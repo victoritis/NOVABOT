@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      0.5.1
+// @version      0.6.0
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -50,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '0.5.1';
+  const VERSION = '0.6.0';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -124,6 +124,7 @@
         storageMarginPct: 5,  // hueco que se deja libre en el almacén destino
         keepMin: 0,           // mínimo que se deja siempre en la ciudad donante
         maxPerTick: 5,
+        agingWeight: 2,       // cuánto sube la prioridad por cada segundo esperando (anti-olvido de lejanas)
         secPerUnit: 0         // se calibra solo con los envíos reales
       }
     };
@@ -1316,28 +1317,74 @@
   const fmtRes = (r) => RES.filter((k) => r[k] > 0).map((k) => `${Math.round(r[k])} ${({ wood: 'madera', stone: 'piedra', iron: 'plata' })[k]}`).join(', ');
 
   // ---- Proveedores de demandas (añadir aquí los de futuros módulos) ----
+  // Cada proveedor devuelve una lista ORDENADA de encargos por ciudad:
+  //   { townId, prio, label, wood, stone, iron }
+  // El orden importa: se asume que la ciudad los irá gastando en ese orden en
+  // cuanto pueda pagarlos (así se puede enviar más de lo que cabe en el almacén
+  // si antes de que llegue lo último ya se habrá gastado lo primero).
+
+  // Huecos de la cola de construcción: 7 con Administrador (premium "curator"), si no 2.
+  function buildQueueLimit() {
+    const c = +UW.Game?.premium_features?.curator || 0;
+    return c * 1000 > Date.now() ? 7 : 2;
+  }
+
+  // Coste de un nivel concreto. El juego aplica un descuento fijo sobre la
+  // fórmula base (medido: 0,85); se calcula con el nivel siguiente que el juego
+  // sí da (resources_for) y se aplica igual a los niveles posteriores.
+  function levelCost(id, level, info) {
+    const b = UW.GameData?.buildings?.[id];
+    if (!b?.resources) return null;
+    const base = (L) => ({
+      wood: b.resources.wood * Math.pow(L, b.wood_factor || 1),
+      stone: b.resources.stone * Math.pow(L, b.stone_factor || 1),
+      iron: b.resources.iron * Math.pow(L, b.iron_factor || 1)
+    });
+    const L0 = +info?.next_level || 0;
+    const real = info?.resources_for;
+    if (real && level === L0) return { wood: +real.wood || 0, stone: +real.stone || 0, iron: +real.iron || 0 };
+    const f0 = L0 ? base(L0) : null;
+    const fl = base(level);
+    const out = {};
+    for (const k of RES) {
+      const ratio = real && f0 && f0[k] ? (+real[k] || 0) / f0[k] : 0.85;
+      out[k] = Math.round(fl[k] * ratio);
+    }
+    return out;
+  }
+
   const tradeDemandProviders = [
-    // Construcción: coste del siguiente objetivo que solo espera por recursos.
+    // Construcción: todos los niveles que caben en los huecos libres de la cola
+    // real (límite 7 contando lo que ya está en cola del juego), siguiendo el
+    // orden de objetivos del bot.
     function buildDemands() {
       if (!state.comercio.forBuild) return [];
       const out = [];
+      const limit = buildQueueLimit();
       for (const townId of allTownIds()) {
         const goals = townBuildCfg(townId).goals;
         if (!goals.length) continue;
         const bd = buildDataFor(townId);
         if (!bd) continue;
+        let free = Math.max(0, limit - townBuildOrders(townId).length);
+        if (!free) continue;
+        const sim = {}; // nivel simulado por edificio conforme se "encargan" niveles
         for (const g of goals) {
+          if (!free) break;
           const info = bd.building_data?.[g.id];
-          if (!info || committedLevel(info) >= g.target) continue;
-          const reason = buildBlockReason(townId, info);
-          if (reason && reason !== 'faltan recursos') {
-            if (state.construccion.strictOrder) break; // el primero bloquea a los demás
-            continue;                                    // bloqueado por otra cosa: probar el siguiente
+          if (!info || info.has_max_level) continue;
+          // Bloqueos que el comercio no puede resolver: se salta ese edificio.
+          const hard = info.group_locked || (Array.isArray(info.missing_dependencies) && info.missing_dependencies.length) || !info.enough_storage;
+          if (hard) { if (state.construccion.strictOrder) break; continue; }
+          let lvl = sim[g.id] ?? committedLevel(info);
+          while (free && lvl < g.target) {
+            lvl += 1;
+            const cost = levelCost(g.id, lvl, info);
+            if (!cost) break;
+            out.push({ townId, prio: 1, label: `${buildingName(g.id)} ${lvl}`, ...cost });
+            free -= 1;
           }
-          const cost = info.resources_for || {};
-          out.push({ townId, prio: 1, label: `${buildingName(g.id)} ${committedLevel(info) + 1}`,
-            wood: +cost.wood || 0, stone: +cost.stone || 0, iron: +cost.iron || 0 });
-          break; // solo el siguiente de cada ciudad
+          sim[g.id] = lvl;
         }
       }
       return out;
@@ -1411,72 +1458,138 @@
   }
 
   // ---- Planificación ----
+  /*
+   Algoritmo (problema de transporte con plazos):
+   1) Demandas: lista ordenada de encargos por ciudad (todos los que caben en la cola).
+   2) Falta neta por ciudad = suma de sus encargos − recursos actuales − lo que ya viene de camino.
+   3) Reparto tipo Vogel (VAM): en cada paso se atiende la ciudad con mayor
+      "arrepentimiento" = cuánto empeora su tiempo si le quitan su mejor donante
+      (tiempo 2º donante − tiempo 1º donante), sumado a lo que lleva esperando.
+      Así las lejanas (que solo tienen donantes lejanos) no se quedan sin nada
+      por culpa de que las cercanas siempre ganen: cuanto más esperan, más suben.
+   4) Almacén: en vez de limitar a "lo que cabe ahora", se simula la línea de
+      tiempo de la ciudad destino (producción + llegadas ordenadas por hora +
+      gasto de sus encargos en orden en cuanto se pueden pagar) y se comprueba
+      que en el momento de cada llegada no se supera el almacén. Así se puede
+      enviar más de lo que cabe si antes se va a gastar, sin perder nada.
+  */
+  function simulateOk(s, items, arrivals, storageCap) {
+    const lvl = { ...s.cur };
+    const queue = items.map((i) => ({ wood: i.wood, stone: i.stone, iron: i.iron }));
+    const consume = () => {
+      while (queue.length && RES.every((k) => lvl[k] >= queue[0][k])) {
+        const q = queue.shift();
+        for (const k of RES) lvl[k] -= q[k];
+      }
+    };
+    consume();
+    let prevT = 0;
+    for (const a of [...arrivals].sort((x, y) => x.t - y.t)) {
+      const dt = Math.max(0, a.t - prevT) / 3600;
+      for (const k of RES) lvl[k] = Math.min(s.storage, lvl[k] + s.prod[k] * dt);
+      prevT = a.t;
+      consume();
+      for (const k of RES) {
+        if (!a[k]) continue;
+        lvl[k] += a[k];
+        if (lvl[k] > storageCap + 1) return false; // se desperdiciaría al llegar
+      }
+      consume();
+    }
+    return true;
+  }
+
   function planTrades() {
     const cfg = state.comercio;
     const towns = allTownIds();
     const transit = transitRows();
     const demands = collectDemands();
+    const now = Date.now();
+    const marginPct = clamp(+cfg.storageMarginPct || 0, 0, 50) / 100;
+    const minShip = Math.max(1, +cfg.minShipment || 500);
 
-    // Reserva de cada ciudad = lo que piden SUS demandas (nunca dona eso).
-    const reserve = {};
-    for (const id of towns) reserve[id] = { wood: 0, stone: 0, iron: 0 };
-    for (const d of demands) for (const k of RES) reserve[d.townId][k] += d[k];
+    const itemsBy = {};
+    for (const id of towns) itemsBy[id] = [];
+    for (const d of demands) if (itemsBy[d.townId]) itemsBy[d.townId].push(d);
 
-    // Estado de cada ciudad.
     const st = {};
     for (const id of towns) {
       const cur = townResources(id);
+      const total = { wood: 0, stone: 0, iron: 0 };
+      for (const d of itemsBy[id]) for (const k of RES) total[k] += d[k];
       st[id] = {
-        cur, cap: tradeCapacityOf(id), storage: townStorage(id) || 0, prod: productionOf(id),
+        cur, total, cap: tradeCapacityOf(id), storage: townStorage(id) || 0, prod: productionOf(id),
         incoming: incomingTo(id, transit),
-        surplus: Object.fromEntries(RES.map((k) => [k, Math.max(0, cur[k] - reserve[id][k] - (+cfg.keepMin || 0))]))
+        // Llegadas ya en camino (para la simulación del almacén).
+        arrivals: transit.filter((r) => r.to === id).map((r) => ({ t: Math.max(0, (r.arrival - now) / 1000), wood: r.wood, stone: r.stone, iron: r.iron })),
+        // Excedente: lo que sobra tras reservar TODOS sus propios encargos.
+        surplus: Object.fromEntries(RES.map((k) => [k, Math.max(0, cur[k] - total[k] - (+cfg.keepMin || 0))]))
       };
     }
 
-    // Necesidades netas (lo que falta tras contar lo que ya viene de camino).
     const needs = [];
-    const now = Date.now();
-    for (const d of demands) {
-      const s = st[d.townId];
-      const miss = Object.fromEntries(RES.map((k) => [k, Math.max(0, d[k] - s.cur[k] - s.incoming[k])]));
-      if (sumRes(miss) <= 0) { tradeRuntime.waitingSince.delete(d.townId); continue; }
-      if (!tradeRuntime.waitingSince.has(d.townId)) tradeRuntime.waitingSince.set(d.townId, now);
-      needs.push({ ...d, miss, waited: now - tradeRuntime.waitingSince.get(d.townId) });
+    for (const id of towns) {
+      const s = st[id];
+      if (!itemsBy[id].length) { tradeRuntime.waitingSince.delete(id); continue; }
+      const miss = Object.fromEntries(RES.map((k) => [k, Math.max(0, s.total[k] - s.cur[k] - s.incoming[k])]));
+      if (sumRes(miss) <= 0) { tradeRuntime.waitingSince.delete(id); continue; }
+      if (!tradeRuntime.waitingSince.has(id)) tradeRuntime.waitingSince.set(id, now);
+      needs.push({ townId: id, miss, label: itemsBy[id].map((i) => i.label).join(', '), items: itemsBy[id],
+        waited: (now - tradeRuntime.waitingSince.get(id)) / 1000 });
     }
-    // Orden: prioridad del módulo, luego quien más tiempo lleva esperando (así
-    // las ciudades lejanas no se quedan olvidadas), luego la necesidad más pequeña
-    // (se completa antes y la ciudad empieza a construir ya).
-    needs.sort((a, b) => (a.prio - b.prio) || (b.waited - a.waited) || (sumRes(a.miss) - sumRes(b.miss)));
+
+    const donorsFor = (n) => towns
+      .filter((id) => id !== n.townId && st[id].cap > 0 && RES.some((k) => st[id].surplus[k] > 0 && n.miss[k] > 0))
+      .filter((id) => (tradeRuntime.pairCooldown.get(`${id}>${n.townId}`) || 0) < now)
+      .sort((a, b) => travelSec(a, n.townId) - travelSec(b, n.townId));
 
     const plan = [];
-    const minShip = Math.max(1, +cfg.minShipment || 500);
-    const marginPct = clamp(+cfg.storageMarginPct || 5, 0, 50) / 100;
-    for (const n of needs) {
-      const r = st[n.townId];
-      // Donantes ordenados por tiempo de viaje (el más cercano primero).
-      const donors = towns.filter((id) => id !== n.townId && st[id].cap > 0 && sumRes(st[id].surplus) > 0)
-        .filter((id) => (tradeRuntime.pairCooldown.get(`${id}>${n.townId}`) || 0) < now)
-        .sort((a, b) => travelSec(a, n.townId) - travelSec(b, n.townId));
-      for (const donorId of donors) {
-        if (sumRes(n.miss) <= 0) break;
+    const pending = needs.slice();
+    const agingWeight = Math.max(0, +cfg.agingWeight || 2);
+    while (pending.length) {
+      // Recalcular prioridad (VAM + envejecimiento) tras cada asignación.
+      let best = null, bestScore = -Infinity;
+      for (const n of pending) {
+        const ds = donorsFor(n);
+        if (!ds.length) { n.score = -Infinity; continue; }
+        const t1 = travelSec(ds[0], n.townId);
+        const regret = ds.length > 1 ? travelSec(ds[1], n.townId) - t1 : 24 * 3600; // un solo donante posible = urgente
+        n.score = regret + n.waited * agingWeight;
+        if (n.score > bestScore) { bestScore = n.score; best = n; }
+      }
+      if (!best) break;
+      pending.splice(pending.indexOf(best), 1);
+
+      const r = st[best.townId];
+      const storageCap = r.storage * (1 - marginPct);
+      for (const donorId of donorsFor(best)) {
+        if (sumRes(best.miss) <= 0) break;
         const d = st[donorId];
-        const eta = travelSec(donorId, n.townId);
-        // Hueco del almacén destino al llegar (actual + en camino + producción durante el viaje).
-        const head = Object.fromEntries(RES.map((k) => [k, Math.max(0,
-          r.storage * (1 - marginPct) - r.cur[k] - r.incoming[k] - r.prod[k] * eta / 3600)]));
-        const ship = { wood: 0, stone: 0, iron: 0 };
+        const eta = travelSec(donorId, best.townId);
+        const want = { wood: 0, stone: 0, iron: 0 };
         let left = d.cap;
-        for (const k of [...RES].sort((a, b) => n.miss[b] - n.miss[a])) {
-          const v = Math.floor(Math.min(left, d.surplus[k], n.miss[k], head[k]));
-          if (v > 0) { ship[k] = v; left -= v; }
+        for (const k of [...RES].sort((a, b) => best.miss[b] - best.miss[a])) {
+          const v = Math.floor(Math.min(left, d.surplus[k], best.miss[k]));
+          if (v > 0) { want[k] = v; left -= v; }
         }
-        const total = sumRes(ship);
-        const completes = RES.every((k) => ship[k] >= n.miss[k]);
-        if (total < minShip && !completes) continue;
-        plan.push({ from: donorId, to: n.townId, ship, eta, label: n.label });
-        // Descontar para que el resto de la planificación lo vea.
+        if (sumRes(want) <= 0) continue;
+        // Ajustar a lo que la simulación de almacén permite (por recurso).
+        const test = (ship) => simulateOk(r, best.items, [...r.arrivals, { t: eta, ...ship }], storageCap);
+        if (!test(want)) {
+          for (const k of RES) {
+            if (!want[k] || test(want)) continue;
+            let lo = 0, hi = want[k];
+            while (hi - lo > 50) { const mid = Math.floor((lo + hi) / 2); want[k] = mid; if (test(want)) lo = mid; else hi = mid; }
+            want[k] = lo;
+          }
+        }
+        const total = sumRes(want);
+        const completes = RES.every((k) => want[k] >= best.miss[k]);
+        if (total <= 0 || (total < minShip && !completes)) continue;
+        plan.push({ from: donorId, to: best.townId, ship: want, eta, label: best.items[0]?.label || '' });
         d.cap -= total;
-        for (const k of RES) { d.surplus[k] -= ship[k]; n.miss[k] -= ship[k]; r.incoming[k] += ship[k]; }
+        for (const k of RES) { d.surplus[k] -= want[k]; best.miss[k] -= want[k]; r.incoming[k] += want[k]; }
+        r.arrivals.push({ t: eta, ...want });
       }
     }
     return { plan, needs };
@@ -1492,7 +1605,7 @@
       try {
         await gpPostAs(p.from, 'town_info', 'trade', { id: p.to, wood: p.ship.wood, stone: p.ship.stone, iron: p.ship.iron, nl_init: true });
         tradeRuntime.ledger.push({ from: p.from, to: p.to, ...p.ship, arrival: Date.now() + p.eta * 1000, expires: Date.now() + p.eta * 1000 + 120000 });
-        tradeRuntime.pairCooldown.set(`${p.from}>${p.to}`, Date.now() + 60000);
+        tradeRuntime.pairCooldown.set(`${p.from}>${p.to}`, Date.now() + 20000);
         tradeLog(`${farmTownName(p.from)} → ${farmTownName(p.to)}: ${fmtRes(p.ship)} · ${Math.round(p.eta / 60)} min · para ${p.label}`, 'ok');
       } catch (e) {
         tradeRuntime.pairCooldown.set(`${p.from}>${p.to}`, Date.now() + 5 * 60000);
@@ -1500,7 +1613,7 @@
       }
       await sleep(700 + Math.random() * 900);
     }
-    if (state.activeTab === 'comercio') renderBody();
+    if (plan.length && state.activeTab === 'comercio') renderBody();
   }
 
   function startTradeEngine() {
@@ -1509,7 +1622,7 @@
       if (!state.comercio.enabled || tradeRuntime.running) return;
       tradeRuntime.running = true;
       tradeTick().catch((e) => tradeLog(`Error: ${e.message}`, 'error')).finally(() => { tradeRuntime.running = false; });
-    }, 45000);
+    }, 10000); // revisa cada 10 s si hay algo que enviar
   }
 
   function tradeLog(text, kind = 'info') {
@@ -1534,7 +1647,7 @@
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, [el('b', {}, 'Comercio automático')]), sw]),
       el('label', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Abastecer la construcción'), forBuild]),
-      el('p', { class: 'nb-placeholder' }, 'Mueve recursos entre tus ciudades hacia las que los necesitan. Nunca dona lo que la ciudad donante va a gastar.')
+      el('p', { class: 'nb-placeholder' }, 'Revisa cada 10 s. Abastece todos los encargos que caben en la cola de cada ciudad. Nunca dona lo que la donante va a gastar y nunca hace que se pierda recurso al llegar.')
     ]));
 
     const num = (key, label, step, min) => {
@@ -1546,6 +1659,7 @@
       el('div', { class: 'nb-card-title' }, 'Ajustes'),
       el('div', { class: 'nb-field-row' }, [num('minShipment', 'Envío mínimo', 100, 1), num('storageMarginPct', 'Margen almacén %', 1, 0)]),
       el('div', { class: 'nb-field-row' }, [num('keepMin', 'Dejar siempre en donante', 100, 0), num('maxPerTick', 'Envíos por ciclo', 1, 1)]),
+      el('div', { class: 'nb-field-row' }, [num('agingWeight', 'Peso de la espera (anti-olvido)', 1, 0)]),
       el('p', { class: 'nb-placeholder' }, `Velocidad de viaje calibrada: ${secPerUnit()} s por casilla.`)
     ]));
 
