@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      0.7.3
+// @version      0.8.0
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -50,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '0.7.3';
+  const VERSION = '0.8.0';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -62,8 +62,7 @@
     { id: 'granjas',     label: 'Granjas',       icon: 'farm',   disabled: false },
     { id: 'construccion', label: 'Construcción', icon: 'build',  disabled: false },
     { id: 'reclutamiento', label: 'Reclutamiento', icon: 'shield', disabled: false },
-    { id: 'comercio',    label: 'Comercio',       icon: 'trade',  disabled: false },
-    { id: 'ajustes',     label: 'Ajustes',        icon: 'gear',   disabled: true }
+    { id: 'comercio',    label: 'Comercio',       icon: 'trade',  disabled: false }
   ];
 
   /* ---------------------------------------------------------------------------------
@@ -231,6 +230,22 @@
   --------------------------------------------------------------------------------- */
   let root, fab, panel, headerEl, tabsEl, bodyEl, footerCityEl, farmLogEl;
 
+  // Interruptor reutilizable (sustituye a los checkbox nativos, que se ven mal
+  // sobre el fondo oscuro).
+  function switchEl(on, onToggle, small = true) {
+    const sw = el('div', { class: `nb-switch${small ? ' nb-switch-sm' : ''}${on ? ' on' : ''}`, role: 'switch', tabindex: '0' });
+    const flip = () => { const v = !sw.classList.contains('on'); sw.classList.toggle('on', v); onToggle(v); };
+    sw.addEventListener('click', flip);
+    sw.addEventListener('keydown', (e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); flip(); } });
+    return sw;
+  }
+  function optionRow(label, hint, on, onToggle) {
+    return el('div', { class: 'nb-row nb-option' }, [
+      el('div', { class: 'nb-option-text' }, [el('span', { class: 'nb-option-label' }, label), hint ? el('span', { class: 'nb-option-hint' }, hint) : null]),
+      switchEl(on, onToggle)
+    ]);
+  }
+
   function buildTabs() {
     tabsEl.innerHTML = '';
     for (const tab of TABS) {
@@ -263,31 +278,7 @@
     }
 
     if (state.activeTab === 'inicio') {
-      bodyEl.appendChild(el('div', { class: 'nb-card' }, [
-        el('div', { class: 'nb-card-title' }, 'Estado'),
-        el('div', { class: 'nb-row' }, [
-          el('span', { class: 'nb-row-label' }, 'Ciudad actual'),
-          el('span', { class: 'nb-row-value', id: 'nb-current-town' }, '—')
-        ]),
-        el('div', { class: 'nb-row' }, [
-          el('span', { class: 'nb-row-label' }, 'Granjas'),
-          el('span', { class: `nb-pill${state.granjas.enabled ? '' : ' nb-pill-off'}` }, state.granjas.enabled ? 'Activado' : 'Desactivado')
-        ]),
-        el('div', { class: 'nb-row' }, [
-          el('span', { class: 'nb-row-label' }, 'Próxima recolección'),
-          el('span', { class: 'nb-row-value', 'data-nb-countdown': '' }, '—')
-        ])
-      ]));
-      updateCountdown();
-      footerCityEl = $('#nb-current-town', bodyEl);
-
-      bodyEl.appendChild(el('div', { class: 'nb-card' }, [
-        el('div', { class: 'nb-card-title' }, 'Próximos pasos'),
-        el('p', { class: 'nb-placeholder' },
-          'Este es el panel base de NOVABOT. Las pestañas de Construcción, Reclutamiento y Comercio se irán activando a medida que se implementen.')
-      ]));
-
-      updateCityLabel();
+      renderInicioTab();
     } else if (state.activeTab === 'reclutamiento') {
       renderReclutamientoTab();
     } else if (state.activeTab === 'comercio') {
@@ -301,6 +292,54 @@
         el('p', { class: 'nb-placeholder' }, 'Este módulo todavía no está disponible.')
       ]));
     }
+  }
+
+  // Resumen: una tarjeta por módulo con su estado, interruptor y dato clave.
+  // Clic en la tarjeta = ir a la pestaña.
+  function renderInicioTab() {
+    const townId = +UW.Game?.townId;
+    bodyEl.appendChild(el('div', { class: 'nb-card nb-hero' }, [
+      el('div', { class: 'nb-hero-label' }, 'Ciudad actual'),
+      el('div', { class: 'nb-hero-value', id: 'nb-current-town' }, '—')
+    ]));
+    footerCityEl = $('#nb-current-town', bodyEl);
+    updateCityLabel();
+
+    let metrics = {};
+    try {
+      const goalsBuild = allTownIds().reduce((n, id) => n + townBuildCfg(id).goals.length, 0);
+      const goalsRec = allTownIds().filter((id) => townRecruitCfg(id).goals.length).length;
+      const transit = transitRows().length;
+      const needs = (() => { try { return planTrades().needs.length; } catch { return 0; } })();
+      metrics = {
+        granjas: el('span', { 'data-nb-countdown': '' }, '—'),
+        construccion: `${goalsBuild} objetivos · ${buildQueueLimit()} huecos de cola`,
+        reclutamiento: `${goalsRec} ciudades con tropas pedidas`,
+        comercio: `${transit} en camino · ${needs} ciudades esperando`
+      };
+    } catch {}
+    const mod = (tab, title, cfgObj, hint) => {
+      const tile = el('div', { class: `nb-tile${cfgObj.enabled ? ' on' : ''}` }, [
+        el('div', { class: 'nb-tile-head' }, [
+          el('span', { class: 'nb-tile-title' }, title),
+          switchEl(!!cfgObj.enabled, (v) => { cfgObj.enabled = v; saveState(); renderBody(); })
+        ]),
+        el('div', { class: 'nb-tile-metric' }, [metrics[tab] || '']),
+        el('div', { class: 'nb-tile-hint' }, hint)
+      ]);
+      tile.addEventListener('click', (e) => {
+        if (e.target.closest('.nb-switch')) return;
+        state.activeTab = tab; saveState(); buildTabs(); renderBody();
+      });
+      return tile;
+    };
+    bodyEl.appendChild(el('div', { class: 'nb-tiles' }, [
+      mod('granjas', 'Granjas', state.granjas, 'Recolecta todas las aldeas'),
+      mod('construccion', 'Construcción', state.construccion, 'Sube edificios por objetivos'),
+      mod('reclutamiento', 'Reclutamiento', state.reclutamiento, 'Lotes que llenan el almacén'),
+      mod('comercio', 'Comercio', state.comercio, 'Reparte recursos entre ciudades')
+    ]));
+    updateCountdown();
   }
 
   function buildUI() {
@@ -1141,12 +1180,10 @@
       cfg.enabled = !cfg.enabled; saveState(); renderBody();
       buildLog(cfg.enabled ? 'Construcción activada.' : 'Construcción desactivada.');
     });
-    const strict = el('input', { type: 'checkbox' });
-    strict.checked = !!cfg.strictOrder;
-    strict.addEventListener('change', () => { cfg.strictOrder = strict.checked; saveState(); });
+
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, [el('b', {}, 'Construcción automática')]), sw]),
-      el('label', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Respetar orden estricto (no saltar al siguiente)'), strict])
+      optionRow('Orden estricto', 'Si el primero está bloqueado, no salta al siguiente', !!cfg.strictOrder, (v) => { cfg.strictOrder = v; saveState(); })
     ]));
 
     const copyBtn = el('div', { class: 'nb-btn', title: 'Copia estos objetivos al resto de ciudades' }, 'Copiar a todas');
@@ -1649,12 +1686,11 @@
     const cfg = state.comercio;
     const sw = el('div', { class: `nb-switch${cfg.enabled ? ' on' : ''}` });
     sw.addEventListener('click', () => { cfg.enabled = !cfg.enabled; saveState(); renderBody(); tradeLog(cfg.enabled ? 'Comercio activado.' : 'Comercio desactivado.'); });
-    const forBuild = el('input', { type: 'checkbox' });
-    forBuild.checked = !!cfg.forBuild;
-    forBuild.addEventListener('change', () => { cfg.forBuild = forBuild.checked; saveState(); renderBody(); });
+
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, [el('b', {}, 'Comercio automático')]), sw]),
-      el('label', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Abastecer la construcción'), forBuild]),
+      optionRow('Abastecer construcción', 'Envía lo que falta para los edificios en cola', !!cfg.forBuild, (v) => { cfg.forBuild = v; saveState(); renderBody(); }),
+      optionRow('Abastecer reclutamiento', 'Envía lo que falta para completar los lotes de tropas', !!cfg.forRecruit, (v) => { cfg.forRecruit = v; saveState(); renderBody(); }),
       el('p', { class: 'nb-placeholder' }, 'Revisa cada 10 s. Abastece todos los encargos que caben en la cola de cada ciudad. Nunca dona lo que la donante va a gastar y nunca hace que se pierda recurso al llegar.')
     ]));
 
@@ -1733,27 +1769,55 @@
     const u = UW.GameData?.units?.[id];
     const r = u?.resources || {};
     const f = 1;
-    return { wood: Math.ceil((+r.wood || 0) * f), stone: Math.ceil((+r.stone || 0) * f), iron: Math.ceil((+r.iron || 0) * f), pop: +u?.population || 1 };
+    return { wood: Math.ceil((+r.wood || 0) * f), stone: Math.ceil((+r.stone || 0) * f), iron: Math.ceil((+r.iron || 0) * f), pop: +u?.population || 1, favor: +u?.favor || 0 };
   }
 
   const isNavalUnit = (id) => !!UW.GameData?.units?.[id]?.is_naval;
+  const isMythUnit = (id) => +UW.GameData?.units?.[id]?.favor > 0;
 
-  // Tropas (tierra y mar) que la ciudad puede reclutar ya (investigación + edificios), sin míticas.
+  function townGod(townId) {
+    try { return UW.ITowns.getTown(townId)?.god?.() || null; } catch { return null; }
+  }
+  // Tope de favor por dios: el lote mítico se dimensiona con él (igual que el
+  // almacén para los recursos) y se recluta cuando el favor llega.
+  function godMaxFavor() {
+    try { return +Object.values(UW.MM.getModels().PlayerGods || {})[0]?.attributes?.max_favor || 500; } catch { return 500; }
+  }
+
+  // Favor actual del dios (compartido entre todas las ciudades con ese dios).
+  function godFavor(god) {
+    if (!god) return 0;
+    try {
+      const m = Object.values(UW.MM.getModels().PlayerGods || {})[0];
+      const a = m?.attributes || {};
+      const o = a.production_overview?.[god];
+      if (o) {
+        const hours = Math.max(0, Date.now() / 1000 - (+a.last_updated_timestamp || Date.now() / 1000)) / 3600;
+        return Math.min(+a.max_favor || Infinity, (+o.current || 0) + (+o.production || 0) * hours);
+      }
+      return +a[`${god}_favor`] || 0;
+    } catch { return 0; }
+  }
+
+  // Tropas que la ciudad puede reclutar ya (investigación + edificios). Las míticas
+  // solo si son del dios de la ciudad.
   function landUnitsFor(townId) {
     const units = UW.GameData?.units || {};
     let rs = null; try { rs = UW.ITowns.getTown(townId)?.getResearches?.(); } catch {}
     const bd = buildDataFor(townId);
     const out = [];
     for (const [id, u] of Object.entries(units)) {
-      if (!u || typeof u !== 'object' || u.is_npc_unit_only || id === 'militia' || +u.favor > 0) continue;
+      if (!u || typeof u !== 'object' || u.is_npc_unit_only || id === 'militia') continue;
+      if (+u.favor > 0 && (!u.god_id || u.god_id !== townGod(townId))) continue;
       const needR = [].concat(u.research_dependencies || []);
       if (needR.some((r) => !rs?.get?.(r))) continue;
       const needB = u.building_dependencies || {};
       if (Object.entries(needB).some(([b, l]) => (+bd?.building_data?.[b]?.level || 0) < +l)) continue;
       out.push(id);
     }
-    // Primero las de tierra, luego las navales; alfabético dentro de cada grupo.
-    return out.sort((a, b) => (isNavalUnit(a) - isNavalUnit(b)) || unitName(a).localeCompare(unitName(b), 'es'));
+    // Tierra, luego mar, luego míticas; alfabético dentro de cada grupo.
+    const grp = (id) => (isMythUnit(id) ? 2 : isNavalUnit(id) ? 1 : 0);
+    return out.sort((a, b) => (grp(a) - grp(b)) || unitName(a).localeCompare(unitName(b), 'es'));
   }
 
   function townUnitsHave(townId) {
@@ -1792,38 +1856,39 @@
     if (!rows.length) return null;
     const storage = townStorage(townId) || 0;
     const fill = clamp(+state.reclutamiento.fillPct || 95, 10, 100) / 100;
-    const budget = { wood: storage * fill, stone: storage * fill, iron: storage * fill, pop: freePopulation(townId) };
+    const budget = { wood: storage * fill, stone: storage * fill, iron: storage * fill, pop: freePopulation(townId), favor: godMaxFavor() * fill };
+    const KEYS = [...RES, 'pop', 'favor'];
     if (budget.pop <= 0) return { rows, units: {}, cost: { wood: 0, stone: 0, iron: 0 }, reason: 'sin población libre' };
 
     // Proporcional
-    const sum = { wood: 0, stone: 0, iron: 0, pop: 0 };
-    for (const r of rows) for (const k of [...RES, 'pop']) sum[k] += r.rem * r.c[k];
+    const sum = { wood: 0, stone: 0, iron: 0, pop: 0, favor: 0 };
+    for (const r of rows) for (const k of KEYS) sum[k] += r.rem * r.c[k];
     let s = 1;
-    for (const k of [...RES, 'pop']) if (sum[k] > 0) s = Math.min(s, budget[k] / sum[k]);
+    for (const k of KEYS) if (sum[k] > 0) s = Math.min(s, budget[k] / sum[k]);
     const units = {};
-    const used = { wood: 0, stone: 0, iron: 0, pop: 0 };
+    const used = { wood: 0, stone: 0, iron: 0, pop: 0, favor: 0 };
     for (const r of rows) {
       const n = Math.floor(r.rem * s);
-      if (n > 0) { units[r.id] = n; for (const k of [...RES, 'pop']) used[k] += n * r.c[k]; }
+      if (n > 0) { units[r.id] = n; for (const k of KEYS) used[k] += n * r.c[k]; }
     }
     // Relleno greedy (1 a 1) con la tropa que más usa lo que sobra.
     for (let guard = 0; guard < 5000; guard++) {
-      const left = Object.fromEntries([...RES, 'pop'].map((k) => [k, budget[k] - used[k]]));
+      const left = Object.fromEntries(KEYS.map((k) => [k, budget[k] - used[k]]));
       let best = null, bestScore = 0;
       for (const r of rows) {
         if ((units[r.id] || 0) >= r.rem) continue;
-        if ([...RES, 'pop'].some((k) => r.c[k] > left[k])) continue;
+        if (KEYS.some((k) => r.c[k] > left[k])) continue;
         // Puntuación: población por unidad del recurso más escaso tras añadirla.
         const score = r.c.pop / Math.max(1e-9, Math.max(...RES.map((k) => r.c[k] / Math.max(1, left[k]))));
         if (score > bestScore) { bestScore = score; best = r; }
       }
       if (!best) break;
       units[best.id] = (units[best.id] || 0) + 1;
-      for (const k of [...RES, 'pop']) used[k] += best.c[k];
+      for (const k of KEYS) used[k] += best.c[k];
     }
     const cost = { wood: used.wood, stone: used.stone, iron: used.iron };
     if (!Object.keys(units).length) return { rows, units, cost, reason: 'no cabe ni una tropa' };
-    return { rows, units, cost, pop: used.pop };
+    return { rows, units, cost, pop: used.pop, favor: used.favor };
   }
 
   // Demanda para el Comercio: el lote completo (prioridad por detrás de construir).
@@ -1851,6 +1916,7 @@
       if (!b || b.reason) continue;
       const cur = townResources(townId);
       if (RES.some((k) => cur[k] < b.cost[k])) continue; // aún no está el lote completo
+      if (b.favor && godFavor(townGod(townId)) < b.favor) continue;
       for (const [unitId, amount] of Object.entries(b.units)) {
         if (!(amount > 0)) continue;
         try {
@@ -1895,14 +1961,12 @@
 
     const sw = el('div', { class: `nb-switch${cfg.enabled ? ' on' : ''}` });
     sw.addEventListener('click', () => { cfg.enabled = !cfg.enabled; saveState(); renderBody(); recruitLog(cfg.enabled ? 'Reclutamiento activado.' : 'Reclutamiento desactivado.'); });
-    const tradeChk = el('input', { type: 'checkbox' });
-    tradeChk.checked = !!state.comercio.forRecruit;
-    tradeChk.addEventListener('change', () => { state.comercio.forRecruit = tradeChk.checked; saveState(); });
+
     const fillIn = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '10', max: '100', value: cfg.fillPct });
     fillIn.addEventListener('change', () => { cfg.fillPct = clamp(pos(fillIn.value, 95), 10, 100); saveState(); renderBody(); });
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, [el('b', {}, 'Reclutamiento automático')]), sw]),
-      el('label', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Pedir recursos al Comercio'), tradeChk]),
+      optionRow('Pedir recursos al Comercio', 'Los lotes se completan con envíos de otras ciudades', !!state.comercio.forRecruit, (v) => { state.comercio.forRecruit = v; saveState(); }),
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Lote = % del almacén'), el('span', {}, [fillIn, ' %'])]),
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Ciudad actual'), el('span', { class: 'nb-row-value' }, farmTownName(townId))])
     ]));
@@ -1924,7 +1988,7 @@
       });
       lotBox = el('div', {}, [
         el('div', { class: 'nb-goal-name' }, Object.entries(b.units).map(([u, n]) => `${n} ${unitName(u)}`).join(' + ')),
-        el('div', { class: 'nb-goal-sub' }, `${b.pop} de población · cola ${unitQueueFree(townId) ? 'libre' : 'llena'}`),
+        el('div', { class: 'nb-goal-sub' }, `${b.pop} de población${b.favor ? ` · ${Math.ceil(b.favor)} favor (${Math.floor(godFavor(townGod(townId)))} disponible)` : ''}`),
         ...bars
       ]);
     }
@@ -1947,7 +2011,7 @@
       input.addEventListener('change', () => setTarget(g.id, pos(input.value, g.target)));
       goalsBox.appendChild(el('div', { class: `nb-goal${h >= g.target ? ' nb-goal-done' : ''}` }, [
         el('div', { class: 'nb-goal-main' }, [
-          el('div', { class: 'nb-goal-name' }, `${unitName(g.id)}${isNavalUnit(g.id) ? ' · naval' : ''}`),
+          el('div', { class: 'nb-goal-name' }, [unitName(g.id), isMythUnit(g.id) ? el('span', { class: 'nb-tag nb-tag-myth' }, 'mítica') : isNavalUnit(g.id) ? el('span', { class: 'nb-tag' }, 'naval') : null]),
           el('div', { class: 'nb-goal-sub' }, `tienes ${+have[g.id] || 0}${queued[g.id] ? ` + ${queued[g.id]} en cola` : ''} · faltan ${Math.max(0, g.target - h)}`)
         ]),
         el('div', { class: 'nb-stepper' }, [
@@ -1973,7 +2037,11 @@
       const add = () => setTarget(id, Math.max(h + 1, pos(input.value, h + 100)));
       input.addEventListener('keydown', (e) => { if (e.key === 'Enter') add(); });
       addList.appendChild(el('div', { class: 'nb-add-row' }, [
-        el('div', { class: 'nb-add-name' }, [`${unitName(id)}${isNavalUnit(id) ? ' ⚓' : ''}`, el('span', { class: 'nb-add-level' }, `tienes ${h} · ${c.wood}/${c.stone}/${c.iron} · ${c.pop} pob`)]),
+        el('div', { class: 'nb-add-name' }, [
+          el('span', {}, unitName(id)),
+          isMythUnit(id) ? el('span', { class: 'nb-tag nb-tag-myth' }, 'mítica') : isNavalUnit(id) ? el('span', { class: 'nb-tag' }, 'naval') : null,
+          el('span', { class: 'nb-add-level' }, `tienes ${h} · ${c.wood}/${c.stone}/${c.iron}${c.favor ? ` · ${c.favor} favor` : ''} · ${c.pop} pob`)
+        ]),
         el('div', { class: 'nb-stepper' }, [input, el('span', { class: 'nb-mini nb-mini-add', title: 'Añadir (total objetivo)', onclick: add }, '✓')])
       ]));
     }

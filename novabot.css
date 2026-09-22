@@ -1,347 +1,340 @@
 /* =====================================================================================
    NOVABOT — hoja de estilos
    -------------------------------------------------------------------------------------
-   Este archivo se sirve desde GitHub (raw) y NOVABOT.user.js lo carga en tiempo de
-   ejecución mediante @resource + GM_getResourceText (ver sección ESTILOS del .user.js).
-
-   IMPORTANTE sobre cómo Tampermonkey cachea @resource:
-   Tampermonkey descarga este archivo la primera vez que se instala el script y lo
-   guarda en caché. Solo lo vuelve a descargar cuando detecta que el propio .user.js
-   ha cambiado de versión (el @version del bloque de cabecera) y el usuario acepta la
-   actualización — no cada vez que cambia este .css por su cuenta. Así que cada vez que
-   toquemos este archivo, hay que subir los dos (css + user.js con @version incrementada)
-   para que a ti te llegue la versión nueva al actualizar en Tampermonkey.
-   VERSIÓN DEL CSS: 0.4.3 — súbela en --nb-css-version cada vez que cambie este archivo.
-   El panel la muestra junto a la del script (cabecera) para saber cuál está cargada.
+   NOVABOT.user.js descarga este archivo de GitHub en cada carga de la página, así que
+   basta con subirlo para ver los cambios. Sube también --nb-css-version cuando lo
+   cambies: el panel la muestra en la cabecera ("v… · css …").
    ===================================================================================== */
 
 :root{
-  --nb-css-version:   "0.4.5";
-  --nb-bg:            #15181e;
-  --nb-panel:         rgba(21, 24, 30, .96);
-  --nb-panel-alt:     rgba(255, 255, 255, .035);
+  --nb-css-version:   "0.8.0";
+
+  /* superficies */
+  --nb-bg:            #111419;
+  --nb-panel:         rgba(17, 20, 25, .97);
+  --nb-surface:       #181c23;
+  --nb-surface-2:     #1f242d;
+  --nb-surface-3:     #272d38;
   --nb-border:        rgba(255, 255, 255, .09);
-  --nb-border-soft:   rgba(255, 255, 255, .05);
-  --nb-gold:          #d3af6b;
-  --nb-gold-bright:   #f0cd8e;
-  --nb-text:          #eae7df;
-  --nb-text-dim:      #9a978e;
-  --nb-text-faint:    #6c6a63;
-  --nb-danger:        #e0665c;
+  --nb-border-soft:   rgba(255, 255, 255, .055);
+  --nb-border-strong: rgba(255, 255, 255, .16);
+
+  /* acento */
+  --nb-gold:          #d4af6a;
+  --nb-gold-bright:   #f1cf8f;
+  --nb-gold-soft:     rgba(212, 175, 106, .14);
+  --nb-gold-line:     rgba(212, 175, 106, .45);
+
+  /* texto */
+  --nb-text:          #ece9e1;
+  --nb-text-dim:      #a8a59c;
+  --nb-text-faint:    #74726b;
+
+  /* estados */
+  --nb-ok:            #7cc79a;
+  --nb-danger:        #e36e63;
+  --nb-danger-soft:   rgba(227, 110, 99, .14);
+  --nb-myth:          #b99cf0;
+  --nb-myth-soft:     rgba(185, 156, 240, .14);
+  --nb-naval:         #7fb6e6;
+  --nb-naval-soft:    rgba(127, 182, 230, .14);
+
   --nb-radius-lg:     16px;
-  --nb-radius-md:     10px;
-  --nb-radius-sm:     7px;
+  --nb-radius-md:     11px;
+  --nb-radius-sm:     8px;
   --nb-shadow:        0 24px 60px rgba(0,0,0,.55), 0 4px 14px rgba(0,0,0,.35);
   --nb-font:          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --nb-ease:          cubic-bezier(.2, .7, .2, 1);
 }
 
-#novabot-root, #novabot-root *{
-  box-sizing: border-box;
-  font-family: var(--nb-font);
-}
-#novabot-root{
-  position: fixed;
-  inset: 0 0 0 0;
-  pointer-events: none;
-  z-index: 999999;
-}
+/* ---------- base ---------- */
+#novabot-root, #novabot-root *{ box-sizing: border-box; font-family: var(--nb-font); }
+#novabot-root{ position: fixed; inset: 0; pointer-events: none; z-index: 999999; }
 #novabot-root .nb-interactive{ pointer-events: auto; }
+/* los controles nativos (select, number…) se dibujan en oscuro */
+#novabot-panel{ color-scheme: dark; }
 
-/* ---------- botón flotante (FAB) ---------- */
+/* ---------- botón flotante ---------- */
 #novabot-fab{
-  position: fixed;
-  width: 54px; height: 54px;
-  border-radius: 50%;
-  background: linear-gradient(155deg, #262b34, #181b21);
-  border: 1px solid var(--nb-border);
-  box-shadow: var(--nb-shadow);
+  position: fixed; right: 22px; bottom: 22px;
+  width: 54px; height: 54px; border-radius: 50%;
+  background: radial-gradient(circle at 30% 25%, #2c323d, #15181e 70%);
+  border: 1px solid var(--nb-gold-line);
+  box-shadow: var(--nb-shadow), 0 0 0 4px rgba(212,175,106,.06);
   display: flex; align-items: center; justify-content: center;
-  cursor: pointer;
-  transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease;
-  right: 22px; bottom: 22px;
+  cursor: pointer; transition: transform .18s var(--nb-ease), box-shadow .18s var(--nb-ease);
 }
-#novabot-fab:hover{
-  transform: translateY(-2px);
-  border-color: var(--nb-gold);
-}
+#novabot-fab:hover{ transform: translateY(-2px); box-shadow: var(--nb-shadow), 0 0 0 5px rgba(212,175,106,.12); }
 #novabot-fab:active{ cursor: grabbing; }
 #novabot-fab svg{ width: 24px; height: 24px; stroke: var(--nb-gold-bright); }
 #novabot-fab.nb-hidden{ display: none; }
 
 /* ---------- panel ---------- */
 #novabot-panel{
-  position: fixed;
-  width: 360px;
-  max-height: 78vh;
-  background: var(--nb-panel);
-  backdrop-filter: blur(14px);
-  border: 1px solid var(--nb-border);
-  border-radius: var(--nb-radius-lg);
+  position: fixed; width: 400px; max-height: 80vh;
+  background: var(--nb-panel); backdrop-filter: blur(16px);
+  border: 1px solid var(--nb-border); border-radius: var(--nb-radius-lg);
   box-shadow: var(--nb-shadow);
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  color: var(--nb-text);
-  opacity: 0;
-  transform: translateY(8px) scale(.98);
-  transition: opacity .15s ease, transform .15s ease;
+  display: flex; flex-direction: column; overflow: hidden;
+  color: var(--nb-text); font-size: 12.5px; line-height: 1.4;
+  opacity: 0; transform: translateY(8px) scale(.98);
+  transition: opacity .16s var(--nb-ease), transform .16s var(--nb-ease);
 }
-/* cuando se redimensiona con JS, width/height/max-height pasan a ser inline styles
-   que pisan estas reglas — se dejan tal cual como valores por defecto */
-#novabot-panel.nb-visible{ opacity: 1; transform: translateY(0) scale(1); }
+#novabot-panel.nb-visible{ opacity: 1; transform: none; }
 #novabot-panel.nb-hidden{ display: none; }
 
 /* ---------- cabecera ---------- */
 #novabot-panel .nb-header{
-  display: flex; align-items: center; gap: 10px;
-  padding: 12px 14px;
-  background: var(--nb-panel-alt);
+  display: flex; align-items: center; gap: 10px; padding: 12px 14px;
+  background: linear-gradient(180deg, rgba(212,175,106,.07), transparent);
   border-bottom: 1px solid var(--nb-border-soft);
-  cursor: grab;
-  user-select: none;
+  cursor: grab; user-select: none;
 }
 #novabot-panel .nb-header:active{ cursor: grabbing; }
-#novabot-panel .nb-brand{
-  display: flex; align-items: center; gap: 9px;
-  flex: 1;
-  min-width: 0;
-}
-#novabot-panel .nb-brand svg{ width: 18px; height: 18px; stroke: var(--nb-gold-bright); flex: none; }
+#novabot-panel .nb-brand{ display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; }
+#novabot-panel .nb-brand svg{ width: 20px; height: 20px; stroke: var(--nb-gold-bright); flex: none; }
 #novabot-panel .nb-brand-text{ display: flex; flex-direction: column; line-height: 1.15; min-width: 0; }
-#novabot-panel .nb-brand-title{
-  font-size: 13px; font-weight: 700; letter-spacing: .06em;
-  color: var(--nb-text); text-transform: uppercase;
-}
+#novabot-panel .nb-brand-title{ font-size: 13px; font-weight: 800; letter-spacing: .12em; color: var(--nb-text); text-transform: uppercase; }
 #novabot-panel .nb-brand-version{ font-size: 10.5px; color: var(--nb-text-faint); }
 #novabot-panel .nb-header-actions{ display: flex; gap: 4px; }
 #novabot-panel .nb-icon-btn{
-  width: 24px; height: 24px;
-  display: flex; align-items: center; justify-content: center;
-  border-radius: var(--nb-radius-sm);
-  color: var(--nb-text-dim);
-  cursor: pointer;
-  transition: background .12s ease, color .12s ease;
+  width: 26px; height: 26px; display: flex; align-items: center; justify-content: center;
+  border-radius: var(--nb-radius-sm); color: var(--nb-text-dim); cursor: pointer;
+  transition: background .12s, color .12s;
 }
 #novabot-panel .nb-icon-btn:hover{ background: rgba(255,255,255,.08); color: var(--nb-text); }
 #novabot-panel .nb-icon-btn svg{ width: 14px; height: 14px; stroke: currentColor; }
 
-/* ---------- interruptor on/off (reutilizable) ---------- */
-.nb-switch{
-  position: relative; width: 38px; height: 21px; flex: none;
-  border-radius: 999px;
-  background: rgba(255,255,255,.12);
-  border: 1px solid var(--nb-border);
-  cursor: pointer;
-  transition: background .15s ease, border-color .15s ease;
-}
-.nb-switch::after{
-  content: ''; position: absolute; top: 2px; left: 2px;
-  width: 15px; height: 15px; border-radius: 50%;
-  background: var(--nb-text-dim);
-  transition: transform .15s ease, background .15s ease;
-}
-.nb-switch.on{ background: rgba(211,175,107,.22); border-color: var(--nb-gold); }
-.nb-switch.on::after{ transform: translateX(17px); background: var(--nb-gold-bright); }
-
 /* ---------- pestañas ---------- */
 #novabot-panel .nb-tabs{
-  display: flex;
-  padding: 6px 8px 0;
-  gap: 2px;
+  display: flex; gap: 2px; padding: 6px 8px 0;
   border-bottom: 1px solid var(--nb-border-soft);
-  overflow-x: auto;
-  scrollbar-width: none;
+  overflow-x: auto; scrollbar-width: none;
 }
 #novabot-panel .nb-tabs::-webkit-scrollbar{ display: none; }
 #novabot-panel .nb-tab{
-  display: flex; align-items: center; gap: 6px;
-  padding: 7px 10px;
-  font-size: 11.5px; font-weight: 600;
-  color: var(--nb-text-faint);
-  border-radius: var(--nb-radius-sm) var(--nb-radius-sm) 0 0;
-  cursor: pointer;
-  white-space: nowrap;
-  border-bottom: 2px solid transparent;
-  transition: color .12s ease, border-color .12s ease;
+  display: flex; align-items: center; gap: 6px; padding: 8px 10px;
+  font-size: 11.5px; font-weight: 650; color: var(--nb-text-faint);
+  border-bottom: 2px solid transparent; cursor: pointer; white-space: nowrap;
+  transition: color .12s, border-color .12s;
 }
 #novabot-panel .nb-tab svg{ width: 13px; height: 13px; stroke: currentColor; flex: none; }
 #novabot-panel .nb-tab:hover:not(.nb-disabled){ color: var(--nb-text); }
 #novabot-panel .nb-tab.nb-active{ color: var(--nb-gold-bright); border-color: var(--nb-gold); }
 #novabot-panel .nb-tab.nb-disabled{ opacity: .35; cursor: default; }
 
-/* ---------- cuerpo ---------- */
-#novabot-panel .nb-body{
-  flex: 1;
-  min-height: 0;
-  padding: 14px;
-  overflow-y: auto;
-  font-size: 12.5px;
-  color: var(--nb-text-dim);
-}
-#novabot-panel .nb-body::-webkit-scrollbar{ width: 8px; }
-#novabot-panel .nb-body::-webkit-scrollbar-thumb{ background: rgba(255,255,255,.1); border-radius: 8px; }
+/* ---------- cuerpo y tarjetas ---------- */
+#novabot-panel .nb-body{ flex: 1; min-height: 0; padding: 12px; overflow-y: auto; color: var(--nb-text-dim); }
+#novabot-panel .nb-body::-webkit-scrollbar,
+#novabot-panel .nb-add-list::-webkit-scrollbar,
+#novabot-panel .nb-log::-webkit-scrollbar{ width: 8px; }
+#novabot-panel .nb-body::-webkit-scrollbar-thumb,
+#novabot-panel .nb-add-list::-webkit-scrollbar-thumb,
+#novabot-panel .nb-log::-webkit-scrollbar-thumb{ background: rgba(255,255,255,.1); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
 
 #novabot-panel .nb-card{
-  background: var(--nb-panel-alt);
-  border: 1px solid var(--nb-border-soft);
-  border-radius: var(--nb-radius-md);
-  padding: 12px;
-  margin-bottom: 10px;
+  background: var(--nb-surface); border: 1px solid var(--nb-border-soft);
+  border-radius: var(--nb-radius-md); padding: 12px; margin-bottom: 10px;
 }
 #novabot-panel .nb-card:last-child{ margin-bottom: 0; }
 #novabot-panel .nb-card-title{
-  font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
-  color: var(--nb-text-faint); margin-bottom: 6px;
+  font-size: 10.5px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--nb-text-faint); margin-bottom: 8px;
 }
-#novabot-panel .nb-row{ display: flex; align-items: center; justify-content: space-between; padding: 4px 0; }
+#novabot-panel .nb-card-head{ display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+#novabot-panel .nb-card-head .nb-card-title{ margin-bottom: 0; }
+#novabot-panel .nb-placeholder{ margin: 0; color: var(--nb-text-faint); font-size: 12px; }
+
+#novabot-panel .nb-row{ display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 6px 0; }
 #novabot-panel .nb-row + .nb-row{ border-top: 1px solid var(--nb-border-soft); }
 #novabot-panel .nb-row-label{ color: var(--nb-text-dim); }
-#novabot-panel .nb-row-value{ color: var(--nb-text); font-weight: 600; }
-#novabot-panel .nb-pill{
-  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
-  padding: 2px 7px; border-radius: 999px;
-  background: rgba(211,175,107,.14); color: var(--nb-gold-bright);
-}
-#novabot-panel .nb-pill.nb-pill-off{ background: rgba(255,255,255,.08); color: var(--nb-text-faint); }
-#novabot-panel .nb-placeholder{ color: var(--nb-text-faint); font-style: italic; }
+#novabot-panel .nb-row-value{ color: var(--nb-text); font-weight: 650; font-variant-numeric: tabular-nums; text-align: right; }
 
-/* ---------- grupos de botones (tiers, presets %) ---------- */
+/* fila de opción con interruptor */
+#novabot-panel .nb-option-text{ display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+#novabot-panel .nb-option-label{ color: var(--nb-text); font-weight: 600; }
+#novabot-panel .nb-option-hint{ font-size: 11px; color: var(--nb-text-faint); }
+
+/* ---------- interruptor ---------- */
+.nb-switch{
+  position: relative; flex: none; width: 38px; height: 22px; border-radius: 999px;
+  background: var(--nb-surface-3); border: 1px solid var(--nb-border-strong);
+  cursor: pointer; transition: background .15s, border-color .15s; outline: none;
+}
+.nb-switch::after{
+  content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%;
+  background: #8b8980; box-shadow: 0 1px 3px rgba(0,0,0,.4);
+  transition: transform .18s var(--nb-ease), background .15s;
+}
+.nb-switch.on{ background: var(--nb-gold-soft); border-color: var(--nb-gold); }
+.nb-switch.on::after{ transform: translateX(16px); background: var(--nb-gold-bright); }
+.nb-switch:focus-visible{ box-shadow: 0 0 0 3px rgba(212,175,106,.25); }
+.nb-switch-sm{ width: 32px; height: 19px; }
+.nb-switch-sm::after{ width: 13px; height: 13px; }
+.nb-switch-sm.on::after{ transform: translateX(13px); }
+
+/* ---------- botones ---------- */
 #novabot-panel .nb-btn-group{ display: flex; flex-wrap: wrap; gap: 6px; }
 #novabot-panel .nb-btn{
-  padding: 6px 10px;
-  font-size: 11px; font-weight: 600;
-  color: var(--nb-text-dim);
-  background: rgba(255,255,255,.04);
-  border: 1px solid var(--nb-border-soft);
-  border-radius: var(--nb-radius-sm);
-  cursor: pointer;
-  transition: background .12s ease, color .12s ease, border-color .12s ease;
+  display: inline-flex; align-items: center; justify-content: center; gap: 4px;
+  height: 30px; padding: 0 12px; border-radius: var(--nb-radius-sm);
+  background: var(--nb-surface-2); border: 1px solid var(--nb-border);
+  color: var(--nb-text-dim); font-size: 12px; font-weight: 650;
+  cursor: pointer; user-select: none; transition: background .12s, color .12s, border-color .12s;
 }
-#novabot-panel .nb-btn:hover{ color: var(--nb-text); border-color: var(--nb-border); }
-#novabot-panel .nb-btn.active{ background: rgba(211,175,107,.16); border-color: var(--nb-gold); color: var(--nb-gold-bright); }
-#novabot-panel .nb-btn-manual{ display: flex; align-items: center; gap: 3px; }
+#novabot-panel .nb-btn:hover{ color: var(--nb-text); border-color: var(--nb-border-strong); background: var(--nb-surface-3); }
+#novabot-panel .nb-btn.active{ background: var(--nb-gold-soft); border-color: var(--nb-gold); color: var(--nb-gold-bright); }
+#novabot-panel .nb-btn-manual{ padding: 0 8px; }
 
-/* ---------- campos e inputs ---------- */
-#novabot-panel .nb-field-row{ display: flex; gap: 10px; }
-#novabot-panel .nb-field{ display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--nb-text-faint); flex: 1; }
-#novabot-panel .nb-input{
-  width: 100%;
-  padding: 6px 8px;
-  font-size: 12px;
-  color: var(--nb-text);
-  background: rgba(255,255,255,.04);
-  border: 1px solid var(--nb-border-soft);
-  border-radius: var(--nb-radius-sm);
+/* botones pequeños (−, +, ▲, ▼, ✕, ✓) */
+#novabot-panel .nb-mini{
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 24px; height: 24px; padding: 0 6px; border-radius: 7px;
+  background: var(--nb-surface-2); border: 1px solid var(--nb-border);
+  color: var(--nb-text-dim); font-size: 12px; font-weight: 700; line-height: 1;
+  cursor: pointer; user-select: none; transition: all .12s;
 }
-#novabot-panel .nb-input:focus{ outline: none; border-color: var(--nb-gold); }
+#novabot-panel .nb-mini:hover{ color: var(--nb-gold-bright); border-color: var(--nb-gold); background: var(--nb-surface-3); }
+#novabot-panel .nb-mini-off{ opacity: .3; pointer-events: none; }
+#novabot-panel .nb-mini-danger:hover{ color: var(--nb-danger); border-color: var(--nb-danger); background: var(--nb-danger-soft); }
+#novabot-panel .nb-mini-add{ background: var(--nb-gold-soft); border-color: var(--nb-gold-line); color: var(--nb-gold-bright); }
+#novabot-panel .nb-mini-add:hover{ background: var(--nb-gold); color: #17140d; border-color: var(--nb-gold); }
+
+/* ---------- campos ---------- */
+#novabot-panel .nb-field-row{ display: flex; gap: 10px; margin-bottom: 8px; }
+#novabot-panel .nb-field-row:last-child{ margin-bottom: 0; }
+#novabot-panel .nb-field{ display: flex; flex-direction: column; gap: 5px; flex: 1; min-width: 0; font-size: 11px; color: var(--nb-text-faint); }
+#novabot-panel .nb-input,
+#novabot-panel select.nb-input{
+  width: 100%; height: 32px; padding: 0 10px;
+  background: var(--nb-bg); color: var(--nb-text);
+  border: 1px solid var(--nb-border); border-radius: var(--nb-radius-sm);
+  font-size: 12.5px; outline: none; transition: border-color .12s, box-shadow .12s;
+}
+#novabot-panel .nb-input::placeholder{ color: var(--nb-text-faint); }
+#novabot-panel .nb-input:hover{ border-color: var(--nb-border-strong); }
+#novabot-panel .nb-input:focus{ border-color: var(--nb-gold); box-shadow: 0 0 0 3px rgba(212,175,106,.15); }
+#novabot-panel select.nb-input{ cursor: pointer; }
+#novabot-panel select.nb-input option{ background: var(--nb-surface); color: var(--nb-text); }
 #novabot-panel .nb-input-inline{
-  width: 44px; padding: 0; border: none; background: none; color: inherit;
-  font: inherit; text-align: right;
+  width: 56px; height: 24px; padding: 0 4px; text-align: center;
+  font-weight: 700; color: var(--nb-gold-bright); border-radius: 7px;
 }
-#novabot-panel .nb-input-inline:focus{ outline: none; }
+/* sin flechas en los campos numéricos (se usan − / +) */
+#novabot-panel input[type=number]::-webkit-outer-spin-button,
+#novabot-panel input[type=number]::-webkit-inner-spin-button{ -webkit-appearance: none; margin: 0; }
+#novabot-panel input[type=number]{ -moz-appearance: textfield; }
 
-/* ---------- log de actividad ---------- */
-#novabot-panel .nb-log{ display: flex; flex-direction: column; gap: 4px; max-height: 140px; overflow-y: auto; }
-#novabot-panel .nb-log-item{
-  font-size: 10.5px; padding: 5px 7px;
-  background: rgba(255,255,255,.035);
-  border-radius: var(--nb-radius-sm);
-  color: var(--nb-text-dim);
+/* ---------- pastillas y etiquetas ---------- */
+#novabot-panel .nb-pill{
+  display: inline-flex; align-items: center; height: 20px; padding: 0 8px; border-radius: 999px;
+  background: var(--nb-gold-soft); color: var(--nb-gold-bright); font-size: 10.5px; font-weight: 700;
 }
-#novabot-panel .nb-log-item.nb-log-ok{ color: var(--nb-gold-bright); }
-#novabot-panel .nb-log-item.nb-log-error{ color: var(--nb-danger); }
+#novabot-panel .nb-pill.nb-pill-off{ background: rgba(255,255,255,.06); color: var(--nb-text-faint); }
+#novabot-panel .nb-tag{
+  display: inline-flex; align-items: center; height: 16px; padding: 0 6px; margin-left: 6px;
+  border-radius: 999px; font-size: 9.5px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase;
+  background: var(--nb-naval-soft); color: var(--nb-naval); vertical-align: middle;
+}
+#novabot-panel .nb-tag-myth{ background: var(--nb-myth-soft); color: var(--nb-myth); }
+
+/* ---------- Inicio ---------- */
+#novabot-panel .nb-hero{
+  display: flex; align-items: baseline; justify-content: space-between;
+  background: linear-gradient(135deg, rgba(212,175,106,.12), rgba(212,175,106,.02));
+  border-color: var(--nb-gold-line);
+}
+#novabot-panel .nb-hero-label{ font-size: 10.5px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; color: var(--nb-text-faint); }
+#novabot-panel .nb-hero-value{ font-size: 16px; font-weight: 800; color: var(--nb-gold-bright); }
+#novabot-panel .nb-tiles{ display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+#novabot-panel .nb-tile{
+  display: flex; flex-direction: column; gap: 6px; padding: 11px;
+  background: var(--nb-surface); border: 1px solid var(--nb-border-soft); border-radius: var(--nb-radius-md);
+  cursor: pointer; transition: border-color .12s, background .12s, transform .12s;
+}
+#novabot-panel .nb-tile:hover{ border-color: var(--nb-border-strong); background: var(--nb-surface-2); transform: translateY(-1px); }
+#novabot-panel .nb-tile.on{ border-color: var(--nb-gold-line); }
+#novabot-panel .nb-tile-head{ display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+#novabot-panel .nb-tile-title{ color: var(--nb-text); font-weight: 750; }
+#novabot-panel .nb-tile-metric{ color: var(--nb-gold-bright); font-weight: 650; font-size: 12px; font-variant-numeric: tabular-nums; min-height: 16px; }
+#novabot-panel .nb-tile-hint{ font-size: 10.5px; color: var(--nb-text-faint); }
+
+/* ---------- listas: cola y necesidades ---------- */
+#novabot-panel .nb-queue{ display: flex; flex-direction: column; gap: 4px; }
+#novabot-panel .nb-queue-item{
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 6px 9px; border-radius: var(--nb-radius-sm); background: var(--nb-surface-2);
+  font-size: 12px; color: var(--nb-text-dim);
+}
+#novabot-panel .nb-queue-level{ color: var(--nb-gold-bright); font-weight: 750; }
+#novabot-panel .nb-queue-time{ color: var(--nb-text); font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+/* ---------- objetivos (construcción / reclutamiento) ---------- */
+#novabot-panel .nb-goals{ display: flex; flex-direction: column; gap: 6px; }
+#novabot-panel .nb-goal{
+  display: flex; align-items: center; gap: 9px; padding: 8px 9px;
+  background: var(--nb-surface-2); border: 1px solid var(--nb-border-soft); border-radius: var(--nb-radius-sm);
+  transition: border-color .12s;
+}
+#novabot-panel .nb-goal:hover{ border-color: var(--nb-border); }
+#novabot-panel .nb-goal-next{ border-color: var(--nb-gold-line); background: linear-gradient(90deg, rgba(212,175,106,.10), var(--nb-surface-2) 60%); }
+#novabot-panel .nb-goal-done{ opacity: .5; }
+#novabot-panel .nb-goal-idx{
+  flex: none; width: 20px; height: 20px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 10px; font-weight: 800; background: var(--nb-surface-3); color: var(--nb-text-dim);
+}
+#novabot-panel .nb-goal-next .nb-goal-idx{ background: var(--nb-gold); color: #17140d; }
+#novabot-panel .nb-goal-main{ flex: 1; min-width: 0; }
+#novabot-panel .nb-goal-name{ color: var(--nb-text); font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#novabot-panel .nb-goal-sub{ margin-top: 1px; font-size: 11px; color: var(--nb-text-faint); }
+#novabot-panel .nb-goal-next .nb-goal-sub{ color: var(--nb-gold-bright); }
+#novabot-panel .nb-stepper{ display: flex; align-items: center; gap: 4px; flex: none; }
+#novabot-panel .nb-goal-cur{ font-size: 11px; color: var(--nb-text-faint); margin-right: 2px; font-variant-numeric: tabular-nums; }
+#novabot-panel .nb-goal-target{ min-width: 22px; text-align: center; font-weight: 800; color: var(--nb-gold-bright); font-variant-numeric: tabular-nums; }
+#novabot-panel .nb-goal-actions{ display: flex; gap: 3px; flex: none; padding-left: 6px; border-left: 1px solid var(--nb-border-soft); }
+
+/* ---------- añadir (edificio / tropa) ---------- */
+#novabot-panel .nb-add-list{ display: flex; flex-direction: column; gap: 4px; margin-top: 8px; max-height: 280px; overflow-y: auto; padding-right: 2px; }
+#novabot-panel .nb-add-row{
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 7px 9px; border-radius: var(--nb-radius-sm);
+  background: var(--nb-surface-2); border: 1px solid transparent; transition: border-color .12s, background .12s;
+}
+#novabot-panel .nb-add-row:hover{ border-color: var(--nb-border); background: var(--nb-surface-3); }
+#novabot-panel .nb-add-row-off{ opacity: .45; }
+#novabot-panel .nb-add-name{ display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 6px; min-width: 0; color: var(--nb-text); font-weight: 650; }
+#novabot-panel .nb-add-level{ flex-basis: 100%; font-size: 10.5px; font-weight: 500; color: var(--nb-text-faint); }
+
+/* ---------- barras de progreso ---------- */
+#novabot-panel .nb-bar-row{ display: flex; align-items: center; gap: 8px; margin-top: 7px; font-size: 11px; }
+#novabot-panel .nb-bar-label{ width: 46px; color: var(--nb-text-dim); }
+#novabot-panel .nb-bar{ flex: 1; height: 7px; border-radius: 999px; background: var(--nb-surface-3); overflow: hidden; }
+#novabot-panel .nb-bar-fill{ height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--nb-gold), var(--nb-gold-bright)); transition: width .3s var(--nb-ease); }
+#novabot-panel .nb-bar-num{ min-width: 92px; text-align: right; color: var(--nb-text); font-variant-numeric: tabular-nums; }
+
+/* ---------- registro ---------- */
+#novabot-panel .nb-log{ display: flex; flex-direction: column; gap: 3px; max-height: 160px; overflow-y: auto; }
+#novabot-panel .nb-log-item{
+  padding: 5px 8px 5px 10px; border-radius: 6px; font-size: 11.5px; line-height: 1.35;
+  background: var(--nb-surface-2); color: var(--nb-text-dim); border-left: 2px solid var(--nb-border-strong);
+}
+#novabot-panel .nb-log-item.nb-log-ok{ color: var(--nb-text); border-left-color: var(--nb-gold); }
+#novabot-panel .nb-log-item.nb-log-error{ color: var(--nb-danger); border-left-color: var(--nb-danger); background: var(--nb-danger-soft); }
 #novabot-panel .nb-log-item.nb-log-muted{ color: var(--nb-text-faint); }
 
 /* ---------- pie ---------- */
 #novabot-panel .nb-footer{
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 8px 14px;
-  font-size: 10.5px;
-  color: var(--nb-text-faint);
-  border-top: 1px solid var(--nb-border-soft);
-  background: var(--nb-panel-alt);
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 8px 14px; border-top: 1px solid var(--nb-border-soft);
+  font-size: 10.5px; color: var(--nb-text-faint);
 }
 #novabot-panel .nb-footer b{ color: var(--nb-text-dim); }
 
-/* ---------- asa de redimensionado ---------- */
+/* ---------- asa de redimensionar ---------- */
 #novabot-panel .nb-resize{
-  position: absolute;
-  right: 4px; bottom: 4px;
-  width: 16px; height: 16px;
-  display: flex; align-items: center; justify-content: center;
-  cursor: nwse-resize;
-  color: var(--nb-text-faint);
-  opacity: .55;
-  transition: opacity .12s ease, color .12s ease;
+  position: absolute; right: 2px; bottom: 2px; width: 14px; height: 14px;
+  color: var(--nb-text-faint); cursor: nwse-resize; opacity: .5; transition: opacity .12s, color .12s;
 }
 #novabot-panel .nb-resize:hover{ opacity: 1; color: var(--nb-gold-bright); }
 #novabot-panel .nb-resize svg{ width: 100%; height: 100%; stroke: currentColor; }
-
-/* ---------- Construcción ---------- */
-#novabot-panel .nb-card-head{ display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
-#novabot-panel .nb-card-head .nb-card-title{ margin-bottom: 0; }
-
-#novabot-panel .nb-mini{
-  display: inline-flex; align-items: center; justify-content: center;
-  min-width: 22px; height: 22px; padding: 0 5px; border-radius: 6px;
-  border: 1px solid var(--nb-border-soft); background: rgba(255,255,255,.03);
-  color: var(--nb-text-dim); font-size: 12px; cursor: pointer; user-select: none;
-}
-#novabot-panel .nb-mini:hover{ color: var(--nb-gold-bright); border-color: var(--nb-gold); }
-#novabot-panel .nb-mini-off{ opacity: .3; pointer-events: none; }
-#novabot-panel .nb-mini-danger:hover{ color: var(--nb-danger); border-color: var(--nb-danger); }
-
-#novabot-panel .nb-goals{ display: flex; flex-direction: column; gap: 6px; }
-#novabot-panel .nb-goal{
-  display: flex; align-items: center; gap: 8px; padding: 6px 8px;
-  border: 1px solid var(--nb-border-soft); border-radius: var(--nb-radius-sm);
-  background: rgba(255,255,255,.02);
-}
-#novabot-panel .nb-goal-next{ border-color: var(--nb-gold); background: rgba(211,175,107,.07); }
-#novabot-panel .nb-goal-done{ opacity: .5; }
-#novabot-panel .nb-goal-idx{
-  flex: none; width: 18px; height: 18px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
-  font-size: 10px; font-weight: 700; background: rgba(255,255,255,.07); color: var(--nb-text-dim);
-}
-#novabot-panel .nb-goal-next .nb-goal-idx{ background: var(--nb-gold); color: #1a1a1a; }
-#novabot-panel .nb-goal-main{ flex: 1; min-width: 0; }
-#novabot-panel .nb-goal-name{ color: var(--nb-text); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-#novabot-panel .nb-goal-sub{ font-size: 10.5px; color: var(--nb-text-faint); }
-#novabot-panel .nb-goal-next .nb-goal-sub{ color: var(--nb-gold-bright); }
-#novabot-panel .nb-stepper{ display: flex; align-items: center; gap: 3px; flex: none; }
-#novabot-panel .nb-goal-cur{ font-size: 11px; color: var(--nb-text-faint); margin-right: 2px; }
-#novabot-panel .nb-goal-target{ min-width: 20px; text-align: center; font-weight: 700; color: var(--nb-gold-bright); }
-#novabot-panel .nb-goal-actions{ display: flex; gap: 3px; flex: none; }
-
-#novabot-panel .nb-chips{ display: flex; flex-wrap: wrap; gap: 5px; }
-#novabot-panel .nb-chip{
-  display: inline-flex; align-items: center; gap: 5px; padding: 4px 8px; border-radius: 999px;
-  border: 1px solid var(--nb-border-soft); background: rgba(255,255,255,.03);
-  font-size: 11.5px; color: var(--nb-text-dim); cursor: pointer; user-select: none;
-}
-#novabot-panel .nb-chip b{ color: var(--nb-text); font-weight: 600; }
-#novabot-panel .nb-chip:hover{ border-color: var(--nb-gold); color: var(--nb-gold-bright); }
-#novabot-panel .nb-chip-off{ opacity: .35; cursor: default; pointer-events: none; }
-
-#novabot-panel .nb-queue{ display: flex; flex-direction: column; gap: 4px; }
-#novabot-panel .nb-queue-item{ display: flex; justify-content: space-between; font-size: 12px; color: var(--nb-text-dim); }
-#novabot-panel .nb-queue-time{ color: var(--nb-text); font-variant-numeric: tabular-nums; }
-
-/* ---------- Añadir edificio (Construcción) ---------- */
-#novabot-panel .nb-add-list{
-  display: flex; flex-direction: column; gap: 4px; margin-top: 8px;
-  max-height: 260px; overflow-y: auto; padding-right: 2px;
-}
-#novabot-panel .nb-add-row{
-  display: flex; align-items: center; justify-content: space-between; gap: 8px;
-  padding: 6px 8px; border-radius: var(--nb-radius-sm);
-  border: 1px solid var(--nb-border-soft); background: rgba(255,255,255,.02);
-}
-#novabot-panel .nb-add-row:hover{ border-color: var(--nb-border); }
-#novabot-panel .nb-add-row-off{ opacity: .45; }
-#novabot-panel .nb-add-name{ display: flex; align-items: baseline; gap: 6px; min-width: 0; color: var(--nb-text); font-weight: 600; }
-#novabot-panel .nb-add-level{ font-size: 10.5px; font-weight: 400; color: var(--nb-text-faint); white-space: nowrap; }
-#novabot-panel .nb-mini-add{ color: var(--nb-gold); border-color: var(--nb-border-soft); }
-#novabot-panel .nb-mini-add:hover{ color: #1a1a1a; background: var(--nb-gold-bright); border-color: var(--nb-gold-bright); }
-#novabot-panel .nb-add-row .nb-input-inline{ width: 46px; text-align: center; }
-#novabot-panel .nb-queue-level{ color: var(--nb-gold-bright); font-weight: 700; }
