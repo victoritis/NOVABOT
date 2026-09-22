@@ -7,7 +7,7 @@
    ===================================================================================== */
 
 :root{
-  --nb-css-version:   "0.8.0";
+  --nb-css-version:   "1.0.0";
 
   /* superficies */
   --nb-bg:            #111419;
@@ -338,3 +338,131 @@
 }
 #novabot-panel .nb-resize:hover{ opacity: 1; color: var(--nb-gold-bright); }
 #novabot-panel .nb-resize svg{ width: 100%; height: 100%; stroke: currentColor; }
+
+/* ---------- utilidades ---------- */
+#novabot-panel .nb-mt{ margin-top: 10px; }
+#novabot-panel .nb-err{ color: var(--nb-danger) !important; }
+#novabot-panel .nb-clickable{ cursor: pointer; }
+#novabot-panel .nb-btn-primary{ background: var(--nb-gold); border-color: var(--nb-gold); color: #17140d; }
+#novabot-panel .nb-btn-primary:hover{ background: var(--nb-gold-bright); border-color: var(--nb-gold-bright); color: #17140d; }
+
+/* control segmentado (dos o más opciones exclusivas) */
+#novabot-panel .nb-seg{ display: flex; padding: 3px; gap: 3px; background: var(--nb-bg); border: 1px solid var(--nb-border); border-radius: var(--nb-radius-sm); }
+#novabot-panel .nb-seg-btn{
+  flex: 1; text-align: center; padding: 6px 8px; border-radius: 6px; cursor: pointer; user-select: none;
+  font-size: 12px; font-weight: 650; color: var(--nb-text-dim); transition: background .12s, color .12s;
+}
+#novabot-panel .nb-seg-btn:hover{ color: var(--nb-text); }
+#novabot-panel .nb-seg-btn.active{ background: var(--nb-gold-soft); color: var(--nb-gold-bright); box-shadow: inset 0 0 0 1px var(--nb-gold-line); }
+
+/* ---------- Ataques ---------- */
+#novabot-panel .nb-input-time{ font-variant-numeric: tabular-nums; letter-spacing: .06em; font-weight: 700; }
+#novabot-panel .nb-selected{
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 8px 10px; border-radius: var(--nb-radius-sm);
+  background: var(--nb-gold-soft); border: 1px solid var(--nb-gold-line); color: var(--nb-text);
+}
+#novabot-panel .nb-units-grid{ display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+#novabot-panel .nb-unit-cell{
+  display: flex; align-items: center; gap: 5px; padding: 5px 6px 5px 9px;
+  background: var(--nb-surface-2); border: 1px solid var(--nb-border-soft); border-radius: var(--nb-radius-sm);
+}
+#novabot-panel .nb-unit-name{ flex: 1; min-width: 0; font-size: 11.5px; color: var(--nb-text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#novabot-panel .nb-unit-cell .nb-input-inline{ width: 50px; }
+#novabot-panel .nb-timing{ margin-top: 10px; }
+#novabot-panel .nb-stats{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+#novabot-panel .nb-stat{
+  display: flex; flex-direction: column; gap: 2px; padding: 8px; border-radius: var(--nb-radius-sm);
+  background: var(--nb-surface-2); border: 1px solid var(--nb-border-soft);
+}
+#novabot-panel .nb-stat span{ font-size: 10px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; color: var(--nb-text-faint); }
+#novabot-panel .nb-stat b{ color: var(--nb-gold-bright); font-variant-numeric: tabular-nums; font-size: 12.5px; }
+#novabot-panel .nb-atk-count{ flex: none; font-variant-numeric: tabular-nums; font-weight: 800; color: var(--nb-gold-bright); }
+#novabot-panel .nb-atk-sent{ opacity: .6; }
+#novabot-panel .nb-atk-error{ border-color: rgba(227,110,99,.4); }
+#novabot-panel .nb-tag-pending{ background: var(--nb-gold-soft); color: var(--nb-gold-bright); }
+#novabot-panel .nb-tag-sending{ background: var(--nb-naval-soft); color: var(--nb-naval); }
+#novabot-panel .nb-tag-sent{ background: rgba(124,199,154,.14); color: var(--nb-ok); }
+#novabot-panel .nb-tag-error{ background: var(--nb-danger-soft); color: var(--nb-danger); }
+
+/* =====================================================================================
+   ATAQUES v2
+   ===================================================================================== */
+#novabot-panel .nb-mono{ font-variant-numeric: tabular-nums; letter-spacing: .02em; }
+#novabot-panel .nb-ok{ color: var(--nb-ok) !important; }
+#novabot-panel .nb-warn-txt{ color: #e7b861 !important; }
+
+/* cabecera con reloj y próxima salida */
+#novabot-panel .nb-hero-atk{ align-items: stretch; gap: 12px; }
+#novabot-panel .nb-hero-atk > div{ display: flex; flex-direction: column; gap: 2px; }
+#novabot-panel .nb-hero-next{ text-align: right; align-items: flex-end; }
+#novabot-panel .nb-hero-sub{ font-size: 10.5px; color: var(--nb-text-faint); max-width: 170px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+#novabot-panel .nb-seg-main{ margin-bottom: 10px; }
+#novabot-panel .nb-seg-sm .nb-seg-btn{ padding: 4px 8px; font-size: 11px; }
+
+/* formulario en pasos */
+#novabot-panel .nb-form{ display: flex; flex-direction: column; gap: 12px; }
+#novabot-panel .nb-step{ display: flex; flex-direction: column; gap: 7px; }
+#novabot-panel .nb-step-head{ display: flex; align-items: center; gap: 8px; font-size: 11px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; color: var(--nb-text-dim); }
+#novabot-panel .nb-step-n{
+  width: 18px; height: 18px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center;
+  background: var(--nb-gold-soft); color: var(--nb-gold-bright); font-size: 10px; border: 1px solid var(--nb-gold-line);
+}
+#novabot-panel .nb-quick{ display: flex; flex-wrap: wrap; gap: 4px; }
+#novabot-panel .nb-time-row{ display: flex; flex-direction: column; gap: 6px; }
+#novabot-panel .nb-input-time{ font-size: 18px; height: 40px; text-align: center; font-weight: 800; color: var(--nb-gold-bright); }
+
+/* objetivo elegido + recientes */
+#novabot-panel .nb-selected-main{ display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+#novabot-panel .nb-chips{ display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+#novabot-panel .nb-chip{
+  display: inline-flex; align-items: center; height: 22px; padding: 0 9px; border-radius: 999px; cursor: pointer;
+  background: var(--nb-surface-2); border: 1px solid var(--nb-border); color: var(--nb-text-dim); font-size: 11px;
+}
+#novabot-panel .nb-chip:hover{ border-color: var(--nb-gold); color: var(--nb-gold-bright); }
+
+/* tropas */
+#novabot-panel .nb-unit-info{ display: flex; flex-direction: column; flex: 1; min-width: 0; }
+#novabot-panel .nb-unit-sub{ font-size: 10px; color: var(--nb-text-faint); font-variant-numeric: tabular-nums; }
+#novabot-panel .nb-unit-cell.nb-slow{ border-color: var(--nb-gold-line); background: linear-gradient(90deg, rgba(212,175,106,.10), var(--nb-surface-2) 70%); }
+#novabot-panel .nb-unit-cell.nb-slow .nb-unit-sub{ color: var(--nb-gold-bright); }
+
+/* plan y avisos */
+#novabot-panel .nb-plan{ display: flex; flex-direction: column; gap: 6px; }
+#novabot-panel .nb-stat small{ font-size: 10px; color: var(--nb-text-faint); }
+#novabot-panel .nb-alert{
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 7px 10px; border-radius: var(--nb-radius-sm); font-size: 11.5px; line-height: 1.35;
+  background: var(--nb-surface-2); border-left: 3px solid var(--nb-border-strong); color: var(--nb-text-dim);
+}
+#novabot-panel .nb-alert-info{ border-left-color: var(--nb-naval); }
+#novabot-panel .nb-alert-warn{ border-left-color: #e7b861; color: #f0d9a8; background: rgba(231,184,97,.08); }
+#novabot-panel .nb-alert-danger{ border-left-color: var(--nb-danger); color: #f3b3ad; background: var(--nb-danger-soft); }
+#novabot-panel .nb-btn-sm{ height: 24px; padding: 0 9px; font-size: 11px; flex: none; }
+#novabot-panel .nb-btn-block{ width: 100%; height: 38px; font-size: 13px; }
+#novabot-panel .nb-options{ display: flex; flex-direction: column; border-top: 1px solid var(--nb-border-soft); padding-top: 4px; }
+
+/* lista de programados */
+#novabot-panel .nb-atk-list{ display: flex; flex-direction: column; gap: 8px; }
+#novabot-panel .nb-atk-item{
+  display: flex; flex-direction: column; gap: 6px; padding: 10px;
+  background: var(--nb-surface-2); border: 1px solid var(--nb-border-soft); border-radius: var(--nb-radius-sm);
+}
+#novabot-panel .nb-atk-pending{ border-color: var(--nb-gold-line); }
+#novabot-panel .nb-atk-sending{ border-color: var(--nb-naval); }
+#novabot-panel .nb-atk-error, #novabot-panel .nb-atk-missed{ border-color: rgba(227,110,99,.45); }
+#novabot-panel .nb-atk-sent, #novabot-panel .nb-atk-skipped{ opacity: .7; }
+#novabot-panel .nb-atk-top{ display: flex; align-items: center; gap: 6px; }
+#novabot-panel .nb-atk-top .nb-tag{ margin-left: 0; }
+#novabot-panel .nb-atk-route{ flex: 1; min-width: 0; color: var(--nb-text); font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#novabot-panel .nb-atk-times{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+#novabot-panel .nb-atk-times > div{ display: flex; flex-direction: column; gap: 1px; }
+#novabot-panel .nb-atk-times span{ font-size: 9.5px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; color: var(--nb-text-faint); }
+#novabot-panel .nb-atk-times b{ color: var(--nb-text); font-size: 12px; font-variant-numeric: tabular-nums; }
+#novabot-panel .nb-atk-count b{ color: var(--nb-gold-bright); }
+#novabot-panel .nb-atk-actions{ display: flex; justify-content: flex-end; gap: 4px; }
+#novabot-panel .nb-tag-attack{ background: var(--nb-danger-soft); color: var(--nb-danger); }
+#novabot-panel .nb-tag-support{ background: rgba(124,199,154,.14); color: var(--nb-ok); }
+#novabot-panel .nb-tag-missed{ background: var(--nb-danger-soft); color: var(--nb-danger); }
+#novabot-panel .nb-tag-skipped{ background: rgba(255,255,255,.06); color: var(--nb-text-faint); }

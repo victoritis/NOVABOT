@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      0.8.0
+// @version      1.0.0
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -50,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '0.8.0';
+  const VERSION = '1.0.0';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -62,7 +62,8 @@
     { id: 'granjas',     label: 'Granjas',       icon: 'farm',   disabled: false },
     { id: 'construccion', label: 'Construcción', icon: 'build',  disabled: false },
     { id: 'reclutamiento', label: 'Reclutamiento', icon: 'shield', disabled: false },
-    { id: 'comercio',    label: 'Comercio',       icon: 'trade',  disabled: false }
+    { id: 'comercio',    label: 'Comercio',       icon: 'trade',  disabled: false },
+    { id: 'ataques',     label: 'Ataques',        icon: 'sword',  disabled: false }
   ];
 
   /* ---------------------------------------------------------------------------------
@@ -116,6 +117,9 @@
         strictOrder: false,   // true = no salta a otro edificio si el primero está bloqueado
         towns: {}             // townId -> { goals: [{id, target}] } (orden = prioridad)
       },
+      ataques: {
+        correctionMs: 0       // corrección automática del disparo (se ajusta sola con la llegada real)
+      },
       reclutamiento: {
         enabled: true,
         fillPct: 95,          // tamaño del lote = % del almacén
@@ -141,7 +145,7 @@
       if (raw && typeof raw === 'object') {
         const def = defaultState();
         const out = { ...def, ...raw };
-        for (const k of ['granjas', 'construccion', 'comercio', 'reclutamiento']) out[k] = { ...def[k], ...(raw[k] || {}) };
+        for (const k of ['granjas', 'construccion', 'comercio', 'reclutamiento', 'ataques']) out[k] = { ...def[k], ...(raw[k] || {}) };
         return out;
       }
     } catch {}
@@ -222,6 +226,7 @@
     minus: '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/></svg>',
     close: '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><path d="m18 6-12 12M6 6l12 12"/></svg>',
     resize: '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><line x1="21" y1="9" x2="9" y2="21"/><line x1="21" y1="15" x2="15" y2="21"/></svg>',
+    sword: '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 17.5 3 6V3h3l11.5 11.5"/><path d="m13 19 6-6"/><path d="m16 16 4 4"/><path d="m19 21 2-2"/></svg>',
     farm: '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21V9"/><path d="M12 9c0-4 3-7 7-7 0 4-3 7-7 7Z"/><path d="M12 13c0-4-3-7-7-7 0 4 3 7 7 7Z"/></svg>'
   };
 
@@ -279,6 +284,8 @@
 
     if (state.activeTab === 'inicio') {
       renderInicioTab();
+    } else if (state.activeTab === 'ataques') {
+      renderAtaquesTab();
     } else if (state.activeTab === 'reclutamiento') {
       renderReclutamientoTab();
     } else if (state.activeTab === 'comercio') {
@@ -337,7 +344,18 @@
       mod('granjas', 'Granjas', state.granjas, 'Recolecta todas las aldeas'),
       mod('construccion', 'Construcción', state.construccion, 'Sube edificios por objetivos'),
       mod('reclutamiento', 'Reclutamiento', state.reclutamiento, 'Lotes que llenan el almacén'),
-      mod('comercio', 'Comercio', state.comercio, 'Reparte recursos entre ciudades')
+      mod('comercio', 'Comercio', state.comercio, 'Reparte recursos entre ciudades'),
+      (() => {
+        const nx = nextPending();
+        const n = atk.queue.filter((a) => a.status === 'pending').length;
+        const tile = el('div', { class: `nb-tile${n ? ' on' : ''}` }, [
+          el('div', { class: 'nb-tile-head' }, [el('span', { class: 'nb-tile-title' }, 'Ataques'), el('span', { class: 'nb-pill' + (n ? '' : ' nb-pill-off') }, `${n} programados`)]),
+          el('div', { class: 'nb-tile-metric' }, nx ? [el('span', { 'data-atk-at': nx.executeAt }, ''), ` · ${nx.targetName}`] : ['—']),
+          el('div', { class: 'nb-tile-hint' }, 'Ataques y apoyos al segundo')
+        ]);
+        tile.addEventListener('click', () => { state.activeTab = 'ataques'; saveState(); buildTabs(); renderBody(); });
+        return tile;
+      })()
     ]));
     updateCountdown();
   }
@@ -628,31 +646,41 @@
     log: []                 // {at, text, kind}
   };
 
-  function gpGet(controller, action, json) {
-    return new Promise((resolve, reject) => {
-      const fn = UW.gpAjax?.ajaxGet;
-      if (typeof fn !== 'function') { reject(new Error('gpAjax.ajaxGet no disponible.')); return; }
-      try {
-        fn.call(UW.gpAjax, controller, action, json, false, {
-          success: (...a) => resolve(a[1] ?? a[0] ?? null),
-          error: (...a) => reject(new Error(a.find((x) => typeof x === 'string' && x.trim()) || 'Error del juego.'))
-        });
-      } catch (e) { reject(e); }
-    });
+  // Texto de error legible a partir de lo que devuelva el juego (string, objeto
+  // con error/message, o un json anidado).
+  function gameErrorText(args) {
+    const pick = (o, depth = 0) => {
+      if (!o || depth > 4) return '';
+      if (typeof o === 'string') return o.trim();
+      if (typeof o !== 'object') return '';
+      for (const k of ['error', 'message', 'msg', 'error_msg', 'description']) {
+        const v = o[k];
+        if (typeof v === 'string' && v.trim()) return v.trim();
+      }
+      for (const k of ['json', 'responseJSON', 'data']) { const t = pick(o[k], depth + 1); if (t) return t; }
+      if (typeof o.responseText === 'string') { try { return pick(JSON.parse(o.responseText), depth + 1); } catch {} }
+      return '';
+    };
+    for (const a of args) { const t = pick(a); if (t && !/^(error|timeout|abort)$/i.test(t)) return t.replace(/<[^>]+>/g, ''); }
+    return 'El juego rechazó la acción.';
   }
 
-  function gpPost(controller, action, json) {
+  function gpCall(method, controller, action, json, timeoutMs = 15000) {
     return new Promise((resolve, reject) => {
-      const fn = UW.gpAjax?.ajaxPost;
-      if (typeof fn !== 'function') { reject(new Error('gpAjax.ajaxPost no disponible.')); return; }
+      const fn = UW.gpAjax?.[method];
+      if (typeof fn !== 'function') { reject(new Error(`gpAjax.${method} no disponible.`)); return; }
+      let done = false;
+      const timer = setTimeout(() => { if (!done) { done = true; reject(new Error(`Sin respuesta del juego (${controller}/${action}).`)); } }, timeoutMs);
       try {
         fn.call(UW.gpAjax, controller, action, json, false, {
-          success: (...a) => resolve(a[1] ?? a[0] ?? null),
-          error: (...a) => reject(new Error(a.find((x) => typeof x === 'string' && x.trim()) || 'Error del juego.'))
+          success: (...a) => { if (done) return; done = true; clearTimeout(timer); resolve(a[1] ?? a[0] ?? null); },
+          error: (...a) => { if (done) return; done = true; clearTimeout(timer); reject(new Error(gameErrorText(a))); }
         });
-      } catch (e) { reject(e); }
+      } catch (e) { done = true; clearTimeout(timer); reject(e); }
     });
   }
+  const gpGet = (controller, action, json) => gpCall('ajaxGet', controller, action, json);
+  const gpPost = (controller, action, json) => gpCall('ajaxPost', controller, action, json);
 
   function allTownIds() {
     try { return Object.values(UW.ITowns?.towns || {}).map((t) => +t.id).filter(Boolean); }
@@ -2057,6 +2085,842 @@
   }
 
   /* ---------------------------------------------------------------------------------
+     8e) ATAQUES — programador de ataques y apoyos (todo por API)
+     -----------------------------------------------------------------------------
+     Peticiones (las mismas que la ventana de ataque del juego):
+       GET  town_info?action=attack      json: { id:<destino>, town_id:<origen> }
+            → json: distance, units{id:{count,duration,population}}, heroes_durations,
+              same_island, morale, has_player_protection, protection_ends,
+              same_alliance, alliance_pact, night_starts_at_hour, night_duration,
+              attack_types, attack_strategies, researches{berth}…
+       POST town_info?action=send_units  json: { id, type, <unidad>:n…, heroes?,
+              attacking_strategy?:[…], power_id?, town_id }
+            (formato leído de WndHandlerAttack.sendUnits del propio juego: el héroe
+            va en "heroes", no en hero_id/include_hero como hacía el script original).
+
+     Tiempo de viaje: duración por tropa que devuelve el servidor (coincide al
+     segundo con la ventana del juego). Reglas de Grepolis:
+       · misma isla: manda la tropa más lenta;
+       · otra isla: las tropas de tierra van en barco → mandan los barcos y las
+         voladoras (que vuelan por su cuenta); hace falta capacidad de transporte.
+
+     Reloj: cada respuesta del juego trae "_srvtime" (segundos del servidor). Con
+     la hora local de envío y de recepción de cada petición se acota el desfase
+     reloj local ↔ servidor por intersección de intervalos (tipo Marzullo), que
+     converge a unas decenas de ms. Así se sabe EXACTAMENTE cuándo es cada segundo
+     del servidor, en vez de leer la hora que se ve en pantalla (precisión 1 s).
+
+     Envío: el servidor fija la llegada = segundo en que procesa la orden +
+     duración. Para acertar el segundo, la orden se dispara para que llegue al
+     servidor a mitad de ese segundo (+500 ms), descontando la latencia medida.
+     Los temporizadores van en un Web Worker para que funcionen aunque la
+     pestaña esté en segundo plano (Chrome frena los timers normales a 1/s).
+     5 s antes se precarga la información (tropas disponibles) para que en el
+     momento exacto solo haga falta el POST. Tras enviar se lee la llegada real
+     que devuelve el juego y se corrige solo el desfase para los siguientes.
+  --------------------------------------------------------------------------------- */
+  const ATK_KEY = 'novabot_attacks_v2';
+  const ATK_MISS_TOLERANCE_MS = 8000;   // si se pasó la hora más de esto (p. ej. PC dormido), NO se envía
+  const ATK_PREFETCH_MS = 6000;         // precarga de tropas antes de salir
+  const ATK_RECHECK_MS = 35000;         // recalcular duración (modo llegada) antes de salir
+  const ATK_ARM_MS = 2500;              // armar el temporizador de precisión
+  const ATK_INTO_SECOND_MS = 500;       // llegar al servidor a mitad del segundo objetivo
+
+  const atk = {
+    queue: [], world: [], worldById: new Map(), worldLoaded: false, worldLoading: false, worldTriedAt: 0,
+    view: 'new', infoCache: new Map(), worker: null, timers: new Map(), log: [],
+    form: {
+      source: null, target: null, search: '', units: {}, hero: '', spell: '', type: 'attack', strategy: '',
+      mode: 'arrival', time: '', onMissing: 'partial', keep: true, step: 1, info: null, infoError: '', infoLoading: false
+    },
+    recent: []
+  };
+
+  // ---------- reloj del servidor (precisión de ms) ----------
+  const clock = { samples: [], lo: null, hi: null, rtt: [], hooked: false };
+
+  function installClockSync() {
+    if (clock.hooked) return;
+    const $j = UW.jQuery;
+    if (!$j) return;
+    clock.hooked = true;
+    $j(document).on('ajaxSend.novabot', (e, xhr) => { try { xhr.__nbSent = Date.now(); } catch {} });
+    $j(document).on('ajaxComplete.novabot', (e, xhr) => {
+      try {
+        const tRecv = Date.now(), tSend = xhr.__nbSent;
+        if (!tSend) return;
+        clock.rtt.push(tRecv - tSend); if (clock.rtt.length > 20) clock.rtt.shift();
+        const txt = String(xhr.responseText || '');
+        const i = txt.lastIndexOf('"_srvtime"');
+        if (i < 0) return;
+        const m = /"_srvtime"\s*:\s*(\d{9,11})/.exec(txt.slice(i, i + 40));
+        if (!m) return;
+        addClockSample(+m[1] * 1000, tSend, tRecv);
+      } catch {}
+    });
+  }
+
+  // Muestra: el servidor procesó la petición entre tSend y tRecv (hora local) y
+  // en ese momento su reloj estaba en [S, S+1000). ⇒ desfase ∈ [S−tRecv, S+1000−tSend].
+  function addClockSample(S, tSend, tRecv) {
+    clock.samples.push({ lo: S - tRecv, hi: S + 1000 - tSend, at: tRecv });
+    const cutoff = Date.now() - 30 * 60000;
+    clock.samples = clock.samples.filter((x) => x.at >= cutoff).slice(-300);
+    // Intersección de las muestras más recientes que sean coherentes entre sí.
+    let lo = -Infinity, hi = Infinity;
+    for (let k = clock.samples.length - 1; k >= 0; k--) {
+      const s = clock.samples[k];
+      const nlo = Math.max(lo, s.lo), nhi = Math.min(hi, s.hi);
+      if (nlo > nhi) break;                       // incoherente (salto de hora): se ignora lo más antiguo
+      lo = nlo; hi = nhi;
+    }
+    clock.lo = lo; clock.hi = hi;
+  }
+
+  function clockOffset() {
+    if (clock.lo !== null && Number.isFinite(clock.lo) && Number.isFinite(clock.hi)) return { off: (clock.lo + clock.hi) / 2, err: (clock.hi - clock.lo) / 2 };
+    // Sin muestras aún: reloj del juego (precisión ±1 s).
+    try { const s = +UW.Timestamp?.server?.(); if (s > 0) return { off: s * 1000 + 500 - Date.now(), err: 1000 }; } catch {}
+    return { off: 0, err: 5000 };
+  }
+  const srvNow = () => Date.now() + clockOffset().off;
+  const latencyOneWay = () => {
+    if (!clock.rtt.length) return 60;
+    const v = clock.rtt.slice().sort((a, b) => a - b);
+    return Math.min(1500, v[Math.floor(v.length / 2)] / 2);
+  };
+  // Hora "de pared" del servidor (la que se ve en el juego).
+  const srvGmt = () => { try { return (+UW.Timestamp?.serverGMTOffset || +UW.Game?.server_gmt_offset || 0) * 1000; } catch { return 0; } };
+  const two = (n) => String(n).padStart(2, '0');
+  const wall = (ms) => new Date(ms + srvGmt());
+  const fmtClock = (ms, tenths = false) => {
+    if (!Number.isFinite(ms)) return '--:--:--';
+    const d = wall(ms);
+    return `${two(d.getUTCHours())}:${two(d.getUTCMinutes())}:${two(d.getUTCSeconds())}${tenths ? `.${Math.floor(d.getUTCMilliseconds() / 100)}` : ''}`;
+  };
+  function dayWord(ms) {
+    const a = wall(srvNow()), b = wall(ms);
+    const days = Math.round((Date.UTC(b.getUTCFullYear(), b.getUTCMonth(), b.getUTCDate()) - Date.UTC(a.getUTCFullYear(), a.getUTCMonth(), a.getUTCDate())) / 86400000);
+    return days === 0 ? 'hoy' : days === 1 ? 'mañana' : days === -1 ? 'ayer' : `${two(b.getUTCDate())}/${two(b.getUTCMonth() + 1)}`;
+  }
+  const fmtWhen = (ms) => (Number.isFinite(ms) ? `${dayWord(ms)} ${fmtClock(ms)}` : '--');
+  const fmtDur = (ms) => { if (!Number.isFinite(ms)) return '--:--:--'; const n = Math.max(0, Math.round(ms / 1000)); return `${two(Math.floor(n / 3600))}:${two(Math.floor(n % 3600 / 60))}:${two(n % 60)}`; };
+  function fmtCount(ms) {
+    if (!Number.isFinite(ms)) return '';
+    if (ms < 0) return 'ya';
+    if (ms < 60000) return `${(ms / 1000).toFixed(1)} s`;
+    return fmtDur(ms);
+  }
+
+  // "22:36:14" (hora del juego) → próximo instante futuro (epoch ms). Admite "223614".
+  function normTime(v) {
+    const digits = String(v || '').replace(/\D/g, '');
+    if (/^\d{1,2}:\d{2}:\d{2}$/.test(String(v).trim())) return String(v).trim().padStart(8, '0');
+    if (digits.length === 6) return `${digits.slice(0, 2)}:${digits.slice(2, 4)}:${digits.slice(4)}`;
+    return String(v || '').trim();
+  }
+  function nextWallTime(hms, notBefore) {
+    const m = /^(\d{1,2}):(\d{2}):(\d{2})$/.exec(hms);
+    if (!m || +m[1] > 23 || +m[2] > 59 || +m[3] > 59) return null;
+    const d = wall(notBefore);
+    let t = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), +m[1], +m[2], +m[3]) - srvGmt();
+    while (t <= notBefore) t += 86400000;
+    return t;
+  }
+
+  // ---------- temporizador en Web Worker (no se frena en segundo plano) ----------
+  function atkWorker() {
+    if (atk.worker !== null) return atk.worker;
+    try {
+      const code = 'const t={};onmessage=(e)=>{const d=e.data;if(d.cmd==="at"){clearTimeout(t[d.id]);t[d.id]=setTimeout(()=>{delete t[d.id];postMessage(d.id)},Math.max(0,d.delay))}else if(d.cmd==="clear"){clearTimeout(t[d.id]);delete t[d.id]}else if(d.cmd==="every"){setInterval(()=>postMessage("__tick"),d.ms)}}';
+      const w = new Worker(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })));
+      w.onmessage = (e) => {
+        if (e.data === '__tick') { atkHeartbeat(); return; }
+        const fn = atk.timers.get(e.data); atk.timers.delete(e.data); if (fn) fn();
+      };
+      atk.worker = w;
+    } catch (e) { console.warn('[NOVABOT][ataques] Worker no disponible, uso temporizadores normales:', e); atk.worker = false; }
+    return atk.worker;
+  }
+  function atkTimerAt(id, delay, fn) {
+    atkTimerClear(id);
+    const w = atkWorker();
+    atk.timers.set(id, fn);
+    if (w) w.postMessage({ cmd: 'at', id, delay });
+    else setTimeout(() => { const f = atk.timers.get(id); atk.timers.delete(id); if (f) f(); }, Math.max(0, delay));
+  }
+  function atkTimerClear(id) {
+    atk.timers.delete(id);
+    if (atk.worker) atk.worker.postMessage({ cmd: 'clear', id });
+  }
+
+  // ---------- mundo: ciudades, jugadores, alianzas ----------
+  async function atkLoadWorld() {
+    if (atk.worldLoaded || atk.worldLoading || Date.now() - atk.worldTriedAt < 60000) return;
+    atk.worldLoading = true; atk.worldTriedAt = Date.now();
+    try {
+      const get = (f) => fetch(`/data/${f}`, { cache: 'no-store', credentials: 'same-origin' }).then((r) => (r.ok ? r.text() : ''));
+      const [towns, players, allis] = await Promise.all([get('towns.txt'), get('players.txt'), get('alliances.txt')]);
+      const dec = (v) => { try { return decodeURIComponent(String(v || '').replace(/\+/g, ' ')); } catch { return String(v || ''); } };
+      const al = new Map();
+      for (const l of allis.split('\n')) { const p = l.split(','); if (+p[0]) al.set(+p[0], dec(p[1])); }
+      const pl = new Map();
+      for (const l of players.split('\n')) { const p = l.split(','); if (+p[0]) pl.set(+p[0], { name: dec(p[1]), ally: al.get(+p[2]) || '' }); }
+      const own = new Set(allTownIds());
+      const arr = [], map = new Map();
+      for (const l of towns.split('\n')) {
+        const p = l.split(','); const id = +p[0]; if (!id) continue;
+        const who = pl.get(+p[1]);
+        const t = { id, name: dec(p[2]), ix: +p[3], iy: +p[4], points: +p[6] || 0, player: +p[1] ? (who?.name || `Jugador #${p[1]}`) : 'Abandonada', ally: who?.ally || '', own: own.has(id) };
+        arr.push(t); map.set(id, t);
+      }
+      atk.world = arr; atk.worldById = map; atk.worldLoaded = arr.length > 0;
+    } catch (e) { console.warn('[NOVABOT][ataques] no se pudo cargar el mundo:', e); }
+    atk.worldLoading = false;
+    if (atk.worldLoaded && state.activeTab === 'ataques') renderBody();
+  }
+  const normTxt = (v) => String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+  // Acepta nombre, jugador, alianza, id, [town]123[/town] o el enlace #eyJ… del juego.
+  function atkSearch(q) {
+    const raw = String(q || '').trim();
+    const bb = /\[town\](\d+)\[\/town\]/i.exec(raw) || /^(\d{1,7})$/.exec(raw);
+    if (bb) { const t = atk.worldById.get(+bb[1]); return t ? [t] : []; }
+    const link = /#([A-Za-z0-9+/=]{12,})/.exec(raw);
+    if (link) { try { const o = JSON.parse(atob(link[1])); const t = atk.worldById.get(+o.id); if (t) return [t]; } catch {} }
+    const n = normTxt(raw);
+    if (n.length < 2) return [];
+    return atk.world.filter((t) => normTxt(t.name).includes(n) || normTxt(t.player).includes(n) || (t.ally && normTxt(t.ally).includes(n)))
+      .sort((a, b) => (normTxt(a.name).startsWith(n) ? 0 : 1) - (normTxt(b.name).startsWith(n) ? 0 : 1) || a.name.localeCompare(b.name))
+      .slice(0, 12);
+  }
+
+  // ---------- héroes, hechizos, tropas ----------
+  function heroModels() { try { return [].concat(UW.MM.getCollections()?.PlayerHero || []).flatMap((c) => c?.models || []); } catch { return []; } }
+  const mval = (m, k) => { try { const v = m?.get?.(k); if (v !== undefined) return v; } catch {} return m?.attributes?.[k]; };
+  function heroIdOf(m) { try { const v = m?.getId?.(); if (v != null) return String(v); } catch {} const v = mval(m, 'hero_id') ?? mval(m, 'id'); return v == null ? '' : String(v); }
+  function heroTownOf(m) {
+    for (const fn of ['getHomeTownId', 'getOriginTownId', 'getTownId']) { try { const v = +m?.[fn]?.(); if (v > 0) return v; } catch {} }
+    for (const k of ['home_town_id', 'origin_town_id', 'town_id']) { const v = +mval(m, k); if (v > 0) return v; }
+    return null;
+  }
+  function heroesIn(townId) { return heroModels().map((m) => ({ id: heroIdOf(m), town: heroTownOf(m), level: +mval(m, 'level') || null })).filter((h) => h.id && h.town === +townId); }
+  const heroName = (id) => UW.GameData?.heroes?.[id]?.name || String(id).replace(/_/g, ' ');
+  function powerList() {
+    const out = new Map();
+    for (const src of [UW.GameData?.powers, UW.GameData?.god_powers].filter(Boolean)) {
+      for (const [k, d] of Object.entries(src)) if (!out.has(k) && d && typeof d === 'object') out.set(k, { id: k, name: d.name || k, cost: +(d.favor || d.favor_cost) || 0 });
+    }
+    return [...out.values()].sort((a, b) => a.name.localeCompare(b.name, 'es'));
+  }
+  const U = (id) => UW.GameData?.units?.[id] || {};
+  const atkUnitName = (id) => U(id).name || id;
+  const isFlying = (id) => !!U(id).flying;
+  const isTransport = (id) => +U(id).capacity > 0;
+  const isOffensive = (id) => { const u = U(id); return +u.attack > Math.max(+u.def_hack || 0, +u.def_pierce || 0, +u.def_distance || 0) && !isTransport(id) && id !== 'colonize_ship'; };
+
+  // ---------- información del ataque (servidor) ----------
+  async function attackInfo(sourceId, targetId, maxAgeMs = 20000) {
+    const key = `${sourceId}>${targetId}`;
+    const c = atk.infoCache.get(key);
+    if (c && Date.now() - c.at < maxAgeMs) return c.info;
+    const r = await gpGetAs(sourceId, 'town_info', 'attack', { id: +targetId, nl_init: true });
+    let x = r?.json !== undefined ? r.json : r;
+    if (typeof x === 'string') { try { x = JSON.parse(x); } catch {} }
+    if (!x || typeof x !== 'object' || !x.units) throw new Error(gameErrorText([r]) || 'El juego no devolvió datos del ataque.');
+    atk.infoCache.set(key, { at: Date.now(), info: x });
+    return x;
+  }
+  function gpGetAs(townId, controller, action, json) {
+    const prev = UW.Game.townId;
+    UW.Game.townId = +townId;
+    try { return gpGet(controller, action, { ...json, town_id: +townId }); }
+    finally { UW.Game.townId = prev; }
+  }
+
+  // Duración (ms) con las reglas de Grepolis. Devuelve también la tropa que marca el tiempo.
+  function travelFromInfo(info, units, heroId) {
+    const sel = Object.entries(units).filter(([, n]) => +n > 0).map(([k]) => k);
+    if (!sel.length) return { error: 'Elige al menos una tropa.' };
+    const dur = (k) => +info.units?.[k]?.duration || 0;
+    const ground = sel.filter((k) => !U(k).is_naval && !isFlying(k));
+    const naval = sel.filter((k) => U(k).is_naval);
+    let counted;
+    if (info.same_island) counted = sel;
+    else {
+      if (ground.length && !naval.length) return { error: 'Otra isla: las tropas de tierra necesitan barcos de transporte.' };
+      counted = sel.filter((k) => U(k).is_naval || isFlying(k));
+    }
+    let slow = null, max = 0;
+    for (const k of counted) if (dur(k) > max) { max = dur(k); slow = k; }
+    if (heroId) { const h = +info.heroes_durations?.[heroId]?.duration || 0; if (h > max) { max = h; slow = 'hero'; } }
+    if (!max) return { error: 'El juego no devolvió la duración de esas tropas.' };
+    return { ms: max * 1000, slow };
+  }
+
+  function transportCheck(sourceId, info, units) {
+    if (info.same_island) return null;
+    const sel = Object.fromEntries(Object.entries(units).filter(([, n]) => +n > 0));
+    let c = null;
+    try { c = UW.GameDataUnits?.calculateCapacity?.(+sourceId, sel); } catch {}
+    if (!c) {
+      const berth = +info.researches?.berth || 0;
+      c = { total_capacity: 0, needed_capacity: 0 };
+      for (const [k, n] of Object.entries(sel)) {
+        if (isFlying(k)) continue;
+        if (U(k).is_naval) c.total_capacity += isTransport(k) ? (+U(k).capacity + berth) * n : 0;
+        else c.needed_capacity += (+U(k).population || 1) * n;
+      }
+    }
+    if (!c.needed_capacity) return null;
+    return { need: c.needed_capacity, have: c.total_capacity, ok: c.total_capacity >= c.needed_capacity };
+  }
+
+  // Añade los barcos de transporte que falten (primero los lentos, que llevan más).
+  function addNeededTransports(sourceId, info, units) {
+    const t = transportCheck(sourceId, info, units);
+    if (!t || t.ok) return units;
+    const out = { ...units };
+    const berth = +info.researches?.berth || 0;
+    let missing = t.need - t.have;
+    for (const k of ['big_transporter', 'small_transporter']) {
+      if (missing <= 0) break;
+      const cap = (+U(k).capacity || 0) + berth;
+      const avail = (+info.units?.[k]?.count || 0) - (+out[k] || 0);
+      if (cap <= 0 || avail <= 0) continue;
+      const n = Math.min(avail, Math.ceil(missing / cap));
+      out[k] = (+out[k] || 0) + n; missing -= n * cap;
+    }
+    return out;
+  }
+
+  // Avisos de Grepolis para un plan concreto.
+  function atkWarnings(item, info, arrivalAt) {
+    const w = [];
+    const type = item.type;
+    if (type !== 'support' && info.same_alliance) w.push({ lvl: 'danger', txt: 'El objetivo es de TU ALIANZA.' });
+    else if (type !== 'support' && info.alliance_pact) w.push({ lvl: 'danger', txt: 'El objetivo es de una alianza con PACTO.' });
+    if (type !== 'support' && info.has_player_protection && +info.protection_ends * 1000 > (arrivalAt || 0)) w.push({ lvl: 'danger', txt: `Objetivo con protección de principiante hasta ${fmtWhen(+info.protection_ends * 1000)}.` });
+    const ns = +info.night_starts_at_hour, nd = +info.night_duration;
+    if (nd > 0 && arrivalAt) {
+      const h = wall(arrivalAt).getUTCHours();
+      const inNight = ((h - ns + 24) % 24) < nd;
+      if (inNight && type !== 'support') w.push({ lvl: 'warn', txt: `Llega en MODO NOCHE (${two(ns)}:00–${two((ns + nd) % 24)}:00): la defensa cuenta doble.` });
+    }
+    if (type !== 'support' && info.morale_activated && +info.morale < 100) w.push({ lvl: 'info', txt: `Moral ${Math.round(+info.morale)} %: tu ataque rinde a ese porcentaje.` });
+    const tr = transportCheck(item.source, info, item.units);
+    if (tr && !tr.ok) w.push({ lvl: 'danger', txt: `Faltan barcos: capacidad ${tr.have}/${tr.need}.`, fix: 'transport' });
+    // Tropas ya comprometidas en otros ataques programados desde la misma ciudad.
+    const committed = {};
+    for (const a of atk.queue) {
+      if (a.id === item.id || a.status !== 'pending' || a.source !== item.source) continue;
+      if (a.executeAt > (item.executeAt || Infinity)) continue;
+      for (const [k, n] of Object.entries(a.units)) committed[k] = (committed[k] || 0) + (+n || 0);
+    }
+    const short = Object.entries(item.units).filter(([k, n]) => +n > 0 && (+info.units?.[k]?.count || 0) - (committed[k] || 0) < +n);
+    if (short.length) w.push({ lvl: 'warn', txt: `Tropas también usadas en otro ataque anterior: ${short.map(([k]) => atkUnitName(k)).join(', ')}.` });
+    return w;
+  }
+
+  // ---------- cola ----------
+  function atkLoad() { try { atk.queue = JSON.parse(localStorage.getItem(ATK_KEY) || '[]'); } catch { atk.queue = []; } }
+  function atkSave() {
+    try { localStorage.setItem(ATK_KEY, JSON.stringify(atk.queue.map(({ _pre, _armed, ...rest }) => rest))); } catch {}
+  }
+  const atkCorrection = () => clamp(+state.ataques?.correctionMs || 0, -1500, 1500);
+
+  function buildPayload(a, info) {
+    const p = { id: +a.target, type: a.type, nl_init: true };
+    const used = {}, missing = [];
+    let total = 0;
+    for (const [k, v] of Object.entries(a.units)) {
+      const req = Math.max(0, Math.floor(+v || 0)); if (!req) continue;
+      const have = Math.max(0, Math.floor(+info?.units?.[k]?.count || 0));
+      const n = Math.min(req, have);
+      if (n > 0) { p[k] = n; used[k] = n; total += n; }
+      if (n < req) missing.push(`${atkUnitName(k)} ${n}/${req}`);
+    }
+    if (!total) throw new Error('No queda ninguna de las tropas elegidas en la ciudad.');
+    if (missing.length && a.onMissing === 'skip') throw new Error(`Faltan tropas (${missing.join(', ')}); configurado para no enviar.`);
+    if (a.type === 'attack' && a.strategy) p.attacking_strategy = [a.strategy];
+    if (a.spell) p.power_id = a.spell;
+    if (a.hero && heroesIn(a.source).some((h) => h.id === String(a.hero))) p.heroes = a.hero;
+    return { payload: p, used, missing };
+  }
+
+  // Llegada real que devuelve el juego (arrival_at en las notificaciones).
+  function arrivalFromResponse(res, expectedMs) {
+    let txt = ''; try { txt = JSON.stringify(res); } catch {}
+    const vals = [...txt.matchAll(/arrival_at\\*"?\s*:\s*\\*"?(\d{10})/g)].map((m) => +m[1] * 1000);
+    if (!vals.length) return null;
+    vals.sort((a, b) => Math.abs(a - expectedMs) - Math.abs(b - expectedMs));
+    return Math.abs(vals[0] - expectedMs) < 6 * 3600000 ? vals[0] : null;
+  }
+
+  async function atkFire(a) {
+    if (a.status !== 'pending') return;
+    a.status = 'sending'; atkRefreshQueue();
+    try {
+      let pre = a._pre;
+      if (!pre || Date.now() - pre.at > 20000) {
+        const info = await attackInfo(a.source, a.target, 0);
+        pre = { at: Date.now(), ...buildPayload(a, info) };
+      }
+      const res = await gpPostAs(a.source, 'town_info', 'send_units', pre.payload);
+      a.status = 'sent'; a.sentAt = srvNow();
+      if (pre.missing.length) a.note = `Enviado con menos tropas: ${pre.missing.join(', ')}`;
+      const expected = a.executeAt + a.duration;
+      const real = arrivalFromResponse(res, expected);
+      if (real) {
+        a.realArrival = real;
+        const errS = Math.round((real - expected) / 1000);
+        a.arrivalErr = errS;
+        // Auto-corrección: si llegó 1 s tarde/pronto, adelantar/retrasar los próximos.
+        // (solo con el reloj bien sincronizado; si no, el error sería del reloj, no del disparo)
+        if (errS !== 0 && Math.abs(errS) <= 2 && clockOffset().err < 250) {
+          state.ataques.correctionMs = clamp(atkCorrection() + (errS > 0 ? 250 : -250), -1500, 1500);
+          saveState();
+        }
+      }
+      atkLog(`${farmTownName(a.source)} → ${a.targetName}: ${a.type === 'support' ? 'apoyo' : 'ataque'} enviado${real ? ` · llega ${fmtClock(real)}${a.arrivalErr ? ` (${a.arrivalErr > 0 ? '+' : ''}${a.arrivalErr} s)` : ' ✓ exacto'}` : ''}.`, 'ok');
+    } catch (e) {
+      a.status = /configurado para no enviar/.test(e.message) ? 'skipped' : 'error';
+      a.error = e.message;
+      atkLog(`${farmTownName(a.source)} → ${a.targetName}: ${e.message}`, 'error');
+    }
+    delete a._pre; delete a._armed;
+    atkSave(); atkRefreshQueue();
+  }
+
+  async function atkRecheck(a) {
+    try {
+      const info = await attackInfo(a.source, a.target, 0);
+      const t = travelFromInfo(info, a.units, a.hero);
+      if (t.error) return;
+      a.duration = t.ms;
+      if (a.mode === 'arrival') {
+        const exec = a.wantAt - t.ms;
+        if (exec < srvNow() + 300) { a.executeAt = Math.ceil((srvNow() + 1500) / 1000) * 1000; a.note = 'La llegada pedida ya no era alcanzable: sale en cuanto se pueda.'; }
+        else a.executeAt = exec;
+      }
+      a.arrivalAt = a.executeAt + a.duration;
+      atkSave();
+    } catch {}
+  }
+
+  // Latido (cada 200 ms, desde el Worker): recálculos, precarga, armado y perdidos.
+  function atkHeartbeat() {
+    const now = srvNow();
+    for (const a of atk.queue) {
+      if (a.status !== 'pending') continue;
+      const left = a.executeAt - now;
+      if (left < -ATK_MISS_TOLERANCE_MS) {
+        a.status = 'missed'; a.error = `No se envió: la hora de salida pasó hace ${fmtDur(-left)} (¿página cerrada o PC en reposo?).`;
+        atkLog(`${farmTownName(a.source)} → ${a.targetName}: perdido (no se envía tarde).`, 'error');
+        atkSave(); atkRefreshQueue(); continue;
+      }
+      if (a.mode === 'arrival' && !a._rechecked && left < ATK_RECHECK_MS && left > ATK_PREFETCH_MS) {
+        a._rechecked = true; atkRecheck(a);
+      }
+      if (!a._pre && !a._prefetching && left < ATK_PREFETCH_MS && left > 400) {
+        a._prefetching = true;
+        attackInfo(a.source, a.target, 0)
+          .then((info) => { a._pre = { at: Date.now(), ...buildPayload(a, info) }; })
+          .catch(() => {})
+          .finally(() => { a._prefetching = false; });
+      }
+      if (!a._armed && left < ATK_ARM_MS) {
+        a._armed = true;
+        // Hora local a la que disparar para que llegue al servidor a mitad del segundo.
+        const fireLocal = a.executeAt + ATK_INTO_SECOND_MS - clockOffset().off - latencyOneWay() - atkCorrection();
+        atkTimerAt(a.id, fireLocal - Date.now(), () => atkFire(a));
+      }
+    }
+  }
+
+  function startAttackEngine() {
+    if (atk.started) return;
+    atk.started = true;
+    if (!state.ataques) state.ataques = { correctionMs: 0 };
+    atkLoad();
+    for (const a of atk.queue) if (a.status === 'sending') { a.status = 'error'; a.error = 'La página se recargó mientras se enviaba: revisa en el juego si salió.'; }
+    atkSave();
+    installClockSync();
+    const w = atkWorker();
+    if (w) w.postMessage({ cmd: 'every', ms: 200 });
+    else setInterval(atkHeartbeat, 200);
+    setInterval(atkUpdateLive, 100);
+  }
+
+  function atkLog(text, kind = 'info') {
+    atk.log.unshift({ at: Date.now(), text, kind });
+    atk.log.length = Math.min(atk.log.length, 40);
+    if (atkLogEl) paintLog(atkLogEl, atk.log);
+  }
+  function paintLog(box, list) {
+    box.innerHTML = '';
+    if (!list.length) { box.appendChild(el('p', { class: 'nb-placeholder' }, 'Sin actividad todavía.')); return; }
+    for (const e of list) box.appendChild(el('div', { class: `nb-log-item nb-log-${e.kind}` }, `${new Date(e.at).toLocaleTimeString('es-ES')} · ${e.text}`));
+  }
+
+  // ---------- UI ----------
+  let atkQueueEl = null, atkPlanEl = null, atkLogEl = null;
+
+  function nextPending() { return atk.queue.filter((a) => a.status === 'pending').sort((a, b) => a.executeAt - b.executeAt)[0] || null; }
+
+  function atkUpdateLive() {
+    if (state.activeTab !== 'ataques' && state.activeTab !== 'inicio') return;
+    const now = srvNow();
+    const c = $('#nb-atk-clock'); if (c) c.textContent = fmtClock(now, true);
+    const p = $('#nb-atk-prec'); if (p) { const e = clockOffset().err; p.textContent = e >= 1000 ? 'sincronizando…' : `±${Math.round(e)} ms`; p.classList.toggle('nb-ok', e < 150); }
+    for (const n of $$('[data-atk-at]')) n.textContent = fmtCount(+n.dataset.atkAt - now);
+  }
+
+  function atkRefreshQueue() {
+    if (!atkQueueEl || state.activeTab !== 'ataques') return;
+    atkQueueEl.innerHTML = '';
+    const order = { sending: 0, pending: 1, error: 2, missed: 2, skipped: 3, sent: 4 };
+    const list = atk.queue.slice().sort((a, b) => (order[a.status] - order[b.status]) || (a.status === 'sent' ? b.executeAt - a.executeAt : a.executeAt - b.executeAt));
+    if (!list.length) { atkQueueEl.appendChild(el('p', { class: 'nb-placeholder' }, 'No hay nada programado.')); return; }
+    const label = { pending: 'programado', sending: 'enviando…', sent: 'enviado', error: 'error', missed: 'perdido', skipped: 'no enviado' };
+    for (const a of list) {
+      const units = Object.entries(a.units).map(([k, n]) => `${n} ${atkUnitName(k)}`).join(' · ');
+      const actions = [];
+      if (a.status === 'pending') {
+        actions.push(el('span', { class: 'nb-mini', title: 'Duplicar llegando 1 s después (tren)', onclick: () => atkDuplicate(a) }, '+1s'));
+        actions.push(el('span', { class: 'nb-mini', title: 'Editar', onclick: () => atkEdit(a) }, '✎'));
+        actions.push(el('span', { class: 'nb-mini nb-mini-danger', title: 'Cancelar', onclick: () => { atkTimerClear(a.id); atk.queue = atk.queue.filter((x) => x !== a); atkSave(); atkRefreshQueue(); } }, '✕'));
+      } else {
+        if (a.status === 'missed' || a.status === 'error') actions.push(el('span', { class: 'nb-mini', title: 'Volver a programar (editar)', onclick: () => atkEdit(a) }, '✎'));
+        actions.push(el('span', { class: 'nb-mini', title: 'Quitar de la lista', onclick: () => { atk.queue = atk.queue.filter((x) => x !== a); atkSave(); atkRefreshQueue(); } }, '✕'));
+      }
+      atkQueueEl.appendChild(el('div', { class: `nb-atk-item nb-atk-${a.status}` }, [
+        el('div', { class: 'nb-atk-top' }, [
+          el('span', { class: `nb-tag nb-tag-${a.type === 'support' ? 'support' : 'attack'}` }, a.type === 'support' ? 'apoyo' : a.type === 'revolt' ? 'revuelta' : 'ataque'),
+          el('span', { class: 'nb-atk-route' }, `${farmTownName(a.source)} → ${a.targetName}`),
+          el('span', { class: `nb-tag nb-tag-${a.status}` }, label[a.status] || a.status)
+        ]),
+        el('div', { class: 'nb-atk-times' }, [
+          el('div', {}, [el('span', {}, 'Sale'), el('b', {}, fmtWhen(a.executeAt))]),
+          el('div', {}, [el('span', {}, 'Llega'), el('b', {}, fmtWhen(a.realArrival || a.arrivalAt))]),
+          a.status === 'pending' || a.status === 'sending'
+            ? el('div', { class: 'nb-atk-count' }, [el('span', {}, 'Falta'), el('b', { 'data-atk-at': a.executeAt }, fmtCount(a.executeAt - srvNow()))])
+            : a.arrivalErr !== undefined && a.status === 'sent'
+              ? el('div', {}, [el('span', {}, 'Precisión'), el('b', { class: a.arrivalErr ? 'nb-warn-txt' : 'nb-ok' }, a.arrivalErr ? `${a.arrivalErr > 0 ? '+' : ''}${a.arrivalErr} s` : 'exacta')])
+              : null
+        ]),
+        el('div', { class: 'nb-goal-sub' }, `${units}${a.hero ? ` · héroe ${heroName(a.hero)}` : ''}${a.spell ? ' · hechizo' : ''}`),
+        a.error ? el('div', { class: 'nb-goal-sub nb-err' }, a.error) : a.note ? el('div', { class: 'nb-goal-sub' }, a.note) : null,
+        el('div', { class: 'nb-atk-actions' }, actions)
+      ]));
+    }
+    atkUpdateLive();
+  }
+
+  function atkEdit(a) {
+    const f = atk.form;
+    Object.assign(f, {
+      source: a.source, target: atk.worldById.get(a.target) || { id: a.target, name: a.targetName, player: '', ally: '', points: 0 },
+      units: { ...a.units }, hero: a.hero || '', spell: a.spell || '', type: a.type, strategy: a.strategy || '',
+      mode: a.mode, time: fmtClock(a.wantAt), onMissing: a.onMissing || 'partial', info: null
+    });
+    atkTimerClear(a.id);
+    atk.queue = atk.queue.filter((x) => x !== a);
+    atkSave();
+    atk.view = 'new';
+    renderBody();
+    atkLoadInfo();
+  }
+
+  function atkDuplicate(a) {
+    const b = { ...a, id: `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`, status: 'pending', note: '', error: '' };
+    delete b._pre; delete b._armed; delete b._rechecked; delete b.realArrival; delete b.arrivalErr;
+    b.wantAt = a.wantAt + 1000; b.executeAt = a.executeAt + 1000; b.arrivalAt = a.arrivalAt + 1000;
+    atk.queue.push(b); atkSave(); atkRefreshQueue();
+    atkLog(`Duplicado: ${b.targetName}, llega ${fmtClock(b.arrivalAt)}.`, 'info');
+  }
+
+  // Carga la info del servidor para el par origen→objetivo del formulario.
+  async function atkLoadInfo() {
+    const f = atk.form;
+    if (!f.source || !f.target) { f.info = null; return; }
+    const key = `${f.source}>${f.target.id}`;
+    f.infoLoading = true; f.infoError = ''; f.infoKey = key;
+    atkPaintPlan();
+    try {
+      const info = await attackInfo(f.source, f.target.id);
+      if (f.infoKey !== key) return;
+      f.info = info;
+      if (!info.attack_strategies?.[f.strategy]) f.strategy = Object.keys(info.attack_strategies || {})[0] || '';
+      if (f.type !== 'support' && !info.attack_types?.[f.type]) f.type = 'attack';
+    } catch (e) { if (f.infoKey === key) { f.info = null; f.infoError = e.message; } }
+    f.infoLoading = false;
+    if (state.activeTab === 'ataques' && atk.view === 'new') renderBody();
+  }
+
+  function atkComputePlan() {
+    const f = atk.form;
+    if (!f.info) return null;
+    const t = travelFromInfo(f.info, f.units, f.hero);
+    if (t.error) return { error: t.error };
+    const now = srvNow();
+    const hms = normTime(f.time);
+    let executeAt = null, arrivalAt = null, wantAt = null, note = '';
+    if (/^\d{2}:\d{2}:\d{2}$/.test(hms)) {
+      if (f.mode === 'arrival') {
+        wantAt = nextWallTime(hms, now + t.ms + 1500);
+        const today = nextWallTime(hms, now);
+        if (today && wantAt !== today) note = `Hoy ya no llega a las ${hms} (lo antes posible: ${fmtWhen(now + t.ms)}): se programa para ${dayWord(wantAt)}.`;
+        executeAt = wantAt - t.ms; arrivalAt = wantAt;
+      } else {
+        wantAt = nextWallTime(hms, now + 1500);
+        executeAt = wantAt; arrivalAt = wantAt + t.ms;
+      }
+    }
+    return { ms: t.ms, slow: t.slow, executeAt, arrivalAt, wantAt, note };
+  }
+
+  function atkPaintPlan() {
+    if (!atkPlanEl) return;
+    const f = atk.form;
+    atkPlanEl.innerHTML = '';
+    if (f.infoLoading) { atkPlanEl.appendChild(el('p', { class: 'nb-placeholder' }, 'Consultando al juego…')); return; }
+    if (f.infoError) { atkPlanEl.appendChild(el('p', { class: 'nb-placeholder nb-err' }, f.infoError)); return; }
+    const plan = atkComputePlan();
+    if (!plan) { atkPlanEl.appendChild(el('p', { class: 'nb-placeholder' }, 'Elige origen, objetivo y tropas.')); return; }
+    if (plan.error) { atkPlanEl.appendChild(el('p', { class: 'nb-placeholder nb-err' }, plan.error)); return; }
+    atkPlanEl.appendChild(el('div', { class: 'nb-stats' }, [
+      el('div', { class: 'nb-stat' }, [el('span', {}, 'Viaje'), el('b', {}, fmtDur(plan.ms)), el('small', {}, plan.slow === 'hero' ? 'marca el héroe' : plan.slow ? `marca: ${atkUnitName(plan.slow)}` : '')]),
+      el('div', { class: 'nb-stat' }, [el('span', {}, 'Salida'), el('b', {}, plan.executeAt ? fmtClock(plan.executeAt) : '—'), el('small', {}, plan.executeAt ? dayWord(plan.executeAt) : '')]),
+      el('div', { class: 'nb-stat' }, [el('span', {}, 'Llegada'), el('b', {}, plan.arrivalAt ? fmtClock(plan.arrivalAt) : '—'), el('small', {}, plan.arrivalAt ? dayWord(plan.arrivalAt) : '')])
+    ]));
+    if (plan.note) atkPlanEl.appendChild(el('div', { class: 'nb-alert nb-alert-warn' }, plan.note));
+    const draft = { id: null, source: f.source, type: f.type, units: f.units, executeAt: plan.executeAt };
+    for (const w of atkWarnings(draft, f.info, plan.arrivalAt)) {
+      const box = el('div', { class: `nb-alert nb-alert-${w.lvl}` }, w.txt);
+      if (w.fix === 'transport') box.appendChild(el('span', { class: 'nb-btn nb-btn-sm', onclick: () => { f.units = addNeededTransports(f.source, f.info, f.units); renderBody(); } }, 'Añadir barcos'));
+      atkPlanEl.appendChild(box);
+    }
+  }
+
+  async function atkSubmit() {
+    const f = atk.form;
+    if (!f.target) throw new Error('Elige un objetivo.');
+    if (f.target.id && allTownIds().includes(+f.target.id) && f.type !== 'support') throw new Error('Es una ciudad tuya: para mandar tropas usa "Apoyo".');
+    const info = await attackInfo(f.source, f.target.id, 0);
+    f.info = info;
+    const plan = atkComputePlan();
+    if (!plan || plan.error) throw new Error(plan?.error || 'Plan no válido.');
+    if (!plan.executeAt) throw new Error('Pon una hora válida (HH:MM:SS).');
+    const units = Object.fromEntries(Object.entries(f.units).filter(([, n]) => +n > 0).map(([k, n]) => [k, Math.floor(+n)]));
+    for (const [k, n] of Object.entries(units)) if (n > (+info.units?.[k]?.count || 0)) throw new Error(`Solo hay ${+info.units?.[k]?.count || 0} ${atkUnitName(k)} en la ciudad.`);
+    const item = {
+      id: `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`, source: +f.source, target: +f.target.id,
+      targetName: f.target.name + (f.target.player ? ` (${f.target.player})` : ''), type: f.type, strategy: f.strategy,
+      units, hero: f.hero, spell: f.spell, mode: f.mode, wantAt: plan.wantAt, duration: plan.ms,
+      executeAt: plan.executeAt, arrivalAt: plan.arrivalAt, onMissing: f.onMissing, status: 'pending',
+      note: plan.note || '', error: '', createdAt: Date.now()
+    };
+    const danger = atkWarnings(item, info, plan.arrivalAt).filter((w) => w.lvl === 'danger');
+    if (danger.length && !confirm(`Atención:\n· ${danger.map((w) => w.txt).join('\n· ')}\n\n¿Programar igualmente?`)) return;
+    atk.queue.push(item); atkSave();
+    atk.recent = [f.target, ...atk.recent.filter((t) => t.id !== f.target.id)].slice(0, 6);
+    atkLog(`Programado: ${farmTownName(item.source)} → ${item.targetName}, sale ${fmtWhen(item.executeAt)}, llega ${fmtWhen(item.arrivalAt)}.`, 'ok');
+    // Tren: mantener objetivo y avanzar la hora para el siguiente.
+    if (f.keep) { f.units = {}; if (/^\d{2}:\d{2}:\d{2}$/.test(normTime(f.time))) f.time = fmtClock(nextWallTime(normTime(f.time), srvNow()) + (+f.step || 1) * 1000); }
+    else Object.assign(f, { target: null, units: {}, time: '', info: null, hero: '', spell: '' });
+    renderBody();
+  }
+
+  function renderAtaquesTab() {
+    atkLoadWorld();
+    installClockSync();
+    const f = atk.form;
+    const towns = allTownIds().sort((a, b) => farmTownName(a).localeCompare(farmTownName(b), 'es'));
+    if (!f.source || !towns.includes(+f.source)) f.source = +UW.Game?.townId || towns[0];
+
+    // Cabecera: reloj + siguiente
+    const nx = nextPending();
+    bodyEl.appendChild(el('div', { class: 'nb-card nb-hero nb-hero-atk' }, [
+      el('div', {}, [el('div', { class: 'nb-hero-label' }, 'Hora del servidor'), el('div', { class: 'nb-hero-value nb-mono', id: 'nb-atk-clock' }, '--:--:--'), el('div', { class: 'nb-hero-sub', id: 'nb-atk-prec' }, '')]),
+      nx ? el('div', { class: 'nb-hero-next' }, [el('div', { class: 'nb-hero-label' }, 'Próxima salida'), el('div', { class: 'nb-hero-value nb-mono', 'data-atk-at': nx.executeAt }, ''), el('div', { class: 'nb-hero-sub' }, `${farmTownName(nx.source)} → ${nx.targetName}`)]) : null
+    ]));
+
+    const pendingN = atk.queue.filter((a) => a.status === 'pending').length;
+    bodyEl.appendChild(el('div', { class: 'nb-seg nb-seg-main' }, [['new', 'Nuevo'], ['queue', `Programados (${pendingN})`]].map(([v, l]) =>
+      el('span', { class: `nb-seg-btn${atk.view === v ? ' active' : ''}`, onclick: () => { atk.view = v; renderBody(); } }, l))));
+
+    if (atk.view === 'queue') {
+      atkQueueEl = el('div', { class: 'nb-atk-list' });
+      bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+        el('div', { class: 'nb-card-head' }, [
+          el('div', { class: 'nb-card-title' }, 'Programados'),
+          el('span', { class: 'nb-btn nb-btn-sm', onclick: () => { atk.queue = atk.queue.filter((a) => a.status === 'pending' || a.status === 'sending'); atkSave(); atkRefreshQueue(); } }, 'Limpiar terminados')
+        ]),
+        atkQueueEl
+      ]));
+      atkRefreshQueue();
+    } else {
+      atkQueueEl = null;
+      renderAtkForm(towns);
+    }
+
+    const logBox = el('div', { class: 'nb-log' });
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [el('div', { class: 'nb-card-title' }, 'Actividad'), logBox]));
+    atkLogEl = logBox; paintLog(logBox, atk.log);
+    atkUpdateLive();
+  }
+
+  function renderAtkForm(towns) {
+    const f = atk.form;
+    const info = f.info && f.infoKey === `${f.source}>${f.target?.id}` ? f.info : null;
+    if (f.target && !info && !f.infoLoading && !f.infoError) atkLoadInfo();
+
+    // 1) Origen
+    const srcSel = el('select', { class: 'nb-input' });
+    for (const id of towns) { const o = el('option', { value: id }, farmTownName(id)); if (id === +f.source) o.selected = true; srcSel.appendChild(o); }
+    srcSel.addEventListener('change', () => { f.source = +srcSel.value; f.units = {}; f.hero = ''; f.info = null; f.infoError = ''; renderBody(); });
+
+    // 2) Objetivo
+    let targetBox;
+    if (f.target) {
+      targetBox = el('div', { class: 'nb-selected' }, [
+        el('div', { class: 'nb-selected-main' }, [
+          el('b', {}, f.target.name),
+          el('span', { class: 'nb-add-level' }, [f.target.player, f.target.ally ? ` · ${f.target.ally}` : '', f.target.points ? ` · ${f.target.points.toLocaleString('es-ES')} pts` : '', info ? (info.same_island ? ' · misma isla' : ' · otra isla') : ''].join(''))
+        ]),
+        el('span', { class: 'nb-mini', title: 'Cambiar objetivo', onclick: () => { f.target = null; f.info = null; f.infoError = ''; renderBody(); } }, '✕')
+      ]);
+    } else {
+      const search = el('input', { class: 'nb-input', type: 'text', placeholder: atk.worldLoaded ? 'Nombre, jugador, alianza, id o [town]…[/town]' : 'Cargando ciudades del mundo…', value: f.search });
+      if (!atk.worldLoaded) search.disabled = true;
+      const sugg = el('div', { class: 'nb-add-list' });
+      const pick = (t) => { f.target = t; f.search = ''; f.info = null; f.infoError = ''; renderBody(); };
+      const paint = () => {
+        sugg.innerHTML = '';
+        const r = atkSearch(search.value);
+        if (search.value.trim().length >= 2 && !r.length) sugg.appendChild(el('p', { class: 'nb-placeholder' }, 'Sin coincidencias.'));
+        for (const t of r) sugg.appendChild(el('div', { class: 'nb-add-row nb-clickable', onclick: () => pick(t) }, [
+          el('div', { class: 'nb-add-name' }, [el('span', {}, t.name), t.own ? el('span', { class: 'nb-tag nb-tag-support' }, 'tuya') : null,
+            el('span', { class: 'nb-add-level' }, `${t.player}${t.ally ? ` · ${t.ally}` : ''} · ${t.points.toLocaleString('es-ES')} pts`)])
+        ]));
+      };
+      search.addEventListener('input', () => { f.search = search.value; paint(); });
+      search.addEventListener('keydown', (e) => { if (e.key === 'Enter') { const r = atkSearch(search.value); if (r[0]) pick(r[0]); } });
+      paint();
+      const recents = atk.recent.length ? el('div', { class: 'nb-chips' }, atk.recent.map((t) => el('span', { class: 'nb-chip', onclick: () => pick(t) }, t.name))) : null;
+      targetBox = el('div', {}, [search, recents, sugg]);
+    }
+
+    // 3) Tipo / estrategia
+    const types = Object.entries(info?.attack_types || { attack: 'Ataque' }).concat([['support', 'Apoyo']]);
+    const typeSeg = el('div', { class: 'nb-seg' }, types.map(([k, l]) => el('span', { class: `nb-seg-btn${f.type === k ? ' active' : ''}`, onclick: () => { f.type = k; renderBody(); } }, l)));
+    const strategies = Object.entries(info?.attack_strategies || {});
+    let stratSel = null;
+    if (strategies.length > 1 && f.type !== 'support') {
+      stratSel = el('select', { class: 'nb-input' });
+      for (const [k, l] of strategies) { const o = el('option', { value: k }, l); if (k === f.strategy) o.selected = true; stratSel.appendChild(o); }
+      stratSel.addEventListener('change', () => { f.strategy = stratSel.value; });
+    }
+
+    // 4) Tropas (disponibles según el juego, con su duración)
+    const counts = {};
+    if (info) for (const [k, u] of Object.entries(info.units || {})) counts[k] = +u.count || 0;
+    else Object.assign(counts, townUnitsHave(f.source));
+    const rows = Object.entries(counts).filter(([k, n]) => n > 0 && k !== 'militia' && UW.GameData?.units?.[k])
+      .sort(([a], [b]) => ((U(a).is_naval ? 1 : 0) - (U(b).is_naval ? 1 : 0)) || atkUnitName(a).localeCompare(atkUnitName(b), 'es'));
+    const plan = info ? atkComputePlan() : null;
+    const grid = el('div', { class: 'nb-units-grid' });
+    for (const [k, n] of rows) {
+      const input = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '0', max: String(n), placeholder: '0', value: f.units[k] || '' });
+      input.addEventListener('input', () => { f.units[k] = clamp(pos(input.value, 0), 0, n); if (+input.value > n) input.value = n; atkPaintPlan(); markSlow(); });
+      const d = +info?.units?.[k]?.duration;
+      grid.appendChild(el('div', { class: `nb-unit-cell${plan?.slow === k ? ' nb-slow' : ''}`, 'data-unit': k, title: d ? `Viaje de ${atkUnitName(k)}: ${fmtDur(d * 1000)}` : atkUnitName(k) }, [
+        el('div', { class: 'nb-unit-info' }, [el('span', { class: 'nb-unit-name' }, atkUnitName(k)), el('span', { class: 'nb-unit-sub' }, `${n}${d ? ` · ${fmtDur(d * 1000)}` : ''}`)]),
+        el('span', { class: 'nb-mini', title: 'Todas', onclick: () => { input.value = n; f.units[k] = n; atkPaintPlan(); markSlow(); } }, 'máx'),
+        input
+      ]));
+    }
+    const setUnits = (pred) => { f.units = {}; for (const [k, n] of rows) if (pred(k)) f.units[k] = n; renderBody(); };
+    function markSlow() {
+      const p = atkComputePlan();
+      for (const c of $$('.nb-unit-cell', grid)) c.classList.toggle('nb-slow', !!p && p.slow === c.dataset.unit);
+    }
+
+    // 5) Héroe / hechizo
+    const heroSel = el('select', { class: 'nb-input' });
+    heroSel.appendChild(el('option', { value: '' }, 'Sin héroe'));
+    for (const h of heroesIn(f.source)) { const o = el('option', { value: h.id }, `${heroName(h.id)}${h.level ? ` · nv ${h.level}` : ''}`); if (h.id === f.hero) o.selected = true; heroSel.appendChild(o); }
+    heroSel.addEventListener('change', () => { f.hero = heroSel.value; atkPaintPlan(); });
+    const spellSel = el('select', { class: 'nb-input' });
+    spellSel.appendChild(el('option', { value: '' }, 'Sin hechizo'));
+    for (const p of powerList()) { const o = el('option', { value: p.id }, `${p.name}${p.cost ? ` · ${p.cost} favor` : ''}`); if (p.id === f.spell) o.selected = true; spellSel.appendChild(o); }
+    spellSel.addEventListener('change', () => { f.spell = spellSel.value; });
+
+    // 6) Hora
+    const modeSeg = el('div', { class: 'nb-seg' }, [['arrival', 'Llegar a las'], ['departure', 'Salir a las']].map(([m, l]) =>
+      el('span', { class: `nb-seg-btn${f.mode === m ? ' active' : ''}`, onclick: () => { f.mode = m; renderBody(); } }, l)));
+    const timeIn = el('input', { class: 'nb-input nb-input-time', type: 'text', inputmode: 'numeric', placeholder: 'HH:MM:SS', value: f.time, maxlength: '8' });
+    timeIn.addEventListener('input', () => { f.time = timeIn.value; atkPaintPlan(); });
+    timeIn.addEventListener('blur', () => { const n = normTime(timeIn.value); if (n !== timeIn.value) { timeIn.value = n; f.time = n; atkPaintPlan(); } });
+    const shift = (s) => {
+      const base = /^\d{2}:\d{2}:\d{2}$/.test(normTime(f.time)) ? nextWallTime(normTime(f.time), srvNow() - 86400000 + 1) : srvNow();
+      f.time = fmtClock(base + s * 1000); timeIn.value = f.time; atkPaintPlan();
+    };
+    const soonest = () => {
+      const p = atkComputePlan();
+      const base = srvNow() + 15000 + (f.mode === 'arrival' && p?.ms ? p.ms : 0);
+      f.time = fmtClock(Math.ceil(base / 1000) * 1000); timeIn.value = f.time; atkPaintPlan();
+    };
+    const quick = el('div', { class: 'nb-quick' }, [
+      el('span', { class: 'nb-mini', onclick: soonest, title: 'Lo antes posible (+15 s)' }, 'ya'),
+      el('span', { class: 'nb-mini', onclick: () => shift(-1) }, '−1s'),
+      el('span', { class: 'nb-mini', onclick: () => shift(1) }, '+1s'),
+      el('span', { class: 'nb-mini', onclick: () => shift(10) }, '+10s'),
+      el('span', { class: 'nb-mini', onclick: () => shift(60) }, '+1m'),
+      el('span', { class: 'nb-mini', onclick: () => shift(600) }, '+10m')
+    ]);
+
+    atkPlanEl = el('div', { class: 'nb-plan' });
+
+    const missSeg = el('div', { class: 'nb-seg nb-seg-sm' }, [['partial', 'Enviar lo que haya'], ['skip', 'No enviar']].map(([v, l]) =>
+      el('span', { class: `nb-seg-btn${f.onMissing === v ? ' active' : ''}`, onclick: () => { f.onMissing = v; renderBody(); } }, l)));
+    const stepIn = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '0', value: f.step });
+    stepIn.addEventListener('change', () => { f.step = Math.max(0, pos(stepIn.value, 1)); });
+
+    const addBtn = el('span', { class: 'nb-btn nb-btn-primary nb-btn-block' }, f.type === 'support' ? 'Programar apoyo' : 'Programar ataque');
+    addBtn.addEventListener('click', async () => {
+      addBtn.textContent = 'Comprobando con el juego…';
+      try { await atkSubmit(); } catch (e) { atkLog(e.message, 'error'); addBtn.textContent = f.type === 'support' ? 'Programar apoyo' : 'Programar ataque'; atkPaintPlan(); }
+    });
+
+    const section = (n, title, children) => el('div', { class: 'nb-step' }, [el('div', { class: 'nb-step-head' }, [el('span', { class: 'nb-step-n' }, String(n)), el('span', {}, title)]), ...[].concat(children)]);
+    bodyEl.appendChild(el('div', { class: 'nb-card nb-form' }, [
+      section(1, 'Origen', srcSel),
+      section(2, 'Objetivo', targetBox),
+      section(3, 'Tipo', [typeSeg, stratSel]),
+      section(4, 'Tropas', rows.length ? [
+        el('div', { class: 'nb-quick' }, [
+          el('span', { class: 'nb-mini', onclick: () => setUnits(() => true) }, 'Todas'),
+          el('span', { class: 'nb-mini', onclick: () => setUnits(isOffensive) }, 'Ofensivas'),
+          el('span', { class: 'nb-mini', onclick: () => setUnits((k) => !U(k).is_naval) }, 'Solo tierra'),
+          el('span', { class: 'nb-mini', onclick: () => setUnits(() => false) }, 'Ninguna')
+        ]),
+        grid,
+        el('div', { class: 'nb-field-row nb-mt' }, [el('label', { class: 'nb-field' }, ['Héroe', heroSel]), el('label', { class: 'nb-field' }, ['Hechizo', spellSel])])
+      ] : el('p', { class: 'nb-placeholder' }, 'No hay tropas en esta ciudad.')),
+      section(5, 'Hora del servidor', [modeSeg, el('div', { class: 'nb-time-row' }, [timeIn, quick])]),
+      atkPlanEl,
+      el('div', { class: 'nb-options' }, [
+        el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Si faltan tropas al salir'), missSeg]),
+        optionRow('Modo tren', 'Tras programar, mantiene objetivo y adelanta la hora', f.keep, (v) => { f.keep = v; renderBody(); }),
+        f.keep ? el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Segundos entre ataques del tren'), stepIn]) : null
+      ]),
+      addBtn
+    ]));
+    atkPaintPlan();
+  }
+
+  /* ---------------------------------------------------------------------------------
      9) INIT
   --------------------------------------------------------------------------------- */
   function waitFor(cond, timeoutMs = 20000, stepMs = 200) {
@@ -2099,6 +2963,7 @@
     startBuildEngine();
     startTradeEngine();
     startRecruitEngine();
+    startAttackEngine();
 
     // En cuanto el cliente del juego termine de cargar, refresca el nombre de ciudad.
     waitFor(() => !!(UW.Game && UW.ITowns)).then(() => {
