@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      0.1.2
+// @version      0.1.3
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -50,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '0.1.2';
+  const VERSION = '0.1.3';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -99,7 +99,8 @@
       minimized: false,
       activeTab: 'inicio',
       pos: null,        // {x, y} panel: esquina superior-izquierda; null = posición por defecto
-      fabPos: null       // {x, y} botón flotante; null = posición por defecto
+      fabPos: null,      // {x, y} botón flotante; null = posición por defecto
+      size: null         // {w, h} tamaño del panel; null = tamaño por defecto (CSS)
     };
   }
 
@@ -147,7 +148,8 @@
     trade: '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7 10 3 6l4-4"/><path d="M3 6h13a4 4 0 0 1 4 4v1"/><path d="m17 14 4 4-4 4"/><path d="M21 18H8a4 4 0 0 1-4-4v-1"/></svg>',
     gear: '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg>',
     minus: '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/></svg>',
-    close: '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><path d="m18 6-12 12M6 6l12 12"/></svg>'
+    close: '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><path d="m18 6-12 12M6 6l12 12"/></svg>',
+    resize: '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><line x1="21" y1="9" x2="9" y2="21"/><line x1="21" y1="15" x2="15" y2="21"/></svg>'
   };
 
   /* ---------------------------------------------------------------------------------
@@ -241,7 +243,9 @@
       el('span', {}, `es147`)
     ]);
 
-    panel = el('div', { id: 'novabot-panel', class: 'nb-interactive' }, [headerEl, tabsEl, bodyEl, footer]);
+    const resizeHandle = el('div', { class: 'nb-resize', html: ICON.resize, title: 'Arrastra para redimensionar' });
+
+    panel = el('div', { id: 'novabot-panel', class: 'nb-interactive' }, [headerEl, tabsEl, bodyEl, footer, resizeHandle]);
 
     root.appendChild(fab);
     root.appendChild(panel);
@@ -250,6 +254,7 @@
     buildTabs();
     renderBody();
     applyPanelPosition();
+    applyPanelSize();
     applyFabPosition();
     applyOpenState();
 
@@ -259,6 +264,9 @@
     makeDraggable(fab, fab, {
       onDragEnd: (pos) => { state.fabPos = pos; saveState(); },
       onClick: () => setOpen(true)
+    });
+    makeResizable(resizeHandle, panel, {
+      onResize: (size) => { state.size = size; saveState(); }
     });
   }
 
@@ -317,6 +325,52 @@
       fab.style.left = 'auto';
       fab.style.top = 'auto';
     }
+  }
+
+  function applyPanelSize() {
+    if (state.size) {
+      panel.style.width = `${state.size.w}px`;
+      panel.style.height = `${state.size.h}px`;
+      panel.style.maxHeight = 'none';
+    }
+  }
+
+  /**
+   * Redimensiona `target` arrastrando desde `handle` (esquina inferior-derecha).
+   * Crece hacia abajo/derecha sin mover la esquina superior-izquierda, y respeta
+   * los límites de la ventana. `onResize` recibe el tamaño final para persistirlo.
+   */
+  function makeResizable(handle, target, { minWidth = 300, minHeight = 220, onResize } = {}) {
+    let resizing = false, startX = 0, startY = 0, startW = 0, startH = 0, left = 0, top = 0;
+
+    handle.addEventListener('mousedown', (e) => {
+      resizing = true;
+      const rect = target.getBoundingClientRect();
+      startX = e.clientX; startY = e.clientY;
+      startW = rect.width; startH = rect.height;
+      left = rect.left; top = rect.top;
+      e.preventDefault();
+      e.stopPropagation();
+    });
+
+    window.addEventListener('mousemove', (e) => {
+      if (!resizing) return;
+      const dx = e.clientX - startX, dy = e.clientY - startY;
+      const maxW = window.innerWidth - left - 8;
+      const maxH = window.innerHeight - top - 8;
+      const w = clamp(startW + dx, minWidth, Math.max(minWidth, maxW));
+      const h = clamp(startH + dy, minHeight, Math.max(minHeight, maxH));
+      target.style.width = `${w}px`;
+      target.style.height = `${h}px`;
+      target.style.maxHeight = 'none';
+    });
+
+    window.addEventListener('mouseup', () => {
+      if (!resizing) return;
+      resizing = false;
+      const rect = target.getBoundingClientRect();
+      onResize?.({ w: Math.round(rect.width), h: Math.round(rect.height) });
+    });
   }
 
   /**
