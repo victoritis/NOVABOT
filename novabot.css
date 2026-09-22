@@ -1,0 +1,219 @@
+/* =====================================================================================
+   NOVABOT — hoja de estilos
+   -------------------------------------------------------------------------------------
+   Este archivo se sirve desde GitHub (raw) y NOVABOT.user.js lo carga en tiempo de
+   ejecución mediante @resource + GM_getResourceText (ver sección ESTILOS del .user.js).
+
+   IMPORTANTE sobre cómo Tampermonkey cachea @resource:
+   Tampermonkey descarga este archivo la primera vez que se instala el script y lo
+   guarda en caché. Solo lo vuelve a descargar cuando detecta que el propio .user.js
+   ha cambiado de versión (el @version del bloque de cabecera) y el usuario acepta la
+   actualización — no cada vez que cambia este .css por su cuenta. Así que cada vez que
+   toquemos este archivo, hay que subir los dos (css + user.js con @version incrementada)
+   para que a ti te llegue la versión nueva al actualizar en Tampermonkey.
+   ===================================================================================== */
+
+:root{
+  --nb-bg:            #15181e;
+  --nb-panel:         rgba(21, 24, 30, .96);
+  --nb-panel-alt:     rgba(255, 255, 255, .035);
+  --nb-border:        rgba(255, 255, 255, .09);
+  --nb-border-soft:   rgba(255, 255, 255, .05);
+  --nb-gold:          #d3af6b;
+  --nb-gold-bright:   #f0cd8e;
+  --nb-text:          #eae7df;
+  --nb-text-dim:      #9a978e;
+  --nb-text-faint:    #6c6a63;
+  --nb-danger:        #e0665c;
+  --nb-radius-lg:     16px;
+  --nb-radius-md:     10px;
+  --nb-radius-sm:     7px;
+  --nb-shadow:        0 24px 60px rgba(0,0,0,.55), 0 4px 14px rgba(0,0,0,.35);
+  --nb-font:          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+#novabot-root, #novabot-root *{
+  box-sizing: border-box;
+  font-family: var(--nb-font);
+}
+#novabot-root{
+  position: fixed;
+  inset: 0 0 0 0;
+  pointer-events: none;
+  z-index: 999999;
+}
+#novabot-root .nb-interactive{ pointer-events: auto; }
+
+/* ---------- botón flotante (FAB) ---------- */
+#novabot-fab{
+  position: fixed;
+  width: 54px; height: 54px;
+  border-radius: 50%;
+  background: linear-gradient(155deg, #262b34, #181b21);
+  border: 1px solid var(--nb-border);
+  box-shadow: var(--nb-shadow);
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer;
+  transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease;
+  right: 22px; bottom: 22px;
+}
+#novabot-fab:hover{
+  transform: translateY(-2px);
+  border-color: var(--nb-gold);
+}
+#novabot-fab svg{ width: 24px; height: 24px; stroke: var(--nb-gold-bright); }
+#novabot-fab.nb-hidden{ display: none; }
+
+/* ---------- panel ---------- */
+#novabot-panel{
+  position: fixed;
+  width: 360px;
+  max-height: 78vh;
+  background: var(--nb-panel);
+  backdrop-filter: blur(14px);
+  border: 1px solid var(--nb-border);
+  border-radius: var(--nb-radius-lg);
+  box-shadow: var(--nb-shadow);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  color: var(--nb-text);
+  opacity: 0;
+  transform: translateY(8px) scale(.98);
+  transition: opacity .15s ease, transform .15s ease;
+}
+#novabot-panel.nb-visible{ opacity: 1; transform: translateY(0) scale(1); }
+#novabot-panel.nb-hidden{ display: none; }
+#novabot-panel.nb-minimized .nb-body,
+#novabot-panel.nb-minimized .nb-tabs,
+#novabot-panel.nb-minimized .nb-footer{ display: none; }
+
+/* ---------- cabecera ---------- */
+#novabot-panel .nb-header{
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 14px;
+  background: var(--nb-panel-alt);
+  border-bottom: 1px solid var(--nb-border-soft);
+  cursor: grab;
+  user-select: none;
+}
+#novabot-panel .nb-header:active{ cursor: grabbing; }
+#novabot-panel .nb-brand{
+  display: flex; align-items: center; gap: 9px;
+  flex: 1;
+  min-width: 0;
+}
+#novabot-panel .nb-brand svg{ width: 18px; height: 18px; stroke: var(--nb-gold-bright); flex: none; }
+#novabot-panel .nb-brand-text{ display: flex; flex-direction: column; line-height: 1.15; min-width: 0; }
+#novabot-panel .nb-brand-title{
+  font-size: 13px; font-weight: 700; letter-spacing: .06em;
+  color: var(--nb-text); text-transform: uppercase;
+}
+#novabot-panel .nb-brand-version{ font-size: 10.5px; color: var(--nb-text-faint); }
+#novabot-panel .nb-header-actions{ display: flex; gap: 4px; }
+#novabot-panel .nb-icon-btn{
+  width: 24px; height: 24px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: var(--nb-radius-sm);
+  color: var(--nb-text-dim);
+  cursor: pointer;
+  transition: background .12s ease, color .12s ease;
+}
+#novabot-panel .nb-icon-btn:hover{ background: rgba(255,255,255,.08); color: var(--nb-text); }
+#novabot-panel .nb-icon-btn svg{ width: 14px; height: 14px; stroke: currentColor; }
+
+/* ---------- interruptor maestro ---------- */
+#novabot-panel .nb-master{
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 11px 14px;
+  background: var(--nb-panel-alt);
+  border-bottom: 1px solid var(--nb-border-soft);
+}
+#novabot-panel .nb-master-label{ font-size: 12.5px; color: var(--nb-text-dim); }
+#novabot-panel .nb-master-label b{ color: var(--nb-text); font-weight: 600; }
+.nb-switch{
+  position: relative; width: 38px; height: 21px; flex: none;
+  border-radius: 999px;
+  background: rgba(255,255,255,.12);
+  border: 1px solid var(--nb-border);
+  cursor: pointer;
+  transition: background .15s ease, border-color .15s ease;
+}
+.nb-switch::after{
+  content: ''; position: absolute; top: 2px; left: 2px;
+  width: 15px; height: 15px; border-radius: 50%;
+  background: var(--nb-text-dim);
+  transition: transform .15s ease, background .15s ease;
+}
+.nb-switch.on{ background: rgba(211,175,107,.22); border-color: var(--nb-gold); }
+.nb-switch.on::after{ transform: translateX(17px); background: var(--nb-gold-bright); }
+
+/* ---------- pestañas ---------- */
+#novabot-panel .nb-tabs{
+  display: flex;
+  padding: 6px 8px 0;
+  gap: 2px;
+  border-bottom: 1px solid var(--nb-border-soft);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+#novabot-panel .nb-tabs::-webkit-scrollbar{ display: none; }
+#novabot-panel .nb-tab{
+  display: flex; align-items: center; gap: 6px;
+  padding: 7px 10px;
+  font-size: 11.5px; font-weight: 600;
+  color: var(--nb-text-faint);
+  border-radius: var(--nb-radius-sm) var(--nb-radius-sm) 0 0;
+  cursor: pointer;
+  white-space: nowrap;
+  border-bottom: 2px solid transparent;
+  transition: color .12s ease, border-color .12s ease;
+}
+#novabot-panel .nb-tab svg{ width: 13px; height: 13px; stroke: currentColor; flex: none; }
+#novabot-panel .nb-tab:hover:not(.nb-disabled){ color: var(--nb-text); }
+#novabot-panel .nb-tab.nb-active{ color: var(--nb-gold-bright); border-color: var(--nb-gold); }
+#novabot-panel .nb-tab.nb-disabled{ opacity: .35; cursor: default; }
+
+/* ---------- cuerpo ---------- */
+#novabot-panel .nb-body{
+  padding: 14px;
+  overflow-y: auto;
+  font-size: 12.5px;
+  color: var(--nb-text-dim);
+}
+#novabot-panel .nb-body::-webkit-scrollbar{ width: 8px; }
+#novabot-panel .nb-body::-webkit-scrollbar-thumb{ background: rgba(255,255,255,.1); border-radius: 8px; }
+
+#novabot-panel .nb-card{
+  background: var(--nb-panel-alt);
+  border: 1px solid var(--nb-border-soft);
+  border-radius: var(--nb-radius-md);
+  padding: 12px;
+  margin-bottom: 10px;
+}
+#novabot-panel .nb-card:last-child{ margin-bottom: 0; }
+#novabot-panel .nb-card-title{
+  font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--nb-text-faint); margin-bottom: 6px;
+}
+#novabot-panel .nb-row{ display: flex; align-items: center; justify-content: space-between; padding: 4px 0; }
+#novabot-panel .nb-row + .nb-row{ border-top: 1px solid var(--nb-border-soft); }
+#novabot-panel .nb-row-label{ color: var(--nb-text-dim); }
+#novabot-panel .nb-row-value{ color: var(--nb-text); font-weight: 600; }
+#novabot-panel .nb-pill{
+  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+  padding: 2px 7px; border-radius: 999px;
+  background: rgba(211,175,107,.14); color: var(--nb-gold-bright);
+}
+#novabot-panel .nb-placeholder{ color: var(--nb-text-faint); font-style: italic; }
+
+/* ---------- pie ---------- */
+#novabot-panel .nb-footer{
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 14px;
+  font-size: 10.5px;
+  color: var(--nb-text-faint);
+  border-top: 1px solid var(--nb-border-soft);
+  background: var(--nb-panel-alt);
+}
+#novabot-panel .nb-footer b{ color: var(--nb-text-dim); }
