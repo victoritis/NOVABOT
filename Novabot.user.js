@@ -1,13 +1,15 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      0.4.3
+// @version      0.4.4
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
 // @resource     NOVABOT_CSS https://raw.githubusercontent.com/victoritis/NOVABOT/main/novabot.css
 // @grant        GM_addStyle
 // @grant        GM_getResourceText
+// @grant        GM_xmlhttpRequest
+// @connect      raw.githubusercontent.com
 // @grant        unsafeWindow
 // @run-at       document-idle
 // ==/UserScript==
@@ -48,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '0.4.3';
+  const VERSION = '0.4.4';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -138,18 +140,41 @@
      nombre de rama distinto a "main"...), avisamos por consola en vez de romper el
      resto del script.
   --------------------------------------------------------------------------------- */
-  function loadStyles() {
-    try {
-      const css = typeof GM_getResourceText === 'function' ? GM_getResourceText('NOVABOT_CSS') : null;
-      if (css) { GM_addStyle(css); return true; }
-      console.warn('[NOVABOT] GM_getResourceText no devolvió CSS (revisa @resource / la rama del repo).');
-    } catch (e) {
-      console.warn('[NOVABOT] No se pudo cargar novabot.css:', e);
-    }
-    return false;
+  // 1º intenta bajar novabot.css FRESCO de GitHub en cada carga (sin caché de
+  // Tampermonkey); si falla, usa la copia de @resource. Así basta con subir el
+  // CSS a GitHub para verlo, sin tocar la versión del script.
+  const CSS_URL = 'https://raw.githubusercontent.com/victoritis/NOVABOT/main/novabot.css';
+  let styleEl = null;
+
+  function applyCss(css) {
+    if (styleEl) styleEl.remove();
+    styleEl = GM_addStyle(css);
   }
 
-  const stylesLoaded = loadStyles();
+  function loadStyles() {
+    let ok = false;
+    try {
+      const css = typeof GM_getResourceText === 'function' ? GM_getResourceText('NOVABOT_CSS') : null;
+      if (css) { applyCss(css); ok = true; }
+    } catch (e) { console.warn('[NOVABOT] @resource CSS no disponible:', e); }
+
+    if (typeof GM_xmlhttpRequest === 'function') {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url: `${CSS_URL}?t=${Date.now()}`,
+        onload: (r) => {
+          if (r.status === 200 && r.responseText) {
+            applyCss(r.responseText);
+            const v = document.querySelector('.nb-brand-version');
+            if (v) v.textContent = `v${VERSION} · css ${cssVersion()}`;
+          } else console.warn('[NOVABOT] No se pudo bajar novabot.css fresco:', r.status);
+        },
+        onerror: (e) => console.warn('[NOVABOT] Error bajando novabot.css:', e)
+      });
+      ok = true;
+    }
+    return ok;
+  }
 
   // Versión declarada dentro de novabot.css (--nb-css-version). Si no aparece,
   // el CSS cargado es anterior a este control (o no se cargó).
