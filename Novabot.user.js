@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      0.2.12
+// @version      0.4.2
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -48,7 +48,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '0.2.12';
+  const VERSION = '0.4.2';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -58,7 +58,7 @@
   const TABS = [
     { id: 'inicio',      label: 'Inicio',        icon: 'home',   disabled: false },
     { id: 'granjas',     label: 'Granjas',       icon: 'farm',   disabled: false },
-    { id: 'construccion', label: 'Construcción', icon: 'build',  disabled: true },
+    { id: 'construccion', label: 'Construcción', icon: 'build',  disabled: false },
     { id: 'reclutamiento', label: 'Reclutamiento', icon: 'shield', disabled: true },
     { id: 'comercio',    label: 'Comercio',       icon: 'trade',  disabled: true },
     { id: 'ajustes',     label: 'Ajustes',        icon: 'gear',   disabled: true }
@@ -109,6 +109,11 @@
         stopMode: 'preset',  // 'preset' | 'manual'
         stopPreset: 90,      // 80 | 90 | 100
         stopManual: 90
+      },
+      construccion: {
+        enabled: false,
+        strictOrder: false,   // true = no salta a otro edificio si el primero está bloqueado
+        towns: {}             // townId -> { goals: [{id, target}] } (orden = prioridad)
       }
     };
   }
@@ -224,6 +229,8 @@
       ]));
 
       updateCityLabel();
+    } else if (state.activeTab === 'construccion') {
+      renderConstruccionTab();
     } else if (state.activeTab === 'granjas') {
       renderGranjasTab();
     } else {
@@ -441,6 +448,15 @@
       const town = id && UW.ITowns?.getTown ? UW.ITowns.getTown(id) : null;
       return town?.name || UW.Game?.town_name || null;
     } catch { return null; }
+  }
+
+  // Al cambiar de ciudad, la pestaña Construcción se redibuja con la nueva.
+  let lastTownId = null;
+  function onTownMaybeChanged() {
+    const id = +UW.Game?.townId || null;
+    if (id === lastTownId) return;
+    lastTownId = id;
+    if (state.activeTab === 'construccion' && bodyEl) renderBody();
   }
 
   function updateCityLabel() {
@@ -766,6 +782,7 @@
       }
     }
     for (const n of $$('[data-nb-countdown]')) n.textContent = text;
+    for (const n of $$('[data-nb-until]')) n.textContent = formatLeft(+n.dataset.nbUntil);
   }
 
   function farmLog(text, kind = 'info') {
@@ -872,6 +889,285 @@
   }
 
   /* ---------------------------------------------------------------------------------
+     8b) CONSTRUCCIÓN — objetivos por ciudad, todo por petición (sin cambiar de ciudad)
+     -----------------------------------------------------------------------------
+     Capturado del propio juego al construir a mano (22/09/2026):
+       POST frontend_bridge?action=execute
+       json: { model_url:"BuildingOrder", action_name:"buildUp", captcha:null,
+               arguments:{ building_id:"barracks" }, town_id, nl_init:true }
+     Datos de cada ciudad (niveles, costes, población, requisitos, cola llena):
+       MM.getCollections().BuildingBuildData → building_data[id] (existe para las 21).
+     gpAjax pone en la URL town_id=Game.townId; para que URL y json apunten a la
+     MISMA ciudad, gpPostAs() cambia Game.townId solo durante la llamada
+     (síncrona) y lo restaura al momento. No se cambia de ciudad en pantalla.
+  --------------------------------------------------------------------------------- */
+  const buildRuntime = { timer: null, running: false, log: [], cooldown: new Map() };
+  let buildLogEl = null;
+
+  function gpPostAs(townId, controller, action, json) {
+    const prev = UW.Game.townId;
+    UW.Game.townId = +townId;
+    try { return gpPost(controller, action, { ...json, town_id: +townId }); }
+    finally { UW.Game.townId = prev; }
+  }
+
+  function buildingName(id) {
+    const d = UW.GameData?.buildings?.[id];
+    return d?.name || id;
+  }
+
+  function buildingIds() {
+    return Object.keys(UW.GameData?.buildings || {}).filter((id) => id !== 'id')
+      .sort((a, b) => buildingName(a).localeCompare(buildingName(b), 'es'));
+  }
+
+  function buildDataFor(townId) {
+    try {
+      const cols = UW.MM.getCollections().BuildingBuildData;
+      for (const c of [].concat(cols || [])) {
+        for (const m of c?.models || []) if (+m.get('town_id') === +townId) return m.attributes;
+      }
+    } catch {}
+    return null;
+  }
+
+  // Nivel "comprometido" = actual + lo que ya está en cola.
+  function committedLevel(info) {
+    if (!info) return 0;
+    return Math.max(+info.level || 0, (+info.next_level || 1) - 1);
+  }
+
+  function townBuildCfg(townId) {
+    const all = state.construccion.towns;
+    if (!all[townId]) all[townId] = { goals: [] };
+    return all[townId];
+  }
+
+  // Motivo por el que no se puede subir ahora (null = se puede).
+  function buildBlockReason(townId, info) {
+    if (!info) return 'sin datos';
+    if (info.has_max_level) return 'nivel máximo';
+    if (info.group_locked) return 'bloqueado';
+    if (Array.isArray(info.missing_dependencies) && info.missing_dependencies.length) return 'faltan requisitos';
+    if (!info.enough_storage) return 'almacén pequeño';
+    if ((+info.population_free || 0) < (+info.population_for || 0)) return 'falta población';
+    const cost = info.resources_for || {};
+    const r = townResources(townId);
+    if (r.wood < (+cost.wood || 0) || r.stone < (+cost.stone || 0) || r.iron < (+cost.iron || 0)) return 'faltan recursos';
+    return null;
+  }
+
+  function townBuildOrders(townId) {
+    try {
+      const q = UW.ITowns.getTown(townId)?.buildingOrders?.();
+      return (q?.models || []).map((m) => m.attributes);
+    } catch { return []; }
+  }
+
+  function formatLeft(ts) {
+    const s = Math.max(0, Math.round((+ts || 0) - Date.now() / 1000));
+    if (!ts) return '';
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+    return (h ? `${h}:${String(m).padStart(2, '0')}` : `${m}`) + `:${String(sec).padStart(2, '0')}`;
+  }
+
+  function nextBuildFor(townId) {
+    const bd = buildDataFor(townId);
+    if (!bd) return { reason: 'sin datos' };
+    if (bd.is_building_order_queue_full) return { reason: 'cola llena' };
+    for (const g of townBuildCfg(townId).goals) {
+      const info = bd.building_data?.[g.id];
+      if (!info || committedLevel(info) >= g.target) continue;
+      if ((buildRuntime.cooldown.get(`${townId}:${g.id}`) || 0) > Date.now()) continue;
+      const reason = buildBlockReason(townId, info);
+      if (!reason) return { id: g.id, level: committedLevel(info) + 1 };
+      if (state.construccion.strictOrder) return { reason: `${buildingName(g.id)}: ${reason}` };
+    }
+    return { reason: 'nada pendiente' };
+  }
+
+  async function buildTick() {
+    if (!state.construccion.enabled) return;
+    for (const townId of allTownIds()) {
+      if (!state.construccion.enabled) return;
+      const next = nextBuildFor(townId);
+      if (!next.id) continue;
+      try {
+        await gpPostAs(townId, 'frontend_bridge', 'execute', {
+          model_url: 'BuildingOrder', action_name: 'buildUp', captcha: null,
+          arguments: { building_id: next.id }, nl_init: true
+        });
+        buildLog(`${farmTownName(townId)}: ${buildingName(next.id)} → nivel ${next.level}.`, 'ok');
+      } catch (e) {
+        buildLog(`${farmTownName(townId)}: ${buildingName(next.id)} — ${e.message}`, 'error');
+        buildRuntime.cooldown.set(`${townId}:${next.id}`, Date.now() + 5 * 60000);
+      }
+      await sleep(800 + Math.random() * 1200);
+    }
+  }
+
+  function startBuildEngine() {
+    if (buildRuntime.timer) return;
+    buildRuntime.timer = setInterval(() => {
+      if (!state.construccion.enabled || buildRuntime.running) return;
+      buildRuntime.running = true;
+      buildTick().catch((e) => buildLog(`Error: ${e.message}`, 'error'))
+        .finally(() => { buildRuntime.running = false; });
+    }, 15000);
+  }
+
+  function buildLog(text, kind = 'info') {
+    buildRuntime.log.unshift({ at: Date.now(), text, kind });
+    buildRuntime.log = buildRuntime.log.slice(0, 30);
+    renderBuildLog();
+  }
+
+  function renderBuildLog() {
+    if (!buildLogEl) return;
+    buildLogEl.innerHTML = '';
+    if (!buildRuntime.log.length) {
+      buildLogEl.appendChild(el('p', { class: 'nb-placeholder' }, 'Sin actividad todavía.'));
+      return;
+    }
+    for (const e of buildRuntime.log) {
+      buildLogEl.appendChild(el('div', { class: `nb-log-item nb-log-${e.kind}` }, `${new Date(e.at).toLocaleTimeString('es-ES')} · ${e.text}`));
+    }
+  }
+
+  function renderConstruccionTab() {
+    const cfg = state.construccion;
+    const towns = allTownIds().sort((a, b) => farmTownName(a).localeCompare(farmTownName(b), 'es'));
+    // Siempre la ciudad en la que estás ahora mismo (como en Inicio).
+    const townId = +UW.Game?.townId || towns[0];
+    const tcfg = townBuildCfg(townId);
+    const bd = buildDataFor(townId);
+
+    // Activar / desactivar
+    const sw = el('div', { class: `nb-switch${cfg.enabled ? ' on' : ''}` });
+    sw.addEventListener('click', () => {
+      cfg.enabled = !cfg.enabled; saveState(); renderBody();
+      buildLog(cfg.enabled ? 'Construcción activada.' : 'Construcción desactivada.');
+    });
+    const strict = el('input', { type: 'checkbox' });
+    strict.checked = !!cfg.strictOrder;
+    strict.addEventListener('change', () => { cfg.strictOrder = strict.checked; saveState(); });
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, [el('b', {}, 'Construcción automática')]), sw]),
+      el('label', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Respetar orden estricto (no saltar al siguiente)'), strict])
+    ]));
+
+    const copyBtn = el('div', { class: 'nb-btn', title: 'Copia estos objetivos al resto de ciudades' }, 'Copiar a todas');
+    copyBtn.addEventListener('click', () => {
+      if (!confirm(`¿Copiar los objetivos de ${farmTownName(townId)} a TODAS las ciudades?`)) return;
+      for (const id of towns) if (id !== townId) cfg.towns[id] = { goals: tcfg.goals.map((g) => ({ ...g })) };
+      saveState(); buildLog(`Objetivos de ${farmTownName(townId)} copiados a todas.`, 'ok');
+    });
+    const next = nextBuildFor(townId);
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+      el('div', { class: 'nb-row' }, [
+        el('span', { class: 'nb-row-label' }, 'Ciudad actual'),
+        el('span', { class: 'nb-row-value' }, farmTownName(townId))
+      ]),
+      el('div', { class: 'nb-row' }, [
+        el('span', { class: 'nb-row-label' }, 'Siguiente'),
+        el('span', { class: 'nb-row-value' }, next.id ? `${buildingName(next.id)} → ${next.level}` : next.reason)
+      ]),
+      el('div', { class: 'nb-btn-group' }, [copyBtn])
+    ]));
+
+    // ---- Cola real del juego (solo lectura) ----
+    const orders = townBuildOrders(townId);
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+      el('div', { class: 'nb-card-title' }, `Cola del juego (${orders.length})`),
+      orders.length
+        ? el('div', { class: 'nb-queue' }, orders.map((o) => el('div', { class: 'nb-queue-item' }, [
+            el('span', {}, `${buildingName(o.building_type)}${o.tear_down ? ' (derribo)' : ''}`),
+            el('span', { class: 'nb-queue-time', 'data-nb-until': o.to_be_completed_at || '' }, formatLeft(o.to_be_completed_at))
+          ])))
+        : el('p', { class: 'nb-placeholder' }, 'Nada en construcción.')
+    ]));
+
+    if (!bd) {
+      bodyEl.appendChild(el('div', { class: 'nb-card' }, [el('p', { class: 'nb-placeholder' }, 'Sin datos de edificios para esta ciudad todavía.')]));
+    } else {
+      const maxOf = (id) => +UW.GameData?.buildings?.[id]?.max_level || 99;
+      const setTarget = (id, v) => {
+        const i = tcfg.goals.findIndex((g) => g.id === id);
+        const cur = committedLevel(bd.building_data?.[id]);
+        v = clamp(v, 0, maxOf(id));
+        if (v <= cur) { if (i >= 0) tcfg.goals.splice(i, 1); }       // objetivo alcanzado/menor → se quita
+        else if (i >= 0) tcfg.goals[i].target = v;
+        else tcfg.goals.push({ id, target: v });
+        saveState(); renderBody();
+      };
+      const move = (i, dir) => {
+        const j = i + dir;
+        if (j < 0 || j >= tcfg.goals.length) return;
+        [tcfg.goals[i], tcfg.goals[j]] = [tcfg.goals[j], tcfg.goals[i]];
+        saveState(); renderBody();
+      };
+
+      // ---- Objetivos del bot (orden = prioridad) ----
+      const goalsBox = el('div', { class: 'nb-goals' });
+      tcfg.goals.forEach((g, i) => {
+        const info = bd.building_data?.[g.id];
+        const cur = committedLevel(info);
+        const done = cur >= g.target;
+        const reason = done ? null : buildBlockReason(townId, info);
+        const isNext = next.id === g.id;
+        goalsBox.appendChild(el('div', { class: `nb-goal${isNext ? ' nb-goal-next' : ''}${done ? ' nb-goal-done' : ''}` }, [
+          el('span', { class: 'nb-goal-idx' }, String(i + 1)),
+          el('div', { class: 'nb-goal-main' }, [
+            el('div', { class: 'nb-goal-name' }, buildingName(g.id)),
+            el('div', { class: 'nb-goal-sub' }, done ? 'completado' : isNext ? 'siguiente' : (reason || 'en espera'))
+          ]),
+          el('div', { class: 'nb-stepper' }, [
+            el('span', { class: 'nb-goal-cur' }, `${cur} →`),
+            el('span', { class: 'nb-mini', title: '−1', onclick: () => setTarget(g.id, g.target - 1) }, '−'),
+            el('span', { class: 'nb-goal-target' }, String(g.target)),
+            el('span', { class: 'nb-mini', title: '+1', onclick: () => setTarget(g.id, g.target + 1) }, '+')
+          ]),
+          el('div', { class: 'nb-goal-actions' }, [
+            el('span', { class: `nb-mini${i === 0 ? ' nb-mini-off' : ''}`, title: 'Subir prioridad', onclick: () => move(i, -1) }, '▲'),
+            el('span', { class: `nb-mini${i === tcfg.goals.length - 1 ? ' nb-mini-off' : ''}`, title: 'Bajar prioridad', onclick: () => move(i, 1) }, '▼'),
+            el('span', { class: 'nb-mini nb-mini-danger', title: 'Quitar del bot', onclick: () => { tcfg.goals.splice(i, 1); saveState(); renderBody(); } }, '✕')
+          ])
+        ]));
+      });
+      const clearBtn = tcfg.goals.length
+        ? el('span', { class: 'nb-btn', onclick: () => { if (confirm('¿Quitar todos los objetivos de esta ciudad?')) { tcfg.goals = []; saveState(); renderBody(); } } }, 'Vaciar')
+        : null;
+      bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+        el('div', { class: 'nb-card-head' }, [el('div', { class: 'nb-card-title' }, `Objetivos del bot (${tcfg.goals.length})`), clearBtn]),
+        tcfg.goals.length ? goalsBox : el('p', { class: 'nb-placeholder' }, 'Sin objetivos. Añade edificios abajo.')
+      ]));
+
+      // ---- Añadir edificios (clic = objetivo nivel actual + 1) ----
+      const chips = el('div', { class: 'nb-chips' });
+      for (const id of buildingIds()) {
+        if (tcfg.goals.some((g) => g.id === id)) continue;
+        const info = bd.building_data?.[id];
+        const cur = committedLevel(info);
+        const atMax = cur >= maxOf(id) || info?.has_max_level;
+        chips.appendChild(el('span', {
+          class: `nb-chip${atMax ? ' nb-chip-off' : ''}`,
+          title: atMax ? 'Nivel máximo' : `Añadir: ${buildingName(id)} → ${cur + 1}`,
+          onclick: () => { if (!atMax) setTarget(id, cur + 1); }
+        }, [buildingName(id), el('b', {}, String(cur))]));
+      }
+      bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+        el('div', { class: 'nb-card-title' }, 'Añadir edificio (clic = +1 nivel)'),
+        chips
+      ]));
+    }
+
+    const logBox = el('div', { class: 'nb-log' });
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [el('div', { class: 'nb-card-title' }, 'Actividad'), logBox]));
+    buildLogEl = logBox;
+    renderBuildLog();
+  }
+
+  /* ---------------------------------------------------------------------------------
      9) INIT
   --------------------------------------------------------------------------------- */
   function waitFor(cond, timeoutMs = 20000, stepMs = 200) {
@@ -889,6 +1185,7 @@
     await waitFor(() => !!document.body);
     buildUI();
     startFarmEngine();
+    startBuildEngine();
 
     // En cuanto el cliente del juego termine de cargar, refresca el nombre de ciudad.
     waitFor(() => !!(UW.Game && UW.ITowns)).then(() => {
@@ -898,9 +1195,9 @@
       try {
         const $j = UW.jQuery || UW.$;
         const evt = UW.GameEvents?.town?.town_switch;
-        if ($j && evt) $j(document).on(evt, updateCityLabel);
+        if ($j && evt) $j(document).on(evt, () => { updateCityLabel(); onTownMaybeChanged(); });
       } catch (e) { console.warn('[NOVABOT] No se pudo enganchar al evento de cambio de ciudad:', e); }
-      setInterval(updateCityLabel, 1000); // red de seguridad por si el evento no llega
+      setInterval(() => { updateCityLabel(); onTownMaybeChanged(); }, 1000); // red de seguridad por si el evento no llega
     });
   }
 
