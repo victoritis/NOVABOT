@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      0.4.4
+// @version      0.4.8
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -50,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '0.4.4';
+  const VERSION = '0.4.8';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -144,11 +144,15 @@
   // Tampermonkey); si falla, usa la copia de @resource. Así basta con subir el
   // CSS a GitHub para verlo, sin tocar la versión del script.
   const CSS_URL = 'https://raw.githubusercontent.com/victoritis/NOVABOT/main/novabot.css';
-  let styleEl = null;
-
+  // Un único <style id="novabot-css"> propio: cada carga reemplaza su contenido.
   function applyCss(css) {
-    if (styleEl) styleEl.remove();
-    styleEl = GM_addStyle(css);
+    let st = document.getElementById('novabot-css');
+    if (!st) {
+      st = document.createElement('style');
+      st.id = 'novabot-css';
+      (document.head || document.documentElement).appendChild(st);
+    }
+    st.textContent = css;
   }
 
   function loadStyles() {
@@ -175,6 +179,8 @@
     }
     return ok;
   }
+
+  const stylesLoaded = loadStyles();
 
   // Versión declarada dentro de novabot.css (--nb-css-version). Si no aparece,
   // el CSS cargado es anterior a este control (o no se cargó).
@@ -1018,6 +1024,19 @@
     return { reason: 'nada pendiente' };
   }
 
+  // Quita del bot los objetivos que ya se alcanzaron (nivel actual + lo que
+  // hay en cola real del juego >= objetivo) — así, en cuanto se manda a
+  // construir el último nivel que faltaba, la fila pasa a la cola del juego
+  // y desaparece de "Objetivos del bot" sin esperar a que termine de subir.
+  function pruneCompletedGoals(townId) {
+    const bd = buildDataFor(townId);
+    if (!bd) return;
+    const cfg = townBuildCfg(townId);
+    const before = cfg.goals.length;
+    cfg.goals = cfg.goals.filter((g) => committedLevel(bd.building_data?.[g.id]) < g.target);
+    if (cfg.goals.length !== before) saveState();
+  }
+
   async function buildTick() {
     if (!state.construccion.enabled) return;
     for (const townId of allTownIds()) {
@@ -1029,7 +1048,10 @@
           model_url: 'BuildingOrder', action_name: 'buildUp', captcha: null,
           arguments: { building_id: next.id }, nl_init: true
         });
-        buildLog(`${farmTownName(townId)}: ${buildingName(next.id)} → nivel ${next.level}.`, 'ok');
+        buildLog(`${farmTownName(townId)}: ${buildingName(next.id)} → nivel ${next.level} (a la cola del juego).`, 'ok');
+        await sleep(300); // pequeño margen para que el modelo Backbone se actualice antes de leerlo
+        pruneCompletedGoals(townId);
+        if (state.activeTab === 'construccion') renderBody();
       } catch (e) {
         buildLog(`${farmTownName(townId)}: ${buildingName(next.id)} — ${e.message}`, 'error');
         buildRuntime.cooldown.set(`${townId}:${next.id}`, Date.now() + 5 * 60000);
@@ -1071,6 +1093,7 @@
     const towns = allTownIds().sort((a, b) => farmTownName(a).localeCompare(farmTownName(b), 'es'));
     // Siempre la ciudad en la que estás ahora mismo (como en Inicio).
     const townId = +UW.Game?.townId || towns[0];
+    pruneCompletedGoals(townId); // por si se completó a mano o fuera del ciclo del bot
     const tcfg = townBuildCfg(townId);
     const bd = buildDataFor(townId);
 
@@ -1108,12 +1131,26 @@
     ]));
 
     // ---- Cola real del juego (solo lectura) ----
-    const orders = townBuildOrders(townId);
+    // El nivel que deja cada orden se calcula acumulando sobre el nivel actual
+    // del edificio, en el mismo orden en que el juego las va a completar.
+    const orders = townBuildOrders(townId)
+      .slice()
+      .sort((a, b) => (+a.to_be_completed_at || 0) - (+b.to_be_completed_at || 0));
+    const levelAcc = {};
+    for (const o of orders) {
+      const id = o.building_type;
+      if (!(id in levelAcc)) levelAcc[id] = +bd?.building_data?.[id]?.level || 0;
+      levelAcc[id] += o.tear_down ? -1 : 1;
+      o.__resultLevel = levelAcc[id];
+    }
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
       el('div', { class: 'nb-card-title' }, `Cola del juego (${orders.length})`),
       orders.length
         ? el('div', { class: 'nb-queue' }, orders.map((o) => el('div', { class: 'nb-queue-item' }, [
-            el('span', {}, `${buildingName(o.building_type)}${o.tear_down ? ' (derribo)' : ''}`),
+            el('span', {}, [
+              `${buildingName(o.building_type)}${o.tear_down ? ' (derribo)' : ''} `,
+              el('b', { class: 'nb-queue-level' }, `→ ${o.__resultLevel}`)
+            ]),
             el('span', { class: 'nb-queue-time', 'data-nb-until': o.to_be_completed_at || '' }, formatLeft(o.to_be_completed_at))
           ])))
         : el('p', { class: 'nb-placeholder' }, 'Nada en construcción.')
@@ -1174,22 +1211,51 @@
         tcfg.goals.length ? goalsBox : el('p', { class: 'nb-placeholder' }, 'Sin objetivos. Añade edificios abajo.')
       ]));
 
-      // ---- Añadir edificios (clic = objetivo nivel actual + 1) ----
-      const chips = el('div', { class: 'nb-chips' });
-      for (const id of buildingIds()) {
-        if (tcfg.goals.some((g) => g.id === id)) continue;
+      // ---- Añadir edificios: fila por edificio, con su propio nivel objetivo ----
+      const available = buildingIds().filter((id) => !tcfg.goals.some((g) => g.id === id));
+      const addSearch = el('input', { class: 'nb-input', type: 'text', placeholder: 'Buscar edificio…' });
+      const addList = el('div', { class: 'nb-add-list' });
+
+      function renderAddRow(id) {
         const info = bd.building_data?.[id];
         const cur = committedLevel(info);
-        const atMax = cur >= maxOf(id) || info?.has_max_level;
-        chips.appendChild(el('span', {
-          class: `nb-chip${atMax ? ' nb-chip-off' : ''}`,
-          title: atMax ? 'Nivel máximo' : `Añadir: ${buildingName(id)} → ${cur + 1}`,
-          onclick: () => { if (!atMax) setTarget(id, cur + 1); }
-        }, [buildingName(id), el('b', {}, String(cur))]));
+        const max = maxOf(id);
+        const atMax = cur >= max || info?.has_max_level;
+        const input = el('input', {
+          class: 'nb-input nb-input-inline', type: 'number', min: String(cur + 1), max: String(max), value: String(Math.min(cur + 1, max))
+        });
+        const add = () => {
+          if (atMax) return;
+          const v = clamp(pos(input.value, cur + 1), cur + 1, max);
+          setTarget(id, v);
+        };
+        input.addEventListener('keydown', (e) => { if (e.key === 'Enter') add(); });
+        return el('div', { class: `nb-add-row${atMax ? ' nb-add-row-off' : ''}` }, [
+          el('div', { class: 'nb-add-name' }, [buildingName(id), el('span', { class: 'nb-add-level' }, `nivel ${cur}`)]),
+          atMax
+            ? el('span', { class: 'nb-pill nb-pill-off' }, 'máximo')
+            : el('div', { class: 'nb-stepper' }, [
+                el('span', { class: 'nb-mini', title: '−1', onclick: () => { input.value = clamp(pos(input.value, cur + 1) - 1, cur + 1, max); } }, '−'),
+                input,
+                el('span', { class: 'nb-mini', title: '+1', onclick: () => { input.value = clamp(pos(input.value, cur + 1) + 1, cur + 1, max); } }, '+'),
+                el('span', { class: 'nb-mini nb-mini-add', title: 'Añadir a objetivos', onclick: add }, '✓')
+              ])
+        ]);
       }
+
+      function renderAddList(filter) {
+        addList.innerHTML = '';
+        const f = (filter || '').trim().toLowerCase();
+        const ids = available.filter((id) => !f || buildingName(id).toLowerCase().includes(f));
+        if (!ids.length) { addList.appendChild(el('p', { class: 'nb-placeholder' }, 'Sin resultados.')); return; }
+        for (const id of ids) addList.appendChild(renderAddRow(id));
+      }
+      addSearch.addEventListener('input', () => renderAddList(addSearch.value));
+      renderAddList('');
+
       bodyEl.appendChild(el('div', { class: 'nb-card' }, [
-        el('div', { class: 'nb-card-title' }, 'Añadir edificio (clic = +1 nivel)'),
-        chips
+        el('div', { class: 'nb-card-title' }, `Añadir edificio (${available.length} disponibles)`),
+        available.length ? el('div', {}, [addSearch, addList]) : el('p', { class: 'nb-placeholder' }, 'Ya tienes objetivo en todos los edificios.')
       ]));
     }
 
