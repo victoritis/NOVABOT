@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      0.4.2
+// @version      0.4.3
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -48,7 +48,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '0.4.2';
+  const VERSION = '0.4.3';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -151,6 +151,13 @@
 
   const stylesLoaded = loadStyles();
 
+  // Versión declarada dentro de novabot.css (--nb-css-version). Si no aparece,
+  // el CSS cargado es anterior a este control (o no se cargó).
+  function cssVersion() {
+    const v = getComputedStyle(document.documentElement).getPropertyValue('--nb-css-version').trim().replace(/["']/g, '');
+    return v || '¿antiguo?';
+  }
+
   /* ---------------------------------------------------------------------------------
      5) DOM — iconos (SVG inline, sin depender de ningún recurso externo)
   --------------------------------------------------------------------------------- */
@@ -250,7 +257,7 @@
         el('span', { html: ICON.logo }),
         el('div', { class: 'nb-brand-text' }, [
           el('span', { class: 'nb-brand-title' }, 'NOVABOT'),
-          el('span', { class: 'nb-brand-version' }, `v${VERSION}`)
+          el('span', { class: 'nb-brand-version', title: 'Versión del script · versión del CSS cargado' }, `v${VERSION} · css ${cssVersion()}`)
         ])
       ]),
       el('div', { class: 'nb-header-actions' }, [

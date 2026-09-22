@@ -11,9 +11,12 @@
    actualización — no cada vez que cambia este .css por su cuenta. Así que cada vez que
    toquemos este archivo, hay que subir los dos (css + user.js con @version incrementada)
    para que a ti te llegue la versión nueva al actualizar en Tampermonkey.
+   VERSIÓN DEL CSS: 0.4.3 — súbela en --nb-css-version cada vez que cambie este archivo.
+   El panel la muestra junto a la del script (cabecera) para saber cuál está cargada.
    ===================================================================================== */
 
 :root{
+  --nb-css-version:   "0.4.3";
   --nb-bg:            #15181e;
   --nb-panel:         rgba(21, 24, 30, .96);
   --nb-panel-alt:     rgba(255, 255, 255, .035);
