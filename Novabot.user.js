@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      0.2.1
+// @version      0.2.12
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -10,8 +10,6 @@
 // @grant        GM_getResourceText
 // @grant        unsafeWindow
 // @run-at       document-idle
-// @updateURL    https://raw.githubusercontent.com/victoritis/NOVABOT/main/NOVABOT.user.js
-// @downloadURL  https://raw.githubusercontent.com/victoritis/NOVABOT/main/NOVABOT.user.js
 // ==/UserScript==
 
 /* =====================================================================================
@@ -50,7 +48,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '0.2.1';
+  const VERSION = '0.2.12';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -210,8 +208,13 @@
         el('div', { class: 'nb-row' }, [
           el('span', { class: 'nb-row-label' }, 'Granjas'),
           el('span', { class: `nb-pill${state.granjas.enabled ? '' : ' nb-pill-off'}` }, state.granjas.enabled ? 'Activado' : 'Desactivado')
+        ]),
+        el('div', { class: 'nb-row' }, [
+          el('span', { class: 'nb-row-label' }, 'Próxima recolección'),
+          el('span', { class: 'nb-row-value', 'data-nb-countdown': '' }, '—')
         ])
       ]));
+      updateCountdown();
       footerCityEl = $('#nb-current-town', bodyEl);
 
       bodyEl.appendChild(el('div', { class: 'nb-card' }, [
@@ -462,21 +465,29 @@
                      current_town_id, town_id, nl_init:true }
             → recolecta de golpe las aldeas indicadas, con el tiempo elegido.
 
-     Los 4 tiempos dependen de si la ciudad tiene investigada la Lealtad de los
-     aldeanos (visto en las clases CSS del propio juego: fto_600/2400/10800/28800
-     sin investigar, fto_300/1200/5400/14400 investigada — cada tiempo con Lealtad
-     es la mitad del correspondiente sin ella). "tier" (0-3) es la posición dentro
-     del set que le toque a cada ciudad, así el mismo ajuste vale tenga o no la
-     investigación: 0 = la más rápida, 3 = la más lenta.
+     Confirmado el 22/09/2026 contra el dump real de GameData del propio juego
+     (GameData.farm_town_time_values y farm_town.claim_resource_cooldowns_normal/
+     _booty): SIN investigar Lealtad de los aldeanos los 4 tiempos son
+     [300,1200,5400,14400] (5m·20m·1h30·4h, el set "normal", más rápido), y CON
+     Lealtad investigada son [600,2400,10800,28800] (10m·40m·3h·8h, el set
+     "booty" — investigarla da +115% de recursos pero DOBLA los tiempos de
+     espera). "tier" (0-3) es la posición dentro del set que le toque a cada
+     ciudad, así el mismo ajuste vale tenga o no la investigación: 0 = la más
+     rápida, 3 = la más lenta. Las etiquetas de los botones se quedan fijas en
+     "10 min/40 min/3 horas/8 horas" (los valores del set con Lealtad, que es
+     el habitual en ciudades desarrolladas); si la ciudad no la tiene investigada
+     se usa automáticamente el equivalente rápido sin tocar la etiqueta.
 
-     OJO: los nombres de campo de la respuesta de get_farm_towns_for_town son mi
-     mejor estimación a partir del HTML — no los verifiqué contra el JSON real para
-     no gastar recolecciones de prueba. Actívalo y mira la consola: si algo no
-     encaja, un console.warn dirá qué campo revisar.
+     Enumeración de aldeas: la respuesta de get_farm_towns_for_town no trae
+     farm_town_list de forma fiable (comprobado en pruebas), así que la fuente
+     principal es leer del DOM los tiles del mapa que el propio juego ya
+     renderiza — [id^="farm_town_"] con data-id y data-town_id — sin necesidad
+     de pedir nada al servidor ni pulsar nada. Como respaldo, si el DOM no tiene
+     nada útil, se intenta igualmente el endpoint AJAX por si el formato cambia.
   --------------------------------------------------------------------------------- */
   const FARM_TIME_SETS = {
-    default: [600, 2400, 10800, 28800],   // 10m · 40m · 3h · 8h  (sin Lealtad)
-    loyalty: [300, 1200, 5400, 14400]     // 5m  · 20m · 1h30 · 4h (con Lealtad)
+    normal: [300, 1200, 5400, 14400],     // 5m  · 20m · 1h30 · 4h (sin Lealtad)
+    booty:  [600, 2400, 10800, 28800]     // 10m · 40m · 3h · 8h  (con Lealtad, +115% recursos)
   };
 
   const farmRuntime = {
@@ -521,9 +532,17 @@
     try { return UW.ITowns?.getTown?.(id)?.name || `Ciudad ${id}`; } catch { return `Ciudad ${id}`; }
   }
 
+  // town.toJSON()/attributes vienen VACÍOS para ciudades que no son la activa
+  // (comprobado en vivo, 22/09/2026) — hay que usar los getters propios del
+  // modelo, que sí funcionan para cualquier ciudad cargada en ITowns.
   function farmTownData(townId) {
     const t = UW.ITowns?.getTown?.(townId);
-    try { return t?.toJSON?.() || t?.attributes || {}; } catch { return {}; }
+    if (!t) return {};
+    let booty = false;
+    try { booty = !!t.getResearches?.()?.get?.('booty'); } catch {}
+    let x, y;
+    try { x = t.getIslandCoordinateX?.(); y = t.getIslandCoordinateY?.(); } catch {}
+    return { island_x: x, island_y: y, booty_researched: booty ? 1 : 0 };
   }
 
   function townResources(townId) {
@@ -556,13 +575,43 @@
 
   function townFarmTimeSet(townId) {
     const d = farmTownData(townId);
-    const loyalty = !!(d.booty_researched || d.diplomacy_researched || d.loyalty_researched);
-    return loyalty ? FARM_TIME_SETS.loyalty : FARM_TIME_SETS.default;
+    const booty = !!d.booty_researched;
+    return booty ? FARM_TIME_SETS.booty : FARM_TIME_SETS.normal;
+  }
+
+  /* -----------------------------------------------------------------------
+     Enumeración de aldeas — confirmado leyendo el DOM real del panel nativo
+     "Aldeas" (22/09/2026): cada fila es <li class="... farm_town_el_<id> ...">
+     dentro de #farm_town_list, una por aldea PENDIENTE de recolectar (cuando
+     no queda ninguna, el html trae "farm_list_empty" / el mensaje "Todas las
+     granjas disponibles seleccionadas").
+
+     get_farm_towns_from_multiple_towns (json: town_ids:[todas], town_id:<ancla>)
+     devuelve el mismo tipo de "html", pero solo para la ciudad ancla — no hay
+     forma confirmada de separar por ciudad ahí dentro. Así que por fiabilidad
+     se pide get_farm_towns_for_town CIUDAD A CIUDAD (una llamada por ciudad,
+     con el propio townId como current_town_id) y se parsea su html con el
+     mismo patrón farm_town_el_<id>. Se cachea por ciudad FARM_VILLAGES_TTL_MS
+     para no repetirlo en cada vuelta del bucle.
+  ----------------------------------------------------------------------- */
+  const FARM_VILLAGES_TTL_MS = 0; // sin caché: cada ciclo pide el estado real
+  farmRuntime.villagesByTown = new Map();   // townId -> number[]
+  farmRuntime.villagesFetchedAt = new Map(); // townId -> epoch ms
+
+  // Parsea el html del panel de Aldeas y saca los ids de aldea pendientes
+  // (clase farm_town_el_<id> en cada <li> de #farm_town_list).
+  function parseFarmHtml(html) {
+    if (!html || typeof html !== 'string') return [];
+    if (html.includes('farm_list_empty')) return []; // nada pendiente ahora mismo
+    return [...html.matchAll(/farm_town_el_(\d+)/g)].map((m) => +m[1]);
   }
 
   async function fetchFarmTownIds(townId) {
+    const last = farmRuntime.villagesFetchedAt.get(townId) || 0;
+    if (Date.now() - last < FARM_VILLAGES_TTL_MS) return farmRuntime.villagesByTown.get(townId) || [];
+
     const d = farmTownData(townId);
-    const payload = {
+    const res = await gpGet('farm_town_overviews', 'get_farm_towns_for_town', {
       town_id: townId,
       current_town_id: townId,
       island_x: d.island_x, island_y: d.island_y,
@@ -570,21 +619,18 @@
       trade_office: d.trade_office ?? 0,
       diplomacy_researched: d.diplomacy_researched ?? '',
       nl_init: true
-    };
-    const res = await gpGet('farm_town_overviews', 'get_farm_towns_for_town', payload);
-    const list = res?.farm_towns || res?.villages || res?.data?.farm_towns || (Array.isArray(res) ? res : []);
-    if (!Array.isArray(list)) {
-      farmLog(`${farmTownName(townId)}: respuesta con formato inesperado — mira la consola.`, 'error');
-      console.warn('[NOVABOT][granjas] get_farm_towns_for_town devolvió algo que no reconozco:', res);
-      return [];
-    }
-    return list.map((v) => v.id ?? v.farm_town_id ?? v.town_id).filter(Boolean);
+    });
+    const ids = parseFarmHtml(res?.html);
+    farmRuntime.villagesByTown.set(townId, ids);
+    farmRuntime.villagesFetchedAt.set(townId, Date.now());
+    return ids;
   }
 
   async function collectTown(townId) {
     const seconds = townFarmTimeSet(townId)[clamp(state.granjas.tier, 0, 3)];
     const ids = await fetchFarmTownIds(townId);
-    if (!ids.length) { farmLog(`${farmTownName(townId)}: sin aldeas que recolectar por ahora.`, 'muted'); return seconds; }
+    // Nada listo (en espera): reintenta en 2 min en vez de esperar el ciclo entero.
+    if (!ids.length) { farmLog(`${farmTownName(townId)}: sin aldeas listas.`, 'muted'); return 0; }
     await gpPost('farm_town_overviews', 'claim_loads', {
       farm_town_ids: ids,
       time_option: seconds,
@@ -597,31 +643,97 @@
     return seconds;
   }
 
+  // Las aldeas son de la ISLA, no de la ciudad: si tienes varias ciudades en la
+  // misma isla, solo una puede recoger por ciclo (la otra da "Error del juego").
+  // Agrupamos por isla y en cada una recoge la ciudad con el almacén más vacío.
+  function townFill(townId) {
+    const cap = townStorage(townId);
+    if (!cap) return 0;
+    const r = townResources(townId);
+    return Math.max(r.wood, r.stone, r.iron) / cap;
+  }
+
+  function townsByIsland() {
+    const groups = new Map();
+    for (const id of allTownIds()) {
+      const d = farmTownData(id);
+      const key = `${d.island_x}_${d.island_y}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(id);
+    }
+    return groups;
+  }
+
+  // Un ciclo = recoger TODAS las islas seguidas (sin esperas largas). El retraso
+  // aleatorio configurado se suma al tiempo de recolección para fijar cuándo
+  // empieza el siguiente ciclo: próximo = ahora + tiempo elegido + aleatorio.
+  farmRuntime.nextCycleAt = 0;
+
+  function randomDelayMs() {
+    const { minDelayMs, maxDelayMs } = state.granjas;
+    const lo = Math.min(minDelayMs, maxDelayMs), hi = Math.max(minDelayMs, maxDelayMs);
+    return lo + Math.random() * Math.max(0, hi - lo);
+  }
+
+  // Islas que fallaron (aldeas aún en espera por una recogida anterior): se
+  // reintentan solas cada 1 min hasta que entren, sin esperar al ciclo completo.
+  farmRuntime.retryIslands = new Set();
+  farmRuntime.retryAt = 0;
+
+  async function collectIsland(towns) {
+    const candidates = towns.filter((id) => !isTownStorageAtThreshold(id))
+      .sort((a, b) => townFill(a) - townFill(b));
+    if (!candidates.length) {
+      farmLog(`${towns.map(farmTownName).join(', ')}: almacén lleno, se salta.`, 'muted');
+      return null; // lleno: no se reintenta hasta el próximo ciclo
+    }
+    return collectTown(candidates[0]);
+  }
+
+  /* Recogida de TODAS las ciudades en una sola petición — capturada del propio
+     juego al pulsar "Seleccionar todas" + "Recoger" (22/09/2026):
+       POST farm_town_overviews?action=claim_loads_multiple
+       json: { towns:[ids], time_option_base:<s sin Lealtad>, time_option_booty:<s con Lealtad>,
+               claim_factor:"normal", town_id, nl_init:true }
+     Se manda una ciudad por isla (la de almacén más vacío) y se excluyen las
+     que ya llegaron al % de almacén configurado. */
+  function pickTownsForClaim() {
+    const towns = [], full = [];
+    for (const [, group] of townsByIsland()) {
+      const ok = group.filter((id) => !isTownStorageAtThreshold(id))
+        .sort((a, b) => townFill(a) - townFill(b));
+      if (ok.length) towns.push(ok[0]); else full.push(...group);
+    }
+    return { towns, full };
+  }
+
   async function farmTick() {
-    if (!state.granjas.enabled) return;
-    for (const townId of allTownIds()) {
-      if (!state.granjas.enabled) break; // se pudo desactivar a media vuelta
-      const now = Date.now();
-      const nextAt = farmRuntime.nextTownAt.get(townId) || 0;
-      if (now < nextAt) continue;
-
-      if (isTownStorageAtThreshold(townId)) {
-        farmLog(`${farmTownName(townId)}: almacén lleno, se salta esta vuelta.`, 'muted');
-        farmRuntime.nextTownAt.set(townId, now + 5 * 60000);
-        continue;
-      }
-
-      try {
-        const seconds = await collectTown(townId);
-        farmRuntime.nextTownAt.set(townId, Date.now() + seconds * 1000);
-      } catch (e) {
-        farmLog(`${farmTownName(townId)}: error — ${e.message}`, 'error');
-        farmRuntime.nextTownAt.set(townId, Date.now() + 60000);
-      }
-
-      const { minDelayMs, maxDelayMs } = state.granjas;
-      const lo = Math.min(minDelayMs, maxDelayMs), hi = Math.max(minDelayMs, maxDelayMs);
-      await sleep(lo + Math.random() * Math.max(0, hi - lo));
+    if (!state.granjas.enabled || Date.now() < farmRuntime.nextCycleAt) return;
+    const tier = clamp(state.granjas.tier, 0, 3);
+    const base = FARM_TIME_SETS.normal[tier], booty = FARM_TIME_SETS.booty[tier];
+    const { towns, full } = pickTownsForClaim();
+    if (full.length) farmLog(`Almacén lleno, se saltan: ${full.map(farmTownName).join(', ')}.`, 'muted');
+    if (!towns.length) {
+      farmRuntime.nextCycleAt = Date.now() + 5 * 60000;
+      farmLog('Todas las ciudades con almacén lleno. Reviso en 5 min.', 'muted');
+      return;
+    }
+    try {
+      await gpPost('farm_town_overviews', 'claim_loads_multiple', {
+        towns,
+        time_option_base: base,
+        time_option_booty: booty,
+        claim_factor: 'normal',
+        town_id: UW.Game?.townId || towns[0],
+        nl_init: true
+      });
+      const anyBooty = towns.some((id) => farmTownData(id).booty_researched);
+      const seconds = anyBooty ? booty : base;
+      farmRuntime.nextCycleAt = Date.now() + seconds * 1000 + randomDelayMs();
+      farmLog(`Recogidas ${towns.length} ciudades de una vez (${Math.round(seconds / 60)} min). Próximo a las ${new Date(farmRuntime.nextCycleAt).toLocaleTimeString('es-ES')}.`, 'ok');
+    } catch (e) {
+      farmRuntime.nextCycleAt = Date.now() + 60000;
+      farmLog(`No se pudo recoger (${e.message}). Reintento en 1 min.`, 'error');
     }
   }
 
@@ -636,6 +748,24 @@
         .catch((e) => farmLog(`Error en el ciclo: ${e.message}`, 'error'))
         .finally(() => { farmRuntime.running = false; });
     }, 5000);
+    setInterval(updateCountdown, 1000);
+  }
+
+  // Cuenta atrás hasta el próximo ciclo (en la pestaña Granjas y en Inicio).
+  function updateCountdown() {
+    let text;
+    if (!state.granjas.enabled) text = 'desactivado';
+    else if (farmRuntime.running) text = 'recolectando…';
+    else {
+      const ms = (farmRuntime.nextCycleAt || 0) - Date.now();
+      if (ms <= 0) text = 'ahora';
+      else {
+        const s = Math.ceil(ms / 1000);
+        const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+        text = (h ? `${h}:${String(m).padStart(2, '0')}` : `${m}`) + `:${String(sec).padStart(2, '0')}`;
+      }
+    }
+    for (const n of $$('[data-nb-countdown]')) n.textContent = text;
   }
 
   function farmLog(text, kind = 'info') {
@@ -667,14 +797,23 @@
       saveState();
       renderBody();
       farmLog(cfg.enabled ? 'Módulo activado — se aplica a todas las ciudades.' : 'Módulo desactivado.', 'info');
+      if (cfg.enabled && !farmRuntime.running) {
+        farmRuntime.running = true;
+        farmTick().catch((e) => farmLog(`Error en el ciclo: ${e.message}`, 'error')).finally(() => { farmRuntime.running = false; });
+      }
     });
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
       el('div', { class: 'nb-row' }, [
         el('span', { class: 'nb-row-label' }, [el('b', {}, 'Recolección automática')]),
         enableSwitch
       ]),
+      el('div', { class: 'nb-row' }, [
+        el('span', { class: 'nb-row-label' }, 'Próxima recolección'),
+        el('span', { class: 'nb-row-value', 'data-nb-countdown': '' }, '—')
+      ]),
       el('p', { class: 'nb-placeholder' }, 'Se activa o desactiva para todas tus ciudades a la vez.')
     ]));
+    updateCountdown();
 
     const tierRow = el('div', { class: 'nb-btn-group' });
     ['10 min', '40 min', '3 horas', '8 horas'].forEach((label, i) => {
@@ -694,7 +833,7 @@
     const maxInput = el('input', { class: 'nb-input', type: 'number', min: '0', step: '5', value: Math.round(cfg.maxDelayMs / 1000) });
     maxInput.addEventListener('change', () => { cfg.maxDelayMs = pos(maxInput.value, 90) * 1000; saveState(); });
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
-      el('div', { class: 'nb-card-title' }, 'Retraso aleatorio entre ciudades (segundos)'),
+      el('div', { class: 'nb-card-title' }, 'Retraso aleatorio extra entre ciclos (segundos)'),
       el('div', { class: 'nb-field-row' }, [
         el('label', { class: 'nb-field' }, ['Mínimo', minInput]),
         el('label', { class: 'nb-field' }, ['Máximo', maxInput])
