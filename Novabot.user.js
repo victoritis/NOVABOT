@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      0.1.1
+// @version      0.1.2
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -50,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '0.1.1';
+  const VERSION = '0.1.2';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -98,8 +98,8 @@
       open: false,
       minimized: false,
       activeTab: 'inicio',
-      pos: null,        // {x, y} esquina superior-izquierda del panel; null = posición por defecto
-      masterEnabled: false
+      pos: null,        // {x, y} panel: esquina superior-izquierda; null = posición por defecto
+      fabPos: null       // {x, y} botón flotante; null = posición por defecto
     };
   }
 
@@ -153,7 +153,7 @@
   /* ---------------------------------------------------------------------------------
      5) DOM — construcción del FAB y del panel
   --------------------------------------------------------------------------------- */
-  let root, fab, panel, headerEl, masterSwitch, tabsEl, bodyEl, footerCityEl;
+  let root, fab, panel, headerEl, tabsEl, bodyEl, footerCityEl;
 
   function buildTabs() {
     tabsEl.innerHTML = '';
@@ -217,15 +217,7 @@
   function buildUI() {
     root = el('div', { id: 'novabot-root' });
 
-    fab = el('div', { id: 'novabot-fab', class: 'nb-interactive', html: ICON.logo, title: 'Abrir NOVABOT' });
-    fab.addEventListener('click', () => setOpen(true));
-
-    masterSwitch = el('div', { class: `nb-switch${state.masterEnabled ? ' on' : ''}` });
-    masterSwitch.addEventListener('click', () => {
-      state.masterEnabled = !state.masterEnabled;
-      masterSwitch.classList.toggle('on', state.masterEnabled);
-      saveState();
-    });
+    fab = el('div', { id: 'novabot-fab', class: 'nb-interactive', html: ICON.logo, title: 'Abrir NOVABOT (arrastra para moverlo)' });
 
     headerEl = el('div', { class: 'nb-header' }, [
       el('div', { class: 'nb-brand' }, [
@@ -245,16 +237,11 @@
     bodyEl = el('div', { class: 'nb-body' });
 
     const footer = el('div', { class: 'nb-footer' }, [
-      el('span', {}, ['Estado: ', el('b', {}, state.masterEnabled ? 'activado' : 'en pausa')]),
+      el('span', {}, [el('b', {}, 'NOVABOT'), ' activo']),
       el('span', {}, `es147`)
     ]);
 
-    const masterRow = el('div', { class: 'nb-master' }, [
-      el('div', { class: 'nb-master-label' }, [document.createTextNode('NOVABOT '), el('b', {}, state.masterEnabled ? 'activado' : 'pausado')]),
-      masterSwitch
-    ]);
-
-    panel = el('div', { id: 'novabot-panel', class: 'nb-interactive' }, [headerEl, masterRow, tabsEl, bodyEl, footer]);
+    panel = el('div', { id: 'novabot-panel', class: 'nb-interactive' }, [headerEl, tabsEl, bodyEl, footer]);
 
     root.appendChild(fab);
     root.appendChild(panel);
@@ -263,8 +250,16 @@
     buildTabs();
     renderBody();
     applyPanelPosition();
+    applyFabPosition();
     applyOpenState();
-    makeDraggable(headerEl, panel);
+
+    makeDraggable(headerEl, panel, {
+      onDragEnd: (pos) => { state.pos = pos; saveState(); }
+    });
+    makeDraggable(fab, fab, {
+      onDragEnd: (pos) => { state.fabPos = pos; saveState(); },
+      onClick: () => setOpen(true)
+    });
   }
 
   /* ---------------------------------------------------------------------------------
@@ -309,12 +304,36 @@
     }
   }
 
-  function makeDraggable(handle, target) {
-    let dragging = false, startX = 0, startY = 0, originX = 0, originY = 0;
+  function applyFabPosition() {
+    const defaultRight = 22, defaultBottom = 22;
+    if (state.fabPos) {
+      fab.style.left = `${state.fabPos.x}px`;
+      fab.style.top = `${state.fabPos.y}px`;
+      fab.style.right = 'auto';
+      fab.style.bottom = 'auto';
+    } else {
+      fab.style.right = `${defaultRight}px`;
+      fab.style.bottom = `${defaultBottom}px`;
+      fab.style.left = 'auto';
+      fab.style.top = 'auto';
+    }
+  }
+
+  /**
+   * Arrastre genérico para `target` agarrando por `handle` (pueden ser el mismo
+   * elemento, como en el FAB). Distingue clic de arrastre con un pequeño umbral:
+   * si el puntero no se mueve más de THRESHOLD px, se considera un clic y se
+   * llama a onClick; si se mueve más, es un arrastre y se llama a onDragEnd con
+   * la posición final para persistirla.
+   */
+  function makeDraggable(handle, target, { onDragEnd, onClick, boundsPadding = 4 } = {}) {
+    let dragging = false, dragged = false, startX = 0, startY = 0, originX = 0, originY = 0;
+    const THRESHOLD = 4;
 
     handle.addEventListener('mousedown', (e) => {
       if (e.target.closest('.nb-icon-btn')) return;
       dragging = true;
+      dragged = false;
       const rect = target.getBoundingClientRect();
       startX = e.clientX; startY = e.clientY;
       originX = rect.left; originY = rect.top;
@@ -324,10 +343,12 @@
     window.addEventListener('mousemove', (e) => {
       if (!dragging) return;
       const dx = e.clientX - startX, dy = e.clientY - startY;
-      const maxX = window.innerWidth - target.offsetWidth - 4;
-      const maxY = window.innerHeight - 40;
-      const x = clamp(originX + dx, 4, Math.max(4, maxX));
-      const y = clamp(originY + dy, 4, Math.max(4, maxY));
+      if (!dragged && (Math.abs(dx) > THRESHOLD || Math.abs(dy) > THRESHOLD)) dragged = true;
+      if (!dragged) return;
+      const maxX = window.innerWidth - target.offsetWidth - boundsPadding;
+      const maxY = window.innerHeight - target.offsetHeight - boundsPadding;
+      const x = clamp(originX + dx, boundsPadding, Math.max(boundsPadding, maxX));
+      const y = clamp(originY + dy, boundsPadding, Math.max(boundsPadding, maxY));
       target.style.left = `${x}px`;
       target.style.top = `${y}px`;
       target.style.right = 'auto';
@@ -337,9 +358,12 @@
     window.addEventListener('mouseup', () => {
       if (!dragging) return;
       dragging = false;
-      const rect = target.getBoundingClientRect();
-      state.pos = { x: Math.round(rect.left), y: Math.round(rect.top) };
-      saveState();
+      if (dragged) {
+        const rect = target.getBoundingClientRect();
+        onDragEnd?.({ x: Math.round(rect.left), y: Math.round(rect.top) });
+      } else {
+        onClick?.();
+      }
     });
   }
 
