@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.0.0
+// @version      1.1.0
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -50,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.0.0';
+  const VERSION = '1.1.0';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -63,6 +63,7 @@
     { id: 'construccion', label: 'Construcción', icon: 'build',  disabled: false },
     { id: 'reclutamiento', label: 'Reclutamiento', icon: 'shield', disabled: false },
     { id: 'comercio',    label: 'Comercio',       icon: 'trade',  disabled: false },
+    { id: 'festivales',  label: 'Festivales',     icon: 'star',   disabled: false },
     { id: 'ataques',     label: 'Ataques',        icon: 'sword',  disabled: false }
   ];
 
@@ -117,6 +118,10 @@
         strictOrder: false,   // true = no salta a otro edificio si el primero está bloqueado
         towns: {}             // townId -> { goals: [{id, target}] } (orden = prioridad)
       },
+      festivales: {
+        enabled: true,
+        first: false          // true = construcción/reclutamiento no gastan lo reservado para el festival
+      },
       ataques: {
         correctionMs: 0       // corrección automática del disparo (se ajusta sola con la llegada real)
       },
@@ -133,6 +138,7 @@
         keepMin: 0,           // mínimo que se deja siempre en la ciudad donante
         maxPerTick: 5,
         forRecruit: true,     // abastecer los lotes de reclutamiento
+        forFestival: true,    // abastecer festivales (Academia 30+)
         agingWeight: 2,       // cuánto sube la prioridad por cada segundo esperando (anti-olvido de lejanas)
         secPerUnit: 0         // se calibra solo con los envíos reales
       }
@@ -145,7 +151,7 @@
       if (raw && typeof raw === 'object') {
         const def = defaultState();
         const out = { ...def, ...raw };
-        for (const k of ['granjas', 'construccion', 'comercio', 'reclutamiento', 'ataques']) out[k] = { ...def[k], ...(raw[k] || {}) };
+        for (const k of ['granjas', 'construccion', 'comercio', 'reclutamiento', 'ataques', 'festivales']) out[k] = { ...def[k], ...(raw[k] || {}) };
         return out;
       }
     } catch {}
@@ -226,6 +232,7 @@
     minus: '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/></svg>',
     close: '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><path d="m18 6-12 12M6 6l12 12"/></svg>',
     resize: '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><line x1="21" y1="9" x2="9" y2="21"/><line x1="21" y1="15" x2="15" y2="21"/></svg>',
+    star: '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3 2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1-4.4-4.3 6.1-.9Z"/></svg>',
     sword: '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 17.5 3 6V3h3l11.5 11.5"/><path d="m13 19 6-6"/><path d="m16 16 4 4"/><path d="m19 21 2-2"/></svg>',
     farm: '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21V9"/><path d="M12 9c0-4 3-7 7-7 0 4-3 7-7 7Z"/><path d="M12 13c0-4-3-7-7-7 0 4 3 7 7 7Z"/></svg>'
   };
@@ -284,6 +291,8 @@
 
     if (state.activeTab === 'inicio') {
       renderInicioTab();
+    } else if (state.activeTab === 'festivales') {
+      renderFestivalesTab();
     } else if (state.activeTab === 'ataques') {
       renderAtaquesTab();
     } else if (state.activeTab === 'reclutamiento') {
@@ -322,7 +331,8 @@
         granjas: el('span', { 'data-nb-countdown': '' }, '—'),
         construccion: `${goalsBuild} objetivos · ${buildQueueLimit()} huecos de cola`,
         reclutamiento: `${goalsRec} ciudades con tropas pedidas`,
-        comercio: `${transit} en camino · ${needs} ciudades esperando`
+        comercio: `${transit} en camino · ${needs} ciudades esperando`,
+        festivales: (() => { const apt = allTownIds().filter(canFestival); const on = apt.filter((id) => festivalEnd(id)).length; return `${on}/${apt.length} con festival`; })()
       };
     } catch {}
     const mod = (tab, title, cfgObj, hint) => {
@@ -345,6 +355,7 @@
       mod('construccion', 'Construcción', state.construccion, 'Sube edificios por objetivos'),
       mod('reclutamiento', 'Reclutamiento', state.reclutamiento, 'Lotes que llenan el almacén'),
       mod('comercio', 'Comercio', state.comercio, 'Reparte recursos entre ciudades'),
+      mod('festivales', 'Festivales', state.festivales, 'Academia 30+, sin festival en curso'),
       (() => {
         const nx = nextPending();
         const n = atk.queue.filter((a) => a.status === 'pending').length;
@@ -1096,7 +1107,9 @@
     if ((+info.population_free || 0) < (+info.population_for || 0)) return 'falta población';
     const cost = info.resources_for || {};
     const r = townResources(townId);
+    const fr = typeof festivalReserve === 'function' ? festivalReserve(townId) : { wood: 0, stone: 0, iron: 0 };
     if (r.wood < (+cost.wood || 0) || r.stone < (+cost.stone || 0) || r.iron < (+cost.iron || 0)) return 'faltan recursos';
+    if (r.wood - fr.wood < (+cost.wood || 0) || r.stone - fr.stone < (+cost.stone || 0) || r.iron - fr.iron < (+cost.iron || 0)) return 'reservado para festival';
     return null;
   }
 
@@ -1584,6 +1597,8 @@
     const itemsBy = {};
     for (const id of towns) itemsBy[id] = [];
     for (const d of demands) if (itemsBy[d.townId]) itemsBy[d.townId].push(d);
+    // Orden de gasto dentro de cada ciudad = prioridad del módulo (estable).
+    for (const id of towns) itemsBy[id] = itemsBy[id].map((d, i) => ({ d, i })).sort((a, b) => (a.d.prio - b.d.prio) || (a.i - b.i)).map((x) => x.d);
 
     const st = {};
     for (const id of towns) {
@@ -1884,7 +1899,8 @@
     if (!rows.length) return null;
     const storage = townStorage(townId) || 0;
     const fill = clamp(+state.reclutamiento.fillPct || 95, 10, 100) / 100;
-    const budget = { wood: storage * fill, stone: storage * fill, iron: storage * fill, pop: freePopulation(townId), favor: godMaxFavor() * fill };
+    const fr = festivalReserve(townId);
+    const budget = { wood: Math.max(0, storage * fill - fr.wood), stone: Math.max(0, storage * fill - fr.stone), iron: Math.max(0, storage * fill - fr.iron), pop: freePopulation(townId), favor: godMaxFavor() * fill };
     const KEYS = [...RES, 'pop', 'favor'];
     if (budget.pop <= 0) return { rows, units: {}, cost: { wood: 0, stone: 0, iron: 0 }, reason: 'sin población libre' };
 
@@ -1943,7 +1959,8 @@
       const b = recruitBatch(townId);
       if (!b || b.reason) continue;
       const cur = townResources(townId);
-      if (RES.some((k) => cur[k] < b.cost[k])) continue; // aún no está el lote completo
+      const fr = festivalReserve(townId);
+      if (RES.some((k) => cur[k] - fr[k] < b.cost[k])) continue; // aún no está el lote completo (sin tocar lo del festival)
       if (b.favor && godFavor(townGod(townId)) < b.favor) continue;
       for (const [unitId, amount] of Object.entries(b.units)) {
         if (!(amount > 0)) continue;
@@ -2921,6 +2938,143 @@
   }
 
   /* ---------------------------------------------------------------------------------
+     8f) FESTIVALES (cultura)
+     -----------------------------------------------------------------------------
+     Solo ciudades con Academia ≥ 30 y sin festival en curso.
+     Coste (leído del Ágora del juego): 15 000 madera · 18 000 piedra · 15 000 plata; dura 6 h.
+     Petición (la misma que BuildingPlace.startCelebration del juego):
+       POST building_place?action=start_celebration  json: { celebration_type:"party", town_id }
+     Festivales en curso: MM.getModels().Celebration → { town_id, celebration_type, finished_at }.
+     Comercio: cada ciudad apta sin festival publica como demanda JUSTO lo que le falta
+     para el festival. Con "festival primero", construcción y reclutamiento no gastan
+     por debajo de ese coste en esas ciudades.
+  --------------------------------------------------------------------------------- */
+  const FESTIVAL_COST = { wood: 15000, stone: 18000, iron: 15000 };
+  const FESTIVAL_ACADEMY = 30;
+  const festRuntime = { timer: null, running: false, log: [], cooldown: new Map() };
+  let festLogEl = null;
+
+  function academyLevel(townId) {
+    const bd = buildDataFor(townId);
+    const l = +bd?.building_data?.academy?.level;
+    if (Number.isFinite(l) && l > 0) return l;
+    try { return +UW.ITowns.getTown(townId)?.getBuildings?.()?.attributes?.academy || 0; } catch { return 0; }
+  }
+  function festivalEnd(townId) {
+    try {
+      const all = [];
+      const m = UW.MM.getModels().Celebration;
+      if (m) all.push(...Object.values(m));
+      all.push(...[].concat(UW.MM.getCollections().Celebration || []).flatMap((c) => c?.models || []));
+      let end = 0;
+      for (const x of all) {
+        const a = x?.attributes || {};
+        if (+a.town_id !== +townId || a.celebration_type !== 'party') continue;
+        const f = +a.finished_at * 1000;
+        if (f > Date.now()) end = Math.max(end, f);
+      }
+      return end;
+    } catch { return 0; }
+  }
+  const canFestival = (townId) => academyLevel(townId) >= FESTIVAL_ACADEMY;
+  const festivalPending = (townId) => state.festivales.enabled && canFestival(townId) && !festivalEnd(townId);
+  // Reserva que otros módulos respetan cuando el festival va primero.
+  function festivalReserve(townId) {
+    if (!state.festivales.first || !festivalPending(townId)) return { wood: 0, stone: 0, iron: 0 };
+    return { ...FESTIVAL_COST };
+  }
+
+  tradeDemandProviders.push(function festivalDemands() {
+    if (!state.festivales.enabled || !state.comercio.forFestival) return [];
+    const out = [];
+    for (const townId of allTownIds()) {
+      if (!festivalPending(townId)) continue;
+      out.push({ townId, prio: state.festivales.first ? 0 : 3, label: 'Festival', ...FESTIVAL_COST });
+    }
+    return out;
+  });
+
+  async function festTick() {
+    if (!state.festivales.enabled) return;
+    for (const townId of allTownIds()) {
+      if (!state.festivales.enabled) return;
+      if (!festivalPending(townId)) continue;
+      if ((festRuntime.cooldown.get(townId) || 0) > Date.now()) continue;
+      const cur = townResources(townId);
+      if (RES.some((k) => cur[k] < FESTIVAL_COST[k])) continue;
+      try {
+        await gpPostAs(townId, 'building_place', 'start_celebration', { celebration_type: 'party', nl_init: true });
+        festLog(`${farmTownName(townId)}: festival iniciado.`, 'ok');
+        festRuntime.cooldown.set(townId, Date.now() + 60000);
+      } catch (e) {
+        festLog(`${farmTownName(townId)}: ${e.message}`, 'error');
+        festRuntime.cooldown.set(townId, Date.now() + 5 * 60000);
+      }
+      await sleep(600 + Math.random() * 700);
+    }
+    if (state.activeTab === 'festivales') renderBody();
+  }
+
+  function startFestivalEngine() {
+    if (festRuntime.timer) return;
+    festRuntime.timer = setInterval(() => {
+      if (!state.festivales.enabled || festRuntime.running) return;
+      festRuntime.running = true;
+      festTick().catch((e) => festLog(`Error: ${e.message}`, 'error')).finally(() => { festRuntime.running = false; });
+    }, 10000);
+  }
+
+  function festLog(text, kind = 'info') {
+    festRuntime.log.unshift({ at: Date.now(), text, kind });
+    festRuntime.log = festRuntime.log.slice(0, 30);
+    if (festLogEl) paintLog(festLogEl, festRuntime.log);
+  }
+
+  function renderFestivalesTab() {
+    const cfg = state.festivales;
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, [el('b', {}, 'Festivales automáticos')]),
+        switchEl(!!cfg.enabled, (v) => { cfg.enabled = v; saveState(); renderBody(); festLog(v ? 'Festivales activados.' : 'Festivales desactivados.'); }, false)]),
+      optionRow('Pedir recursos al Comercio', 'Envía justo lo que falta para el festival', !!state.comercio.forFestival, (v) => { state.comercio.forFestival = v; saveState(); }),
+      optionRow('Festival primero', 'Construcción y reclutamiento no gastan lo reservado para el festival', !!cfg.first, (v) => { cfg.first = v; saveState(); renderBody(); }),
+      el('p', { class: 'nb-placeholder' }, `Solo ciudades con Academia ${FESTIVAL_ACADEMY}+ y sin festival en curso. Coste: 15 000 madera · 18 000 piedra · 15 000 plata.`)
+    ]));
+
+    // Estado por ciudad
+    const transit = (() => { try { return transitRows(); } catch { return []; } })();
+    const rows = allTownIds().map((id) => ({ id, name: farmTownName(id), acad: academyLevel(id), end: festivalEnd(id) }))
+      .sort((a, b) => (b.acad >= FESTIVAL_ACADEMY) - (a.acad >= FESTIVAL_ACADEMY) || a.name.localeCompare(b.name, 'es'));
+    const apt = rows.filter((r) => r.acad >= FESTIVAL_ACADEMY);
+    const list = el('div', { class: 'nb-goals' });
+    for (const r of apt) {
+      const cur = townResources(r.id), inc = incomingTo(r.id, transit);
+      let sub, cls = '';
+      if (r.end) { sub = el('span', {}, ['En curso · termina en ', el('b', { 'data-nb-until': Math.round(r.end / 1000) }, formatLeft(Math.round(r.end / 1000)))]); cls = ' nb-goal-done'; }
+      else {
+        const miss = Object.fromEntries(RES.map((k) => [k, Math.max(0, FESTIVAL_COST[k] - cur[k])]));
+        const missAfter = Object.fromEntries(RES.map((k) => [k, Math.max(0, miss[k] - inc[k])]));
+        if (!sumRes(miss)) { sub = 'Listo: se inicia en el próximo ciclo'; cls = ' nb-goal-next'; }
+        else sub = `Faltan ${fmtRes(miss)}${sumRes(inc) ? ` · en camino ${fmtRes(inc)}${sumRes(missAfter) ? '' : ' (cubre)'}` : ''}`;
+      }
+      const pct = Math.min(100, Math.round(RES.reduce((s, k) => s + Math.min(cur[k], FESTIVAL_COST[k]), 0) / sumRes(FESTIVAL_COST) * 100));
+      list.appendChild(el('div', { class: `nb-goal${cls}` }, [
+        el('div', { class: 'nb-goal-main' }, [el('div', { class: 'nb-goal-name' }, r.name), el('div', { class: 'nb-goal-sub' }, [sub])]),
+        r.end ? el('span', { class: 'nb-pill' }, 'festival') : el('div', { class: 'nb-bar nb-bar-mini' }, [el('div', { class: 'nb-bar-fill', style: `width:${pct}%` })])
+      ]));
+    }
+    const noApt = rows.length - apt.length;
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+      el('div', { class: 'nb-card-title' }, `Ciudades aptas (${apt.length})`),
+      apt.length ? list : el('p', { class: 'nb-placeholder' }, 'Ninguna ciudad tiene Academia 30.'),
+      noApt ? el('p', { class: 'nb-placeholder nb-mt' }, `${noApt} ciudades con Academia < ${FESTIVAL_ACADEMY} (no pueden festejar).`) : null
+    ]));
+
+    const logBox = el('div', { class: 'nb-log' });
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [el('div', { class: 'nb-card-title' }, 'Actividad'), logBox]));
+    festLogEl = logBox; paintLog(logBox, festRuntime.log);
+  }
+
+  /* ---------------------------------------------------------------------------------
      9) INIT
   --------------------------------------------------------------------------------- */
   function waitFor(cond, timeoutMs = 20000, stepMs = 200) {
@@ -2964,6 +3118,7 @@
     startTradeEngine();
     startRecruitEngine();
     startAttackEngine();
+    startFestivalEngine();
 
     // En cuanto el cliente del juego termine de cargar, refresca el nombre de ciudad.
     waitFor(() => !!(UW.Game && UW.ITowns)).then(() => {

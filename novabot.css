@@ -7,7 +7,7 @@
    ===================================================================================== */
 
 :root{
-  --nb-css-version:   "1.0.0";
+  --nb-css-version:   "1.1.0";
 
   /* superficies */
   --nb-bg:            #111419;
@@ -466,3 +466,6 @@
 #novabot-panel .nb-tag-support{ background: rgba(124,199,154,.14); color: var(--nb-ok); }
 #novabot-panel .nb-tag-missed{ background: var(--nb-danger-soft); color: var(--nb-danger); }
 #novabot-panel .nb-tag-skipped{ background: rgba(255,255,255,.06); color: var(--nb-text-faint); }
+
+/* ---------- Festivales ---------- */
+#novabot-panel .nb-bar-mini{ flex: none; width: 70px; height: 6px; }
