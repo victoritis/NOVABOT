@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      0.6.0
+// @version      0.7.3
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -50,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '0.6.0';
+  const VERSION = '0.7.3';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -61,7 +61,7 @@
     { id: 'inicio',      label: 'Inicio',        icon: 'home',   disabled: false },
     { id: 'granjas',     label: 'Granjas',       icon: 'farm',   disabled: false },
     { id: 'construccion', label: 'Construcción', icon: 'build',  disabled: false },
-    { id: 'reclutamiento', label: 'Reclutamiento', icon: 'shield', disabled: true },
+    { id: 'reclutamiento', label: 'Reclutamiento', icon: 'shield', disabled: false },
     { id: 'comercio',    label: 'Comercio',       icon: 'trade',  disabled: false },
     { id: 'ajustes',     label: 'Ajustes',        icon: 'gear',   disabled: true }
   ];
@@ -117,6 +117,11 @@
         strictOrder: false,   // true = no salta a otro edificio si el primero está bloqueado
         towns: {}             // townId -> { goals: [{id, target}] } (orden = prioridad)
       },
+      reclutamiento: {
+        enabled: true,
+        fillPct: 95,          // tamaño del lote = % del almacén
+        towns: {}             // townId -> { goals: [{id, target}] }
+      },
       comercio: {
         enabled: true,        // general, no por ciudad
         forBuild: true,       // abastecer la construcción
@@ -124,6 +129,7 @@
         storageMarginPct: 5,  // hueco que se deja libre en el almacén destino
         keepMin: 0,           // mínimo que se deja siempre en la ciudad donante
         maxPerTick: 5,
+        forRecruit: true,     // abastecer los lotes de reclutamiento
         agingWeight: 2,       // cuánto sube la prioridad por cada segundo esperando (anti-olvido de lejanas)
         secPerUnit: 0         // se calibra solo con los envíos reales
       }
@@ -136,7 +142,7 @@
       if (raw && typeof raw === 'object') {
         const def = defaultState();
         const out = { ...def, ...raw };
-        for (const k of ['granjas', 'construccion', 'comercio']) out[k] = { ...def[k], ...(raw[k] || {}) };
+        for (const k of ['granjas', 'construccion', 'comercio', 'reclutamiento']) out[k] = { ...def[k], ...(raw[k] || {}) };
         return out;
       }
     } catch {}
@@ -282,6 +288,8 @@
       ]));
 
       updateCityLabel();
+    } else if (state.activeTab === 'reclutamiento') {
+      renderReclutamientoTab();
     } else if (state.activeTab === 'comercio') {
       renderComercioTab();
     } else if (state.activeTab === 'construccion') {
@@ -524,7 +532,7 @@
     const id = +UW.Game?.townId || null;
     if (id === lastTownId) return;
     lastTownId = id;
-    if (state.activeTab === 'construccion' && bodyEl) renderBody();
+    if ((state.activeTab === 'construccion' || state.activeTab === 'reclutamiento') && bodyEl) renderBody();
   }
 
   function updateCityLabel() {
@@ -1694,6 +1702,293 @@
   }
 
   /* ---------------------------------------------------------------------------------
+     8d) RECLUTAMIENTO (tierra y mar) — lotes que llenan el almacén
+     -----------------------------------------------------------------------------
+     Por ciudad: lista de tropas con un total objetivo. El bot calcula el LOTE
+     más grande que cabe en el almacén (mezclando las tropas pedidas para
+     aprovechar los 3 recursos a la vez), espera a tener ese lote (el recurso
+     que más pide el lote llega a su tope) y entonces recluta todo de golpe.
+     Mientras espera, el lote se publica como demanda al Comercio, que manda
+     justo los recursos que faltan (en la proporción que pide la mezcla).
+
+     Petición: POST building_barracks?action=build (tierra) / building_docks (mar)
+               json: { unit_id, amount, town_id, nl_init:true }
+  --------------------------------------------------------------------------------- */
+  const recruitRuntime = { timer: null, running: false, log: [], cooldown: new Map() };
+  let recruitLogEl = null;
+
+  function townRecruitCfg(townId) {
+    const all = state.reclutamiento.towns;
+    if (!all[townId]) all[townId] = { goals: [] };
+    return all[townId];
+  }
+
+  function unitName(id) { const u = UW.GameData?.units?.[id]; return u?.name_plural || u?.name || id; }
+
+  // Coste por tropa: tabla base del juego (GameData.units[id].resources).
+  // No se aplica el descuento de la Leva: en una orden real de 19. NOVA (con
+  // Leva) el reembolso por unidad es justo el 50% del coste BASE, así que no está
+  // claro que se aplique; usando la base el lote nunca se queda corto.
+  function unitCost(townId, id) {
+    const u = UW.GameData?.units?.[id];
+    const r = u?.resources || {};
+    const f = 1;
+    return { wood: Math.ceil((+r.wood || 0) * f), stone: Math.ceil((+r.stone || 0) * f), iron: Math.ceil((+r.iron || 0) * f), pop: +u?.population || 1 };
+  }
+
+  const isNavalUnit = (id) => !!UW.GameData?.units?.[id]?.is_naval;
+
+  // Tropas (tierra y mar) que la ciudad puede reclutar ya (investigación + edificios), sin míticas.
+  function landUnitsFor(townId) {
+    const units = UW.GameData?.units || {};
+    let rs = null; try { rs = UW.ITowns.getTown(townId)?.getResearches?.(); } catch {}
+    const bd = buildDataFor(townId);
+    const out = [];
+    for (const [id, u] of Object.entries(units)) {
+      if (!u || typeof u !== 'object' || u.is_npc_unit_only || id === 'militia' || +u.favor > 0) continue;
+      const needR = [].concat(u.research_dependencies || []);
+      if (needR.some((r) => !rs?.get?.(r))) continue;
+      const needB = u.building_dependencies || {};
+      if (Object.entries(needB).some(([b, l]) => (+bd?.building_data?.[b]?.level || 0) < +l)) continue;
+      out.push(id);
+    }
+    // Primero las de tierra, luego las navales; alfabético dentro de cada grupo.
+    return out.sort((a, b) => (isNavalUnit(a) - isNavalUnit(b)) || unitName(a).localeCompare(unitName(b), 'es'));
+  }
+
+  function townUnitsHave(townId) {
+    const out = {};
+    try { Object.assign(out, UW.ITowns.getTown(townId)?.units?.() || {}); } catch {}
+    return out;
+  }
+  function townUnitOrders(townId) {
+    try { return (UW.ITowns.getTown(townId)?.getUnitOrdersCollection?.()?.models || []).map((m) => m.attributes); } catch { return []; }
+  }
+  function queuedUnits(townId) {
+    const out = {};
+    for (const o of townUnitOrders(townId)) out[o.unit_type] = (out[o.unit_type] || 0) + (+o.units_left || +o.count || 0);
+    return out;
+  }
+  // Cuartel (tierra) y Puerto (mar) tienen colas separadas.
+  function unitQueueFree(townId, kind = null) {
+    const orders = townUnitOrders(townId);
+    const free = (k) => Math.max(0, buildQueueLimit() - orders.filter((o) => (o.kind === 'naval') === (k === 'naval')).length);
+    return kind ? free(kind) : free('ground') + free('naval');
+  }
+  function freePopulation(townId) {
+    try { return Math.max(0, +UW.ITowns.getTown(townId)?.getAvailablePopulation?.() || 0); } catch { return 0; }
+  }
+
+  // Lote óptimo: maximiza la población reclutada sin pasar el presupuesto de
+  // almacén (por recurso) ni la población libre ni lo que falta de cada tropa.
+  // Empieza con la mezcla proporcional a lo que falta y rellena en greedy con la
+  // tropa que mejor aprovecha el recurso que más sobra (así un lanzador, que tira
+  // de madera, se combina con hoplitas, que tiran de piedra/plata).
+  function recruitBatch(townId) {
+    const cfg = townRecruitCfg(townId);
+    const have = townUnitsHave(townId), queued = queuedUnits(townId);
+    const rows = cfg.goals.map((g) => ({ id: g.id, rem: Math.max(0, g.target - (+have[g.id] || 0) - (+queued[g.id] || 0)), c: unitCost(townId, g.id) }))
+      .filter((r) => r.rem > 0 && unitQueueFree(townId, isNavalUnit(r.id) ? 'naval' : 'ground') > 0);
+    if (!rows.length) return null;
+    const storage = townStorage(townId) || 0;
+    const fill = clamp(+state.reclutamiento.fillPct || 95, 10, 100) / 100;
+    const budget = { wood: storage * fill, stone: storage * fill, iron: storage * fill, pop: freePopulation(townId) };
+    if (budget.pop <= 0) return { rows, units: {}, cost: { wood: 0, stone: 0, iron: 0 }, reason: 'sin población libre' };
+
+    // Proporcional
+    const sum = { wood: 0, stone: 0, iron: 0, pop: 0 };
+    for (const r of rows) for (const k of [...RES, 'pop']) sum[k] += r.rem * r.c[k];
+    let s = 1;
+    for (const k of [...RES, 'pop']) if (sum[k] > 0) s = Math.min(s, budget[k] / sum[k]);
+    const units = {};
+    const used = { wood: 0, stone: 0, iron: 0, pop: 0 };
+    for (const r of rows) {
+      const n = Math.floor(r.rem * s);
+      if (n > 0) { units[r.id] = n; for (const k of [...RES, 'pop']) used[k] += n * r.c[k]; }
+    }
+    // Relleno greedy (1 a 1) con la tropa que más usa lo que sobra.
+    for (let guard = 0; guard < 5000; guard++) {
+      const left = Object.fromEntries([...RES, 'pop'].map((k) => [k, budget[k] - used[k]]));
+      let best = null, bestScore = 0;
+      for (const r of rows) {
+        if ((units[r.id] || 0) >= r.rem) continue;
+        if ([...RES, 'pop'].some((k) => r.c[k] > left[k])) continue;
+        // Puntuación: población por unidad del recurso más escaso tras añadirla.
+        const score = r.c.pop / Math.max(1e-9, Math.max(...RES.map((k) => r.c[k] / Math.max(1, left[k]))));
+        if (score > bestScore) { bestScore = score; best = r; }
+      }
+      if (!best) break;
+      units[best.id] = (units[best.id] || 0) + 1;
+      for (const k of [...RES, 'pop']) used[k] += best.c[k];
+    }
+    const cost = { wood: used.wood, stone: used.stone, iron: used.iron };
+    if (!Object.keys(units).length) return { rows, units, cost, reason: 'no cabe ni una tropa' };
+    return { rows, units, cost, pop: used.pop };
+  }
+
+  // Demanda para el Comercio: el lote completo (prioridad por detrás de construir).
+  tradeDemandProviders.push(function recruitDemands() {
+    if (!state.reclutamiento.enabled || !state.comercio.forRecruit) return [];
+    const out = [];
+    for (const townId of allTownIds()) {
+      if (!townRecruitCfg(townId).goals.length || !unitQueueFree(townId)) continue;
+      const b = recruitBatch(townId);
+      if (!b || !sumRes(b.cost)) continue;
+      out.push({ townId, prio: 2, label: `lote ${Object.entries(b.units).map(([u, n]) => `${n} ${unitName(u)}`).join(' + ')}`, ...b.cost });
+    }
+    return out;
+  });
+
+  async function recruitTick() {
+    if (!state.reclutamiento.enabled) return;
+    for (const townId of allTownIds()) {
+      if (!state.reclutamiento.enabled) return;
+      if (!townRecruitCfg(townId).goals.length || !unitQueueFree(townId)) continue;
+      if ((recruitRuntime.cooldown.get(townId) || 0) > Date.now()) continue;
+      // Construir va primero: si hay un edificio listo para pagarse, no le quitamos recursos.
+      if (state.construccion.enabled && nextBuildFor(townId).id) continue;
+      const b = recruitBatch(townId);
+      if (!b || b.reason) continue;
+      const cur = townResources(townId);
+      if (RES.some((k) => cur[k] < b.cost[k])) continue; // aún no está el lote completo
+      for (const [unitId, amount] of Object.entries(b.units)) {
+        if (!(amount > 0)) continue;
+        try {
+          await gpPostAs(townId, isNavalUnit(unitId) ? 'building_docks' : 'building_barracks', 'build', { unit_id: unitId, amount, nl_init: true });
+          recruitLog(`${farmTownName(townId)}: ${amount} ${unitName(unitId)} reclutados.`, 'ok');
+        } catch (e) {
+          recruitLog(`${farmTownName(townId)}: ${unitName(unitId)} — ${e.message}`, 'error');
+          recruitRuntime.cooldown.set(townId, Date.now() + 5 * 60000);
+          break;
+        }
+        await sleep(700 + Math.random() * 800);
+      }
+      if (state.activeTab === 'reclutamiento') renderBody();
+    }
+  }
+
+  function startRecruitEngine() {
+    if (recruitRuntime.timer) return;
+    recruitRuntime.timer = setInterval(() => {
+      if (!state.reclutamiento.enabled || recruitRuntime.running) return;
+      recruitRuntime.running = true;
+      recruitTick().catch((e) => recruitLog(`Error: ${e.message}`, 'error')).finally(() => { recruitRuntime.running = false; });
+    }, 15000);
+  }
+
+  function recruitLog(text, kind = 'info') {
+    recruitRuntime.log.unshift({ at: Date.now(), text, kind });
+    recruitRuntime.log = recruitRuntime.log.slice(0, 30);
+    renderRecruitLog();
+  }
+  function renderRecruitLog() {
+    if (!recruitLogEl) return;
+    recruitLogEl.innerHTML = '';
+    if (!recruitRuntime.log.length) { recruitLogEl.appendChild(el('p', { class: 'nb-placeholder' }, 'Sin actividad todavía.')); return; }
+    for (const e of recruitRuntime.log) recruitLogEl.appendChild(el('div', { class: `nb-log-item nb-log-${e.kind}` }, `${new Date(e.at).toLocaleTimeString('es-ES')} · ${e.text}`));
+  }
+
+  function renderReclutamientoTab() {
+    const cfg = state.reclutamiento;
+    const townId = +UW.Game?.townId || allTownIds()[0];
+    const tcfg = townRecruitCfg(townId);
+
+    const sw = el('div', { class: `nb-switch${cfg.enabled ? ' on' : ''}` });
+    sw.addEventListener('click', () => { cfg.enabled = !cfg.enabled; saveState(); renderBody(); recruitLog(cfg.enabled ? 'Reclutamiento activado.' : 'Reclutamiento desactivado.'); });
+    const tradeChk = el('input', { type: 'checkbox' });
+    tradeChk.checked = !!state.comercio.forRecruit;
+    tradeChk.addEventListener('change', () => { state.comercio.forRecruit = tradeChk.checked; saveState(); });
+    const fillIn = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '10', max: '100', value: cfg.fillPct });
+    fillIn.addEventListener('change', () => { cfg.fillPct = clamp(pos(fillIn.value, 95), 10, 100); saveState(); renderBody(); });
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, [el('b', {}, 'Reclutamiento automático')]), sw]),
+      el('label', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Pedir recursos al Comercio'), tradeChk]),
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Lote = % del almacén'), el('span', {}, [fillIn, ' %'])]),
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Ciudad actual'), el('span', { class: 'nb-row-value' }, farmTownName(townId))])
+    ]));
+
+    // Siguiente lote
+    const b = recruitBatch(townId);
+    const cur = townResources(townId);
+    let lotBox;
+    if (!b) lotBox = el('p', { class: 'nb-placeholder' }, tcfg.goals.length ? 'Objetivos cumplidos.' : 'Sin tropas pedidas.');
+    else if (b.reason) lotBox = el('p', { class: 'nb-placeholder' }, b.reason);
+    else {
+      const bars = RES.filter((k) => b.cost[k] > 0).map((k) => {
+        const pct = Math.min(100, Math.round(cur[k] / b.cost[k] * 100));
+        return el('div', { class: 'nb-bar-row' }, [
+          el('span', { class: 'nb-bar-label' }, ({ wood: 'Madera', stone: 'Piedra', iron: 'Plata' })[k]),
+          el('div', { class: 'nb-bar' }, [el('div', { class: 'nb-bar-fill', style: `width:${pct}%` })]),
+          el('span', { class: 'nb-bar-num' }, `${Math.floor(cur[k])}/${Math.ceil(b.cost[k])}`)
+        ]);
+      });
+      lotBox = el('div', {}, [
+        el('div', { class: 'nb-goal-name' }, Object.entries(b.units).map(([u, n]) => `${n} ${unitName(u)}`).join(' + ')),
+        el('div', { class: 'nb-goal-sub' }, `${b.pop} de población · cola ${unitQueueFree(townId) ? 'libre' : 'llena'}`),
+        ...bars
+      ]);
+    }
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [el('div', { class: 'nb-card-title' }, 'Siguiente lote'), lotBox]));
+
+    // Objetivos
+    const have = townUnitsHave(townId), queued = queuedUnits(townId);
+    const setTarget = (id, v) => {
+      const i = tcfg.goals.findIndex((g) => g.id === id);
+      v = Math.max(0, Math.round(v));
+      if (!v) { if (i >= 0) tcfg.goals.splice(i, 1); }
+      else if (i >= 0) tcfg.goals[i].target = v;
+      else tcfg.goals.push({ id, target: v });
+      saveState(); renderBody();
+    };
+    const goalsBox = el('div', { class: 'nb-goals' });
+    for (const g of tcfg.goals) {
+      const h = (+have[g.id] || 0) + (+queued[g.id] || 0);
+      const input = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '0', value: g.target });
+      input.addEventListener('change', () => setTarget(g.id, pos(input.value, g.target)));
+      goalsBox.appendChild(el('div', { class: `nb-goal${h >= g.target ? ' nb-goal-done' : ''}` }, [
+        el('div', { class: 'nb-goal-main' }, [
+          el('div', { class: 'nb-goal-name' }, `${unitName(g.id)}${isNavalUnit(g.id) ? ' · naval' : ''}`),
+          el('div', { class: 'nb-goal-sub' }, `tienes ${+have[g.id] || 0}${queued[g.id] ? ` + ${queued[g.id]} en cola` : ''} · faltan ${Math.max(0, g.target - h)}`)
+        ]),
+        el('div', { class: 'nb-stepper' }, [
+          el('span', { class: 'nb-mini', onclick: () => setTarget(g.id, g.target - 50) }, '−50'),
+          input,
+          el('span', { class: 'nb-mini', onclick: () => setTarget(g.id, g.target + 50) }, '+50'),
+          el('span', { class: 'nb-mini nb-mini-danger', title: 'Quitar', onclick: () => setTarget(g.id, 0) }, '✕')
+        ])
+      ]));
+    }
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+      el('div', { class: 'nb-card-title' }, `Tropas objetivo (${tcfg.goals.length})`),
+      tcfg.goals.length ? goalsBox : el('p', { class: 'nb-placeholder' }, 'Añade tropas abajo.')
+    ]));
+
+    // Añadir tropa
+    const avail = landUnitsFor(townId).filter((id) => !tcfg.goals.some((g) => g.id === id));
+    const addList = el('div', { class: 'nb-add-list' });
+    for (const id of avail) {
+      const c = unitCost(townId, id);
+      const h = (+have[id] || 0) + (+queued[id] || 0);
+      const input = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '1', value: String(h + 100) });
+      const add = () => setTarget(id, Math.max(h + 1, pos(input.value, h + 100)));
+      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') add(); });
+      addList.appendChild(el('div', { class: 'nb-add-row' }, [
+        el('div', { class: 'nb-add-name' }, [`${unitName(id)}${isNavalUnit(id) ? ' ⚓' : ''}`, el('span', { class: 'nb-add-level' }, `tienes ${h} · ${c.wood}/${c.stone}/${c.iron} · ${c.pop} pob`)]),
+        el('div', { class: 'nb-stepper' }, [input, el('span', { class: 'nb-mini nb-mini-add', title: 'Añadir (total objetivo)', onclick: add }, '✓')])
+      ]));
+    }
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+      el('div', { class: 'nb-card-title' }, 'Añadir tropa (número = total que quieres tener)'),
+      avail.length ? addList : el('p', { class: 'nb-placeholder' }, 'No hay más tropas disponibles en esta ciudad.')
+    ]));
+
+    const logBox = el('div', { class: 'nb-log' });
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [el('div', { class: 'nb-card-title' }, 'Actividad'), logBox]));
+    recruitLogEl = logBox;
+    renderRecruitLog();
+  }
+
+  /* ---------------------------------------------------------------------------------
      9) INIT
   --------------------------------------------------------------------------------- */
   function waitFor(cond, timeoutMs = 20000, stepMs = 200) {
@@ -1707,6 +2002,27 @@
     });
   }
 
+  // Registro de depuración: guarda en localStorage las últimas peticiones POST
+  // que hace el juego (controller, action, datos). Sobrevive a recargas y sirve
+  // para ver el formato exacto de una acción hecha a mano. Solo lectura local.
+  const DEBUG_KEY = 'novabot_debug_posts';
+  function installPostRecorder() {
+    const obj = UW.gpAjax;
+    if (!obj || typeof obj.ajaxPost !== 'function' || obj.ajaxPost.__nbRec) return;
+    const orig = obj.ajaxPost;
+    const wrapped = function (controller, action, data) {
+      try {
+        const list = JSON.parse(localStorage.getItem(DEBUG_KEY) || '[]');
+        list.push({ at: new Date().toLocaleString('es-ES'), controller, action, town: UW.Game?.townId, data: JSON.stringify(data).slice(0, 500) });
+        localStorage.setItem(DEBUG_KEY, JSON.stringify(list.slice(-40)));
+      } catch {}
+      return orig.apply(this, arguments);
+    };
+    try { Object.assign(wrapped, orig); } catch {}
+    wrapped.__nbRec = true;
+    obj.ajaxPost = wrapped;
+  }
+
   async function init() {
     await waitFor(() => !!document.body);
     buildUI();
@@ -1714,9 +2030,11 @@
     startFarmEngine();
     startBuildEngine();
     startTradeEngine();
+    startRecruitEngine();
 
     // En cuanto el cliente del juego termine de cargar, refresca el nombre de ciudad.
     waitFor(() => !!(UW.Game && UW.ITowns)).then(() => {
+      installPostRecorder();
       updateCityLabel();
       // El juego dispara este evento (vía jQuery) al cambiar de ciudad — así el
       // nombre se actualiza al instante en vez de esperar al sondeo de abajo.
