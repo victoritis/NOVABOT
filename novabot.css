@@ -87,9 +87,6 @@
    que pisan estas reglas — se dejan tal cual como valores por defecto */
 #novabot-panel.nb-visible{ opacity: 1; transform: translateY(0) scale(1); }
 #novabot-panel.nb-hidden{ display: none; }
-#novabot-panel.nb-minimized .nb-body,
-#novabot-panel.nb-minimized .nb-tabs,
-#novabot-panel.nb-minimized .nb-footer{ display: none; }
 
 /* ---------- cabecera ---------- */
 #novabot-panel .nb-header{
@@ -124,6 +121,24 @@
 }
 #novabot-panel .nb-icon-btn:hover{ background: rgba(255,255,255,.08); color: var(--nb-text); }
 #novabot-panel .nb-icon-btn svg{ width: 14px; height: 14px; stroke: currentColor; }
+
+/* ---------- interruptor on/off (reutilizable) ---------- */
+.nb-switch{
+  position: relative; width: 38px; height: 21px; flex: none;
+  border-radius: 999px;
+  background: rgba(255,255,255,.12);
+  border: 1px solid var(--nb-border);
+  cursor: pointer;
+  transition: background .15s ease, border-color .15s ease;
+}
+.nb-switch::after{
+  content: ''; position: absolute; top: 2px; left: 2px;
+  width: 15px; height: 15px; border-radius: 50%;
+  background: var(--nb-text-dim);
+  transition: transform .15s ease, background .15s ease;
+}
+.nb-switch.on{ background: rgba(211,175,107,.22); border-color: var(--nb-gold); }
+.nb-switch.on::after{ transform: translateX(17px); background: var(--nb-gold-bright); }
 
 /* ---------- pestañas ---------- */
 #novabot-panel .nb-tabs{
@@ -184,7 +199,55 @@
   padding: 2px 7px; border-radius: 999px;
   background: rgba(211,175,107,.14); color: var(--nb-gold-bright);
 }
+#novabot-panel .nb-pill.nb-pill-off{ background: rgba(255,255,255,.08); color: var(--nb-text-faint); }
 #novabot-panel .nb-placeholder{ color: var(--nb-text-faint); font-style: italic; }
+
+/* ---------- grupos de botones (tiers, presets %) ---------- */
+#novabot-panel .nb-btn-group{ display: flex; flex-wrap: wrap; gap: 6px; }
+#novabot-panel .nb-btn{
+  padding: 6px 10px;
+  font-size: 11px; font-weight: 600;
+  color: var(--nb-text-dim);
+  background: rgba(255,255,255,.04);
+  border: 1px solid var(--nb-border-soft);
+  border-radius: var(--nb-radius-sm);
+  cursor: pointer;
+  transition: background .12s ease, color .12s ease, border-color .12s ease;
+}
+#novabot-panel .nb-btn:hover{ color: var(--nb-text); border-color: var(--nb-border); }
+#novabot-panel .nb-btn.active{ background: rgba(211,175,107,.16); border-color: var(--nb-gold); color: var(--nb-gold-bright); }
+#novabot-panel .nb-btn-manual{ display: flex; align-items: center; gap: 3px; }
+
+/* ---------- campos e inputs ---------- */
+#novabot-panel .nb-field-row{ display: flex; gap: 10px; }
+#novabot-panel .nb-field{ display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--nb-text-faint); flex: 1; }
+#novabot-panel .nb-input{
+  width: 100%;
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--nb-text);
+  background: rgba(255,255,255,.04);
+  border: 1px solid var(--nb-border-soft);
+  border-radius: var(--nb-radius-sm);
+}
+#novabot-panel .nb-input:focus{ outline: none; border-color: var(--nb-gold); }
+#novabot-panel .nb-input-inline{
+  width: 44px; padding: 0; border: none; background: none; color: inherit;
+  font: inherit; text-align: right;
+}
+#novabot-panel .nb-input-inline:focus{ outline: none; }
+
+/* ---------- log de actividad ---------- */
+#novabot-panel .nb-log{ display: flex; flex-direction: column; gap: 4px; max-height: 140px; overflow-y: auto; }
+#novabot-panel .nb-log-item{
+  font-size: 10.5px; padding: 5px 7px;
+  background: rgba(255,255,255,.035);
+  border-radius: var(--nb-radius-sm);
+  color: var(--nb-text-dim);
+}
+#novabot-panel .nb-log-item.nb-log-ok{ color: var(--nb-gold-bright); }
+#novabot-panel .nb-log-item.nb-log-error{ color: var(--nb-danger); }
+#novabot-panel .nb-log-item.nb-log-muted{ color: var(--nb-text-faint); }
 
 /* ---------- pie ---------- */
 #novabot-panel .nb-footer{
