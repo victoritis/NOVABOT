@@ -7,7 +7,7 @@
    ===================================================================================== */
 
 :root{
-  --nb-css-version:   "1.7.2";
+  --nb-css-version:   "1.7.3";
 
   /* superficies */
   --nb-bg:            #111419;
@@ -605,3 +605,8 @@
 #novabot-panel .nb-spell-row > .nb-icon{ flex: none; }
 #novabot-panel .nb-spell-row > .nb-seg{ flex: none; min-width: 260px; }
 #novabot-panel .nb-ok{ color: var(--nb-ok); }
+
+/* nivel objetivo: verde = construir, rojo = derribar */
+#novabot-panel .nb-lvl-input.nb-lvl-up{ color: var(--nb-ok) !important; border-color: rgba(124,199,154,.55) !important; }
+#novabot-panel .nb-lvl-input.nb-lvl-down{ color: var(--nb-danger) !important; border-color: rgba(227,110,99,.55) !important; }
+#novabot-panel .nb-mini-add.nb-mini-off{ opacity: .35; }

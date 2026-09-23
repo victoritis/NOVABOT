@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.7.6
+// @version      1.7.9
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -50,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.7.6';
+  const VERSION = '1.7.9';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -129,9 +129,9 @@
         towns: {}             // townId -> { queue: ['archer', …], enabled? } (orden = orden de investigación)
       },
       prioridad: {
-        preset: 'equilibrado', // equilibrado | reclutamiento | recl_constr | construccion | festivales | custom
-        order: ['construccion', 'reclutamiento', 'festivales'],
-        include: { construccion: true, reclutamiento: true, festivales: true }
+        mode: 'equilibrado',   // equilibrado | orden | paralelo
+        order: ['construccion', 'investigacion', 'reclutamiento', 'festivales'],
+        include: { construccion: true, investigacion: true, reclutamiento: true, festivales: true }
       },
       ataques: {
         correctionMs: 0       // corrección automática del disparo (se ajusta sola con la llegada real)
@@ -139,6 +139,7 @@
       reclutamiento: {
         enabled: true,
         fillPct: 95,          // tamaño del lote = % del almacén
+        lotsAhead: 2,         // lotes que se piden al comercio por adelantado
         towns: {}             // townId -> { goals: [{id, target}] }
       },
       comercio: {
@@ -164,6 +165,8 @@
         const def = defaultState();
         const out = { ...def, ...raw };
         for (const k of ['granjas', 'construccion', 'comercio', 'reclutamiento', 'ataques', 'festivales', 'prioridad', 'investigacion']) out[k] = { ...def[k], ...(raw[k] || {}) };
+        // Prioridad guardada con el formato antiguo (preset): que prioMode() la convierta.
+        if (raw.prioridad && !raw.prioridad.mode) delete out.prioridad.mode;
         return out;
       }
     } catch {}
@@ -715,6 +718,21 @@
   }
 
   // Al cambiar de ciudad, la pestaña Construcción se redibuja con la nueva.
+  // Firma de edificios + cola del juego de la ciudad abierta: si cambia (has construido
+  // o derribado a mano), la pestaña Construcción se repinta con los datos reales.
+  let lastBuildSig = '';
+  function buildSignature(townId) {
+    try {
+      const t = UW.ITowns.getTown(townId);
+      return JSON.stringify(t.getBuildings().attributes) + '|' + t.buildingOrders().models.map((m) => `${m.attributes.id}:${m.attributes.building_type}:${m.attributes.tear_down ? 1 : 0}`).join(',');
+    } catch { return ''; }
+  }
+  function checkBuildChanges() {
+    if (state.activeTab !== 'construccion' || !bodyEl) return;
+    const sig = buildSignature(+UW.Game?.townId);
+    if (sig && lastBuildSig && sig !== lastBuildSig) renderIfIdle('construccion');
+    lastBuildSig = sig;
+  }
   let lastTownId = null;
   function onTownMaybeChanged() {
     const id = +UW.Game?.townId || null;
@@ -1347,7 +1365,7 @@
   function nextBuildFor(townId) {
     const bd = buildDataFor(townId);
     if (!bd) return { reason: 'sin datos' };
-    if (bd.is_building_order_queue_full) return { reason: 'cola llena' };
+    if (bd.is_building_order_queue_full || townBuildOrders(townId).length >= buildQueueLimit()) return { reason: 'cola llena' };
     const skip = new Set(); // edificio bloqueado → sus pasos siguientes tampoco
     for (const s of buildPlan(townId)) {
       if (skip.has(s.id)) continue;
@@ -1596,31 +1614,37 @@
       const addSearch = el('input', { class: 'nb-input', type: 'text', placeholder: 'Buscar edificio…' });
       const addList = el('div', { class: 'nb-add-list' });
 
+      // Cada ficha muestra el nivel que tendrá el edificio (real + cola del juego +
+      // objetivos del bot). Súbelo para construir (verde) o bájalo para derribar (rojo).
       function renderAddRow(id) {
-        const info = bd.building_data?.[id];
         const cur = lastLevelOf(id);
         const max = maxOf(id);
-        const canUp = cur < max && !(info?.has_max_level && cur <= lvlOf(id));
-        const canDown = cur > 0;
-        const def = canUp ? cur + 1 : Math.max(0, cur - 1);
-        const input = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '0', max: String(max), value: String(def) });
-        // Por debajo del nivel actual = derribar (el ✓ se pone en rojo).
-        const addBtn = el('span', { class: 'nb-mini nb-mini-add', onclick: () => addGoal(id, clamp(pos(input.value, def), 0, max)) }, '✓');
-        const paint = () => { const v = pos(input.value, def); const down = v < cur; addBtn.classList.toggle('nb-mini-danger', down); addBtn.title = down ? `Derribar hasta ${v}` : 'Añadir a objetivos'; };
+        const input = el('input', { class: 'nb-input nb-input-inline nb-lvl-input', type: 'number', min: '0', max: String(max), value: String(cur) });
+        const addBtn = el('span', { class: 'nb-mini nb-mini-add' }, '✓');
+        const val = () => clamp(pos(input.value, cur), 0, max);
+        const paint = () => {
+          const v = val();
+          input.classList.toggle('nb-lvl-up', v > cur);
+          input.classList.toggle('nb-lvl-down', v < cur);
+          addBtn.classList.toggle('nb-mini-danger', v < cur);
+          addBtn.classList.toggle('nb-mini-off', v === cur);
+          addBtn.title = v > cur ? `Subir hasta ${v}` : v < cur ? `Derribar hasta ${v}` : 'Sube (+) para construir o baja (−) para derribar';
+        };
+        const add = () => { const v = val(); if (v === cur) { input.focus(); return; } addGoal(id, v); };
+        addBtn.addEventListener('click', add);
         input.addEventListener('input', paint);
-        input.addEventListener('keydown', (e) => { if (e.key === 'Enter') addGoal(id, clamp(pos(input.value, def), 0, max)); });
+        input.addEventListener('keydown', (e) => { if (e.key === 'Enter') add(); });
         paint();
         const inList = tcfg.goals.some((g) => g.id === id);
-        return el('div', { class: `nb-add-row${!canUp && !canDown ? ' nb-add-row-off' : ''}` }, [
+        return el('div', { class: 'nb-add-row' }, [
           buildingIcon(id),
-          el('div', { class: 'nb-add-name' }, [buildingName(id), el('span', { class: 'nb-add-level' }, `${inList ? `nivel ${lvlOf(id)} · en la lista hasta ${cur}` : `nivel ${cur}`}${canUp ? '' : ' · máximo'}`)]),
-          (!canUp && !canDown) ? el('span', { class: 'nb-pill nb-pill-off' }, '—')
-            : el('div', { class: 'nb-stepper' }, [
-                el('span', { class: 'nb-mini', title: '−1 (por debajo del actual = derribar)', onclick: () => { input.value = clamp(pos(input.value, def) - 1, 0, max); paint(); } }, '−'),
-                input,
-                el('span', { class: 'nb-mini', title: '+1', onclick: () => { input.value = clamp(pos(input.value, def) + 1, 0, max); paint(); } }, '+'),
-                addBtn
-              ])
+          el('div', { class: 'nb-add-name' }, [buildingName(id), el('span', { class: 'nb-add-level' }, `nivel ${lvlOf(id)}${inList ? ` · en la lista hasta ${cur}` : ''}${cur >= max ? ' · máximo' : ''}`)]),
+          el('div', { class: 'nb-stepper' }, [
+            el('span', { class: 'nb-mini', title: '−1 (por debajo del actual = derribar)', onclick: () => { input.value = clamp(val() - 1, 0, max); paint(); } }, '−'),
+            input,
+            el('span', { class: 'nb-mini', title: '+1 (por encima del actual = construir)', onclick: () => { input.value = clamp(val() + 1, 0, max); paint(); } }, '+'),
+            addBtn
+          ])
         ]);
       }
 
@@ -1635,7 +1659,7 @@
       renderAddList('');
 
       bodyEl.appendChild(el('div', { class: 'nb-card' }, [
-        el('div', { class: 'nb-card-title' }, 'Añadir edificio (se pone al final · por debajo del nivel actual = derribar)'),
+        el('div', { class: 'nb-card-title' }, 'Añadir edificio · se pone al final · más = construir (verde), menos = derribar (rojo)'),
         el('div', {}, [addSearch, addList])
       ]));
     }
@@ -1649,36 +1673,56 @@
   /* ---------------------------------------------------------------------------------
      8a) PRIORIDAD DE RECURSOS (común a todos los módulos que gastan)
      -----------------------------------------------------------------------------
-     Un único orden decide, en cada ciudad y en el comercio, quién va primero:
-       · Los módulos INCLUIDOS reciben recursos del comercio, en ese orden.
-       · Dentro de una ciudad, un módulo solo gasta lo que no necesitan los que
-         están por encima (su "reserva"). Así, con "Solo reclutamiento", la
-         construcción solo usa lo que sobre después del lote de tropas.
-       · Los módulos NO incluidos siguen funcionando, pero solo con lo que sobre y
-         sin pedir nada al comercio.
+     Tres modos:
+       · Equilibrado (el de siempre): Construcción → Investigación → Reclutamiento →
+         Festivales. Todos piden a la vez; en cada ciudad un módulo solo gasta lo que
+         no necesita el SIGUIENTE gasto de los de arriba.
+       · Personalizado · por orden: tú eliges el orden y qué entra. En cada ciudad
+         solo recibe recursos UN módulo: el primero de la lista que puede hacer algo
+         ahora. Si su cola está llena (o no tiene nada que hacer) pasa al siguiente, y
+         en cuanto vuelve a tener hueco recupera el turno → sin cuellos de botella.
+       · Personalizado · en paralelo: los módulos elegidos reciben recursos a la vez
+         (varias acciones a la vez) y ninguno reserva nada para otro.
+     Los módulos NO incluidos siguen funcionando, pero solo con lo que sobre y sin
+     pedir nada al comercio.
   --------------------------------------------------------------------------------- */
   const PRIO_MODULES = { construccion: 'Construcción', investigacion: 'Investigación', reclutamiento: 'Reclutamiento', festivales: 'Festivales' };
-  const PRIO_PRESETS = {
-    // (la investigación va con la construcción: son mejoras de la ciudad)
-    equilibrado: { label: 'Equilibrado', order: ['construccion', 'investigacion', 'reclutamiento', 'festivales'], inc: ['construccion', 'investigacion', 'reclutamiento', 'festivales'] },
-    reclutamiento: { label: 'Solo reclutamiento', order: ['reclutamiento', 'construccion', 'investigacion', 'festivales'], inc: ['reclutamiento'] },
-    recl_constr: { label: 'Reclutamiento + construcción', order: ['reclutamiento', 'construccion', 'investigacion', 'festivales'], inc: ['reclutamiento', 'construccion', 'investigacion'] },
-    construccion: { label: 'Solo construcción', order: ['construccion', 'investigacion', 'reclutamiento', 'festivales'], inc: ['construccion', 'investigacion'] },
-    festivales: { label: 'Solo festivales', order: ['festivales', 'construccion', 'investigacion', 'reclutamiento'], inc: ['festivales'] },
-    custom: { label: 'Personalizado' }
+  const PRIO_DEFAULT_ORDER = ['construccion', 'investigacion', 'reclutamiento', 'festivales'];
+  const PRIO_MODES = {
+    equilibrado: { label: 'Equilibrado', hint: 'El de siempre. Todos reciben a la vez; en cada ciudad gasta primero Construcción, luego Investigación, Reclutamiento y Festivales.' },
+    orden: { label: 'Personalizado · por orden', hint: 'Uno cada vez, en tu orden. Si el de arriba tiene la cola llena o nada que hacer, pasa al siguiente; cuando vuelve a tener hueco recupera el turno.' },
+    paralelo: { label: 'Personalizado · en paralelo', hint: 'Los elegidos reciben recursos a la vez (varias acciones a la vez) y ninguno reserva para otro.' }
   };
-
+  // Presets antiguos → modos nuevos (una sola vez).
+  const PRIO_OLD = {
+    reclutamiento: { order: ['reclutamiento', 'construccion', 'investigacion', 'festivales'], inc: ['reclutamiento'] },
+    recl_constr: { order: ['reclutamiento', 'construccion', 'investigacion', 'festivales'], inc: ['reclutamiento', 'construccion', 'investigacion'] },
+    construccion: { order: ['construccion', 'investigacion', 'reclutamiento', 'festivales'], inc: ['construccion', 'investigacion'] },
+    festivales: { order: ['festivales', 'construccion', 'investigacion', 'reclutamiento'], inc: ['festivales'] }
+  };
+  function prioMode() {
+    const p = state.prioridad || (state.prioridad = {});
+    if (!PRIO_MODES[p.mode]) {
+      const old = PRIO_OLD[p.preset];
+      if (old) { p.mode = 'orden'; p.order = old.order.slice(); p.include = Object.fromEntries(Object.keys(PRIO_MODULES).map((m) => [m, old.inc.includes(m)])); }
+      else if (p.preset === 'custom') p.mode = 'orden';
+      else p.mode = 'equilibrado';
+      saveState();
+    }
+    return p.mode;
+  }
   function priorityConfig() {
     const p = state.prioridad || {};
-    const preset = PRIO_PRESETS[p.preset] && p.preset !== 'custom' ? PRIO_PRESETS[p.preset] : null;
-    const order = (preset ? preset.order : p.order || PRIO_PRESETS.equilibrado.order).filter((m) => PRIO_MODULES[m]);
+    const mode = prioMode();
+    const order = (mode === 'equilibrado' ? PRIO_DEFAULT_ORDER : (p.order || PRIO_DEFAULT_ORDER)).filter((m) => PRIO_MODULES[m]);
     for (const m of Object.keys(PRIO_MODULES)) if (!order.includes(m)) order.push(m);
-    const inc = new Set(preset ? preset.inc : Object.keys(PRIO_MODULES).filter((m) => p.include?.[m] !== false));
+    const inc = new Set(mode === 'equilibrado' ? Object.keys(PRIO_MODULES) : Object.keys(PRIO_MODULES).filter((m) => p.include?.[m] !== false));
     // Incluidos primero (en su orden), luego el resto.
     const ranked = [...order.filter((m) => inc.has(m)), ...order.filter((m) => !inc.has(m))];
-    return { ranked, inc };
+    return { mode, ranked, inc };
   }
-  const prioRank = (mod) => priorityConfig().ranked.indexOf(mod);
+  // En paralelo todos los incluidos tienen la misma prioridad.
+  const prioRank = (mod) => { const c = priorityConfig(); return c.mode === 'paralelo' ? (c.inc.has(mod) ? 0 : 9) : c.ranked.indexOf(mod); };
   const prioIncluded = (mod) => priorityConfig().inc.has(mod);
 
   // Lo que cada módulo necesita YA en una ciudad (su siguiente gasto).
@@ -1688,7 +1732,7 @@
       if (mod === 'construccion') {
         if (!buildEnabledFor(townId)) return zero;
         const bd = buildDataFor(townId);
-        if (!bd || bd.is_building_order_queue_full) return zero;
+        if (!bd || bd.is_building_order_queue_full || townBuildOrders(townId).length >= buildQueueLimit()) return zero; // cola llena
         // El mismo edificio que construiría nextBuildFor (sin mirar los recursos).
         const skip = new Set();
         for (const s of buildPlan(townId)) {
@@ -1714,11 +1758,41 @@
     return zero;
   }
 
-  // Reserva que un módulo debe respetar en una ciudad: lo que necesitan los
-  // módulos incluidos que están por encima de él.
-  function reserveAbove(townId, mod) {
-    const { ranked, inc } = priorityConfig();
+  // Todo lo que un módulo pide ahora en la ciudad (no solo el siguiente gasto),
+  // con tope del almacén: es lo que reserva el que tiene el turno en "por orden".
+  function moduleFullDemand(townId, mod) {
     const out = { wood: 0, stone: 0, iron: 0 };
+    try {
+      if (mod === 'construccion') { for (const d of buildDemandItems(townId)) for (const k of RES) out[k] += d[k]; }
+      else if (mod === 'investigacion') { for (const x of researchPlan(townId)) if (!x.block) for (const k of RES) out[k] += x.cost[k]; }
+      else { const c = moduleClaim(townId, mod); for (const k of RES) out[k] += c[k]; }
+    } catch {}
+    const cap = townStorage(townId) || Infinity;
+    for (const k of RES) out[k] = Math.min(out[k], cap);
+    return out;
+  }
+  // "Por orden": el módulo que tiene el turno en esa ciudad = el primero de la lista
+  // (incluido) que puede hacer algo ahora (cola con hueco y algo pendiente).
+  // upTo: mirar solo los que están por encima de ese módulo.
+  function activeModule(townId, upTo = null) {
+    const { ranked, inc } = priorityConfig();
+    for (const m of ranked) {
+      if (m === upTo) return null;
+      if (!inc.has(m)) continue;
+      if (sumRes(moduleClaim(townId, m)) > 0) return m;
+    }
+    return null;
+  }
+
+  // Reserva que un módulo debe respetar en una ciudad (lo que no puede gastar).
+  function reserveAbove(townId, mod) {
+    const { mode, ranked, inc } = priorityConfig();
+    const out = { wood: 0, stone: 0, iron: 0 };
+    if (mode === 'paralelo' && inc.has(mod)) return out;          // nadie reserva para nadie
+    if (mode === 'orden' && inc.has(mod)) {                        // el que tiene el turno reserva TODO lo suyo
+      const act = activeModule(townId, mod);
+      return act ? moduleFullDemand(townId, act) : out;
+    }
     const my = ranked.indexOf(mod);
     for (let i = 0; i < ranked.length; i++) {
       const m = ranked[i];
@@ -1730,7 +1804,8 @@
     return out;
   }
   function reserveOwner(townId, mod) {
-    const { ranked, inc } = priorityConfig();
+    const { mode, ranked, inc } = priorityConfig();
+    if (mode === 'orden' && inc.has(mod)) { const a = activeModule(townId, mod); return a ? PRIO_MODULES[a].toLowerCase() : ''; }
     const my = ranked.indexOf(mod);
     const names = ranked.filter((m, i) => m !== mod && inc.has(m) && (!inc.has(mod) || i < my) && sumRes(moduleClaim(townId, m)) > 0);
     return names.map((m) => PRIO_MODULES[m].toLowerCase()).join(' y ');
@@ -1740,21 +1815,10 @@
   // módulo, el comercio NO le manda recursos (solo gasta lo que ya tenga la ciudad).
   function prioExcludedAlert(mod) {
     if (prioIncluded(mod)) return null;
-    const p = state.prioridad || {};
-    const presetName = PRIO_PRESETS[p.preset]?.label || 'Personalizado';
-    const include = () => {
-      if (p.preset === 'reclutamiento' && mod === 'construccion') p.preset = 'recl_constr';
-      else if (p.preset === 'construccion' && mod === 'reclutamiento') p.preset = 'recl_constr';
-      else {
-        const { ranked, inc } = priorityConfig();
-        p.order = ranked.slice();
-        p.include = Object.fromEntries(Object.keys(PRIO_MODULES).map((m) => [m, inc.has(m) || m === mod]));
-        p.preset = 'custom';
-      }
-      saveState(); renderBody();
-    };
+    const p = state.prioridad;
+    const include = () => { const { ranked } = priorityConfig(); p.order = ranked.slice(); p.include = { ...(p.include || {}), [mod]: true }; saveState(); renderBody(); };
     return el('div', { class: 'nb-alert nb-alert-warn' }, [
-      el('span', {}, `Prioridad «${presetName}»: ${PRIO_MODULES[mod].toLowerCase()} no recibe recursos del comercio; solo usa lo que ya tenga cada ciudad.`),
+      el('span', {}, `Prioridad «${PRIO_MODES[prioMode()].label}»: ${PRIO_MODULES[mod].toLowerCase()} no está incluida; no recibe recursos del comercio y solo usa lo que ya tenga cada ciudad.`),
       el('span', { class: 'nb-btn nb-btn-sm', onclick: include }, 'Incluir')
     ]);
   }
@@ -1762,40 +1826,50 @@
   function renderPriorityCard() {
     const p = state.prioridad;
     const cfg = priorityConfig();
-    const presets = el('div', { class: 'nb-seg nb-seg-wrap' }, Object.entries(PRIO_PRESETS).map(([k, v]) =>
-      el('span', { class: `nb-seg-btn${p.preset === k ? ' active' : ''}`, onclick: () => {
-        if (k === 'custom' && p.preset !== 'custom') { p.order = cfg.ranked.slice(); p.include = Object.fromEntries(Object.keys(PRIO_MODULES).map((m) => [m, cfg.inc.has(m)])); }
-        p.preset = k; saveState(); renderBody();
+    const modes = el('div', { class: 'nb-seg nb-seg-wrap' }, Object.entries(PRIO_MODES).map(([k, v]) =>
+      el('span', { class: `nb-seg-btn${cfg.mode === k ? ' active' : ''}`, onclick: () => {
+        if (k !== 'equilibrado' && cfg.mode === 'equilibrado') { p.order = cfg.ranked.slice(); p.include = Object.fromEntries(Object.keys(PRIO_MODULES).map((m) => [m, true])); }
+        p.mode = k; saveState(); renderBody();
       } }, v.label)));
+    const custom = cfg.mode !== 'equilibrado';
     const list = el('div', { class: 'nb-goals' });
     cfg.ranked.forEach((m, i) => {
       const included = cfg.inc.has(m);
-      const custom = p.preset === 'custom';
       const move = (dir) => {
         const o = cfg.ranked.slice(); const j = i + dir;
         if (j < 0 || j >= o.length) return;
         [o[i], o[j]] = [o[j], o[i]]; p.order = o; saveState(); renderBody();
       };
+      const sub = !included ? 'No incluido: solo usa lo que sobre · no pide recursos'
+        : cfg.mode === 'paralelo' ? 'Recibe a la vez que los demás'
+        : cfg.mode === 'orden' ? (i === 0 ? 'Tiene el turno mientras tenga hueco en su cola' : 'Recibe cuando los de arriba tienen la cola llena o nada que hacer')
+        : (i === 0 ? 'Primero en recibir y en gastar' : 'Recibe y gasta después de los de arriba');
       list.appendChild(el('div', { class: `nb-goal${included ? '' : ' nb-goal-done'}` }, [
-        el('span', { class: 'nb-goal-idx' }, included ? String(i + 1) : '–'),
-        el('div', { class: 'nb-goal-main' }, [
-          el('div', { class: 'nb-goal-name' }, PRIO_MODULES[m]),
-          el('div', { class: 'nb-goal-sub' }, included ? (i === 0 ? 'Primero en recibir y en gastar' : 'Recibe y gasta después de los de arriba') : 'Solo con lo que sobre · no pide recursos')
-        ]),
+        el('span', { class: 'nb-goal-idx' }, included ? (cfg.mode === 'paralelo' ? '=' : String(i + 1)) : '–'),
+        el('div', { class: 'nb-goal-main' }, [el('div', { class: 'nb-goal-name' }, PRIO_MODULES[m]), el('div', { class: 'nb-goal-sub' }, sub)]),
         custom ? el('div', { class: 'nb-goal-actions' }, [
-          el('span', { class: `nb-mini${i === 0 ? ' nb-mini-off' : ''}`, onclick: () => move(-1) }, '▲'),
-          el('span', { class: `nb-mini${i === cfg.ranked.length - 1 ? ' nb-mini-off' : ''}`, onclick: () => move(1) }, '▼'),
+          cfg.mode === 'orden' ? el('span', { class: `nb-mini${i === 0 ? ' nb-mini-off' : ''}`, onclick: () => move(-1) }, '▲') : null,
+          cfg.mode === 'orden' ? el('span', { class: `nb-mini${i === cfg.ranked.length - 1 ? ' nb-mini-off' : ''}`, onclick: () => move(1) }, '▼') : null,
           switchEl(included, (v) => { p.include = { ...(p.include || {}), [m]: v }; saveState(); renderBody(); })
         ]) : null
       ]));
     });
+    // En "por orden": qué módulo tiene ahora el turno en la ciudad abierta.
+    let now = null;
+    if (cfg.mode === 'orden') {
+      const tid = +UW.Game?.townId;
+      const a = tid ? activeModule(tid) : null;
+      now = el('div', { class: 'nb-alert nb-alert-info nb-mt' }, `Ahora en ${farmTownName(tid)}: ${a ? `tiene el turno ${PRIO_MODULES[a]}` : 'ningún módulo tiene nada que hacer'}.`);
+    }
     return el('div', { class: 'nb-card' }, [
       el('div', { class: 'nb-card-title' }, 'Prioridad de recursos'),
-      presets,
+      modes,
+      el('p', { class: 'nb-placeholder nb-mt' }, PRIO_MODES[cfg.mode].hint),
       el('div', { class: 'nb-mt' }, [list]),
-      el('p', { class: 'nb-placeholder nb-mt' }, 'Afecta al comercio (a quién se envía primero) y al gasto dentro de cada ciudad.')
+      now
     ]);
   }
+
 
   /* ---------------------------------------------------------------------------------
      8b-bis) VISTAS GENERALES — estado completo de TODAS las ciudades
@@ -1937,8 +2011,15 @@
     function buildDemands() {
       if (!state.comercio.forBuild) return [];
       const out = [];
+      for (const townId of allTownIds()) out.push(...buildDemandItems(townId));
+      return out;
+    }
+  ];
+  // Niveles que caben en los huecos libres de la cola de construcción de UNA ciudad.
+  function buildDemandItems(tid) {
+      const out = [];
       const limit = buildQueueLimit();
-      for (const townId of allTownIds()) {
+      for (const townId of [+tid]) {
         if (!buildEnabledFor(townId)) continue;
         const goals = townBuildCfg(townId).goals;
         if (!goals.length) continue;
@@ -1963,15 +2044,22 @@
         }
       }
       return out;
-    }
-  ];
+  }
 
   function collectDemands() {
     const all = [];
     for (const p of tradeDemandProviders) { try { all.push(...p()); } catch (e) { console.warn('[NOVABOT][comercio] proveedor falló:', e); } }
     // Prioridad común (8a): los módulos no incluidos no piden ni reservan; el
     // resto recibe su rango como prioridad.
-    return all.filter((d) => !d.module || prioIncluded(d.module)).map((d) => ({ ...d, prio: d.module ? prioRank(d.module) : (d.prio ?? 9) }));
+    const cfg = priorityConfig();
+    let list = all.filter((d) => !d.module || cfg.inc.has(d.module));
+    if (cfg.mode === 'orden') {
+      // Por orden: en cada ciudad solo pide (y reserva) el módulo que tiene el turno.
+      const act = new Map();
+      const turn = (t) => { if (!act.has(t)) act.set(t, activeModule(t)); return act.get(t); };
+      list = list.filter((d) => !d.module || d.module === turn(d.townId));
+    }
+    return list.map((d) => ({ ...d, prio: d.module ? prioRank(d.module) : (d.prio ?? 9) }));
   }
 
   // ---- Distancias y tiempos de viaje ----
@@ -2072,29 +2160,42 @@
   */
   // Devuelve cuánto de cada recurso se perdería (por encima de storageCap) al ir
   // llegando los envíos.
+  // Simulación de la línea de tiempo de la ciudad destino (segundos desde ahora):
+  // producción + llegadas ordenadas + gasto de sus encargos EN ORDEN. Un encargo no se
+  // gasta en el mismo instante en que se puede pagar: el bot tarda un ciclo en
+  // reclutar/construir, así que se cuenta SPEND_LAG s de margen. Así un envío puede
+  // llegar justo después de que se gaste el lote anterior (aunque hoy "no quepa"),
+  // pero nunca antes: lo que llegaría con el almacén lleno se recorta.
+  const SPEND_LAG = 45;
   function simulateWaste(s, items, arrivals, storageCap) {
     const lvl = { ...s.cur };
     const waste = { wood: 0, stone: 0, iron: 0 };
     const queue = items.map((i) => ({ wood: i.wood, stone: i.stone, iron: i.iron }));
-    const consume = () => {
-      while (queue.length && RES.every((k) => lvl[k] >= queue[0][k])) {
-        const q = queue.shift();
+    let readyAt = null; // cuándo se pudo pagar el primer encargo de la cola
+    const affordable = () => queue.length && RES.every((k) => lvl[k] >= queue[0][k]);
+    const step = (t) => {
+      for (;;) {
+        if (readyAt === null) { if (affordable()) readyAt = t; else return; }
+        if (readyAt + SPEND_LAG > t) return;
+        const q = queue.shift(); const at = readyAt + SPEND_LAG;
         for (const k of RES) lvl[k] -= q[k];
+        readyAt = null;
+        if (affordable()) readyAt = at; // el siguiente ya se podía pagar al gastar éste
       }
     };
-    consume();
+    step(0);
     let prevT = 0;
     for (const a of [...arrivals].sort((x, y) => x.t - y.t)) {
       const dt = Math.max(0, a.t - prevT) / 3600;
       for (const k of RES) lvl[k] = Math.min(s.storage, lvl[k] + s.prod[k] * dt);
       prevT = a.t;
-      consume();
+      step(a.t);
       for (const k of RES) {
         if (!a[k]) continue;
         lvl[k] += a[k];
         if (lvl[k] > storageCap) { waste[k] += lvl[k] - storageCap; lvl[k] = Math.min(lvl[k], s.storage); }
       }
-      consume();
+      step(a.t);
     }
     return waste;
   }
@@ -2180,9 +2281,12 @@
 
     // Una ciudad que está esperando recursos NO dona (aunque le sobre de otro tipo):
     // así no manda lo suyo a otra para luego pedirlo de vuelta.
-    const needy = new Set(needs.map((n) => n.townId));
+    // Una ciudad que espera recursos solo puede dar los que ella NO necesita
+    // (nunca lo que le falta: así no manda lo suyo para luego pedirlo de vuelta).
+    const needy = new Map(needs.map((n) => [n.townId, n.missInit]));
+    const canGive = (id, k) => !needy.has(id) || (needy.get(id)[k] || 0) <= 0;
     const donorsFor = (n) => towns
-      .filter((id) => id !== n.townId && !needy.has(id) && st[id].cap > 0 && RES.some((k) => st[id].surplus[k] > 0 && n.miss[k] > 0))
+      .filter((id) => id !== n.townId && st[id].cap > 0 && RES.some((k) => canGive(id, k) && st[id].surplus[k] > 0 && n.miss[k] > 0))
       .filter((id) => (tradeRuntime.pairCooldown.get(`${id}>${n.townId}`) || 0) < now)
       .sort((a, b) => donorCost(a, n) - donorCost(b, n));
     // Coste de usar un donante = tiempo de viaje, rebajado hasta a la mitad si el
@@ -2229,6 +2333,7 @@
         const needTop = Object.fromEntries(RES.map((k) => [k, Math.min(need[k], Math.max(0, best.topMiss[k] - prodT(k)))]));
         for (const pass of [needTop, need]) {
           for (const k of [...RES].sort((a, b) => pass[b] - pass[a])) {
+            if (!canGive(donorId, k)) continue;
             const v = Math.floor(Math.min(left, d.surplus[k] - want[k], pass[k] - want[k]));
             if (v > 0) { want[k] += v; left -= v; }
           }
@@ -2618,9 +2723,12 @@
   //     (lo máximo que cabe en el almacén para esa tropa), en el orden de la lista.
   //  2) Los restos (lo que falta y ya no llena un lote) se dejan para el final.
   // El lote se recorta por la población libre (no se puede reclutar sin ella).
-  function recruitBatch(townId, atMs = null) {
+  // extra: lotes ya pedidos por delante (para calcular el SIGUIENTE lote sin esperar):
+  // { units: {id: n}, orders: {ground: n, naval: n} }.
+  function recruitBatch(townId, atMs = null, extra = null) {
     const cfg = townRecruitCfg(townId);
-    const have = townUnitsHave(townId), queued = queuedUnits(townId);
+    const have = townUnitsHave(townId), queued = { ...queuedUnits(townId) };
+    if (extra?.units) for (const [u, n] of Object.entries(extra.units)) queued[u] = (queued[u] || 0) + n;
     const storage = townStorage(townId) || 0;
     const fill = clamp(+state.reclutamiento.fillPct || 95, 10, 100) / 100;
     const fr = reserveAbove(townId, 'reclutamiento');
@@ -2644,7 +2752,8 @@
     }
     // Solo tropas cuya cola (Cuartel / Puerto) tendrá hueco: si está llena no se
     // recluta ni se piden recursos para ella.
-    const open = pending.filter((r) => unitQueueFree(townId, isNavalUnit(r.id) ? 'naval' : 'ground', atMs) > 0);
+    const kindOf = (id) => (isNavalUnit(id) ? 'naval' : 'ground');
+    const open = extra?.ignoreQueue ? pending : pending.filter((r) => unitQueueFree(townId, kindOf(r.id), atMs) - (+extra?.orders?.[kindOf(r.id)] || 0) > 0);
     if (!open.length) {
       const kinds = [...new Set(pending.map((r) => (isNavalUnit(r.id) ? 'naval' : 'ground')))];
       const next = Math.min(...kinds.map((k) => unitQueueNextFree(townId, k) || Infinity));
@@ -2668,20 +2777,21 @@
     };
   }
 
-  // Demanda para el Comercio: el lote completo (prioridad por detrás de construir).
-  // Coste de todo lo que falta por reclutar en la ciudad, con tope de su almacén:
-  // eso no se regala a otras ciudades aunque ahora no haya lote en marcha.
+  // Reserva de la ciudad (lo que NO regala a otras): lo de sus próximos lotes (los
+  // "pedidos por adelantado", aunque ahora la cola esté llena), con tope del almacén.
+  // Lo que tenga por encima de eso sí puede darlo: no hace falta guardarlo para tropas
+  // que se reclutarán dentro de horas, y así ayuda a otras ciudades ya.
   function recruitPendingReserve(townId) {
-    const cfg = townRecruitCfg(townId);
-    const have = townUnitsHave(townId), queued = queuedUnits(townId);
-    const cap = (townStorage(townId) || 0) * clamp(+state.reclutamiento.fillPct || 95, 10, 100) / 100;
     const out = { wood: 0, stone: 0, iron: 0 };
-    for (const g of cfg.goals) {
-      const rem = Math.max(0, g.target - (+have[g.id] || 0) - (+queued[g.id] || 0));
-      if (!rem || !unitResearched(townId, g.id)) continue; // sin investigar: no se reserva aún
-      const c = unitCost(townId, g.id);
-      for (const k of RES) out[k] += rem * c[k];
+    const ahead = clamp(+state.reclutamiento.lotsAhead || 2, 1, 4);
+    const extra = { units: {}, orders: { ground: 0, naval: 0 }, ignoreQueue: true };
+    for (let n = 0; n < ahead; n++) {
+      const b = recruitBatch(townId, null, extra);
+      if (!b || !sumRes(b.cost)) break;
+      for (const k of RES) out[k] += b.cost[k];
+      for (const [u, c] of Object.entries(b.units)) extra.units[u] = (extra.units[u] || 0) + c;
     }
+    const cap = (townStorage(townId) || 0) * clamp(+state.reclutamiento.fillPct || 95, 10, 100) / 100;
     for (const k of RES) out[k] = Math.min(out[k], cap);
     return out;
   }
@@ -2701,9 +2811,18 @@
       // ahora está llena pero se libera antes de que lleguen, se envía por adelantado).
       const others = allTownIds().filter((id) => id !== townId);
       const eta = others.length ? Math.min(...others.map((id) => travelSec(id, townId))) : 0;
-      const b = recruitBatch(townId, Date.now() + eta * 1000);
-      if (!b || !sumRes(b.cost)) continue;
-      out.push({ townId, module: 'reclutamiento', label: `lote ${Object.entries(b.units).map(([u, n]) => `${n} ${unitName(u)}`).join(' + ')}`, ...b.cost });
+      // Se piden varios lotes por delante (por defecto 2): mientras llega lo del
+      // primero ya viaja lo del siguiente, así la ciudad no se queda parada entre lote
+      // y lote esperando al donante más lejano. La simulación del almacén del comercio
+      // recorta lo que no cabría (nunca se pierde nada).
+      const ahead = clamp(+state.reclutamiento.lotsAhead || 2, 1, 4);
+      const extra = { units: {}, orders: { ground: 0, naval: 0 } };
+      for (let n = 0; n < ahead; n++) {
+        const b = recruitBatch(townId, Date.now() + eta * 1000, n ? extra : null);
+        if (!b || b.reason || !sumRes(b.cost)) break;
+        out.push({ townId, module: 'reclutamiento', label: `${n ? 'siguiente lote' : 'lote'} ${Object.entries(b.units).map(([u, k]) => `${k} ${unitName(u)}`).join(' + ')}`, ...b.cost });
+        for (const [u, k] of Object.entries(b.units)) { extra.units[u] = (extra.units[u] || 0) + k; extra.orders[isNavalUnit(u) ? 'naval' : 'ground'] += 1; }
+      }
     }
     return out;
   });
@@ -2723,22 +2842,28 @@
     { id: 'call_of_the_ocean', kind: 'naval' }
   ];
   const spellInfo = { at: 0, busy: false, active: new Map() }; // townId -> { power_id: endMs }
+  // Hechizos activos de TODAS las ciudades: vista general de dioses (solo lectura,
+  // lo mismo que abrir esa ventana): data.towns[].casted_powers = { power_id: fin (s) }.
+  // (Comprobado: el "refetch" de CastedPowers devuelve vacío aunque haya hechizos.)
   async function refreshCastedPowers() {
     if (spellInfo.busy) return;
     spellInfo.busy = true;
     try {
-      const d = await gpGet('frontend_bridge', 'refetch', { collections: { CastedPowers: [] }, nl_init: true });
-      const raw = d?.collections?.CastedPowers;
-      const list = Array.isArray(raw) ? raw : Array.isArray(raw?.data) ? raw.data : [];
-      const map = new Map();
-      for (const x of list) {
-        const a = x?.d || x?.attributes || x; if (!a?.power_id) continue;
-        const t = +a.town_id; if (!map.has(t)) map.set(t, {});
-        map.get(t)[a.power_id] = Math.max(map.get(t)[a.power_id] || 0, +a.end_at * 1000 || 0);
+      const d = await gpGet('town_overviews', 'gods_overview', { nl_init: true });
+      const towns = d?.data?.towns;
+      if (Array.isArray(towns)) {
+        const map = new Map();
+        for (const t of towns) {
+          const cp = t?.casted_powers;
+          const o = {};
+          if (cp && typeof cp === 'object' && !Array.isArray(cp)) for (const [k, v] of Object.entries(cp)) o[k] = +v * 1000 || 0;
+          else if (Array.isArray(t?.casted_power_ids)) for (const k of t.casted_power_ids) o[k] = Date.now() + 3600000; // sin fin conocido
+          map.set(+t.id, o);
+        }
+        // Los recién lanzados por el bot que la vista aún no trae se mantienen.
+        for (const [t, o] of spellInfo.active) for (const [k, end] of Object.entries(o)) if (end > Date.now() && !(map.get(t)?.[k] > 0)) { if (!map.has(t)) map.set(t, {}); map.get(t)[k] = end; }
+        spellInfo.active = map; spellInfo.at = Date.now();
       }
-      // Los recién lanzados por el bot que el juego aún no devuelve se mantienen.
-      for (const [t, o] of spellInfo.active) for (const [k, end] of Object.entries(o)) if (end > Date.now() && !(map.get(t)?.[k] > 0)) { if (!map.has(t)) map.set(t, {}); map.get(t)[k] = end; }
-      spellInfo.active = map; spellInfo.at = Date.now();
     } catch {} finally { spellInfo.busy = false; }
   }
   function spellEnd(townId, id) {
@@ -2758,6 +2883,8 @@
     for (const sd of RECRUIT_SPELLS.filter((x) => x.kind === kind)) {
       const mode = cfg[sd.id];
       if (!mode || spellActive(townId, sd.id)) continue;
+      // Antes de lanzar, datos frescos (no lanzar uno que ya está activo).
+      if (Date.now() - spellInfo.at > 15000) { await refreshCastedPowers(); if (spellActive(townId, sd.id)) continue; }
       const p = UW.GameData?.powers?.[sd.id]; if (!p) continue;
       const cost = +p.favor || 0, fav = godFavor(p.god_id);
       const key = `${townId}:${sd.id}`;
@@ -2771,6 +2898,14 @@
         setTimeout(refreshCastedPowers, 3000);
         await sleep(600 + Math.random() * 600);
       } catch (e) {
+        // Si el juego dice que ya está activo, se da por activo (no bloquea el reclutamiento).
+        if (/activ|ya est|already|en curso|lanzad/i.test(e.message)) {
+          if (!spellInfo.active.has(+townId)) spellInfo.active.set(+townId, {});
+          spellInfo.active.get(+townId)[sd.id] = Date.now() + 10 * 60000;
+          recruitLog(`${farmTownName(townId)}: ${p.name} ya estaba activo.`, 'info');
+          setTimeout(refreshCastedPowers, 2000);
+          continue;
+        }
         recruitRuntime.cooldown.set(key, Date.now() + 5 * 60000);
         recruitLog(`${farmTownName(townId)}: ${p.name} — ${e.message}`, 'error');
         if (mode === 'required') return `${p.name}: ${e.message}`;
@@ -2906,6 +3041,9 @@
       startBox,
       optionRow('Pedir recursos al Comercio', 'Los lotes se completan con envíos de otras ciudades', !!state.comercio.forRecruit, (v) => { state.comercio.forRecruit = v; saveState(); }),
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Lote = % del almacén'), el('span', {}, [fillIn, ' %'])]),
+      (() => { const inp = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '1', max: '4', value: String(clamp(+cfg.lotsAhead || 2, 1, 4)) });
+        inp.addEventListener('change', () => { cfg.lotsAhead = clamp(pos(inp.value, 2), 1, 4); saveState(); renderBody(); });
+        return el('div', { class: 'nb-row' }, [el('div', { class: 'nb-option-text' }, [el('span', { class: 'nb-option-label' }, 'Lotes pedidos por adelantado'), el('span', { class: 'nb-option-hint' }, 'El comercio ya envía lo del siguiente lote mientras llega el actual')]), inp]); })(),
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Ciudad actual'), el('span', { class: 'nb-row-value' }, farmTownName(townId))]),
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Cola Cuartel / Puerto'),
         el('span', { class: 'nb-row-value' }, ['ground', 'naval'].map((k) => `${buildQueueLimit() - unitQueueFree(townId, k)}/${buildQueueLimit()}`).join(' · '))])
@@ -4509,7 +4647,7 @@
         const evt = UW.GameEvents?.town?.town_switch;
         if ($j && evt) $j(document).on(evt, () => { updateCityLabel(); onTownMaybeChanged(); });
       } catch (e) { console.warn('[NOVABOT] No se pudo enganchar al evento de cambio de ciudad:', e); }
-      setInterval(() => { updateCityLabel(); onTownMaybeChanged(); }, 1000); // red de seguridad por si el evento no llega
+      setInterval(() => { updateCityLabel(); onTownMaybeChanged(); checkBuildChanges(); }, 1000); // red de seguridad por si el evento no llega
     });
   }
 
