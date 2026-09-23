@@ -7,7 +7,7 @@
    ===================================================================================== */
 
 :root{
-  --nb-css-version:   "1.6.4";
+  --nb-css-version:   "1.6.5";
 
   /* superficies */
   --nb-bg:            #111419;
@@ -539,3 +539,10 @@
 #novabot-panel .nb-subtitle{ display: flex; align-items: center; gap: 9px; margin: 10px 0 6px; font-size: 11px; font-weight: 700; color: var(--nb-text-dim); }
 #novabot-panel .nb-subtitle:first-of-type{ margin-top: 2px; }
 #novabot-panel .nb-subtitle > .nb-icon-sm{ margin-right: 0; }
+
+/* barras: etiqueta con icono sin pisar la barra */
+#novabot-panel .nb-bar-label{ width: auto; min-width: 84px; flex: none; white-space: nowrap; }
+/* listas de comercio: texto largo se parte en varias líneas, cantidades a la derecha */
+#novabot-panel .nb-queue-item{ gap: 12px; }
+#novabot-panel .nb-queue-item > span:first-child{ min-width: 0; flex: 1 1 auto; overflow-wrap: anywhere; }
+#novabot-panel .nb-queue-item > .nb-queue-time{ flex: none; white-space: nowrap; }

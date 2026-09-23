@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.6.3
+// @version      1.6.4
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -50,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.6.3';
+  const VERSION = '1.6.4';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -1998,6 +1998,21 @@
     return RES.every((k) => w[k] <= b[k] + 1);
   }
 
+  // "Muralla 14, Muralla 15, Muralla 16" → "Muralla 14–16" (y máx. 3 grupos + "…").
+  function compactLabels(labels) {
+    // Agrupa por edificio (en el orden en que aparece): "Senado 6–9, Muralla 4–5".
+    const groups = [], by = new Map();
+    for (const l of labels) {
+      const m = /^(.*\D)\s(\d+)$/.exec(l);
+      if (!m) { groups.push({ text: l }); continue; }
+      let g = by.get(m[1]);
+      if (!g) { g = { base: m[1], from: +m[2], to: +m[2] }; by.set(m[1], g); groups.push(g); }
+      g.from = Math.min(g.from, +m[2]); g.to = Math.max(g.to, +m[2]);
+    }
+    const txt = groups.map((g) => g.text || `${g.base} ${g.from}${g.to > g.from ? `–${g.to}` : ''}`);
+    return txt.length > 3 ? `${txt.slice(0, 3).join(', ')} y ${txt.length - 3} más` : txt.join(', ');
+  }
+
   function planTrades() {
     const cfg = state.comercio;
     const towns = allTownIds();
@@ -2051,7 +2066,7 @@
       }
       const topMiss = Object.fromEntries(RES.map((k) => [k, top ? Math.max(0, cum[k] - have[k]) : 0]));
       needs.push({ townId: id, miss, missInit: { ...miss }, topMiss, topPrio: top ? top.prio : 99, topLabel: top?.label || '',
-        label: itemsBy[id].map((i) => i.label).join(', '), items: itemsBy[id],
+        label: compactLabels(itemsBy[id].map((i) => i.label)), items: itemsBy[id],
         waited: (now - tradeRuntime.waitingSince.get(id)) / 1000 });
     }
 
@@ -3032,7 +3047,7 @@
     const n = normTxt(raw);
     if (n.length < 2) return [];
     return atk.world.filter((t) => normTxt(t.name).includes(n) || normTxt(t.player).includes(n) || (t.ally && normTxt(t.ally).includes(n)))
-      .sort((a, b) => (normTxt(a.name).startsWith(n) ? 0 : 1) - (normTxt(b.name).startsWith(n) ? 0 : 1) || a.name.localeCompare(b.name))
+      .sort((a, b) => (normTxt(a.name).startsWith(n) ? 0 : 1) - (normTxt(b.name).startsWith(n) ? 0 : 1) || String(a.name).localeCompare(String(b.name)))
       .slice(0, 12);
   }
 
@@ -3050,9 +3065,9 @@
   function powerList() {
     const out = new Map();
     for (const src of [UW.GameData?.powers, UW.GameData?.god_powers].filter(Boolean)) {
-      for (const [k, d] of Object.entries(src)) if (!out.has(k) && d && typeof d === 'object') out.set(k, { id: k, name: d.name || k, cost: +(d.favor || d.favor_cost) || 0 });
+      for (const [k, d] of Object.entries(src)) if (!out.has(k) && d && typeof d === 'object' && typeof d.name === 'string') out.set(k, { id: k, name: d.name, cost: +(d.favor || d.favor_cost) || 0 });
     }
-    return [...out.values()].sort((a, b) => a.name.localeCompare(b.name, 'es'));
+    return [...out.values()].sort((a, b) => String(a.name).localeCompare(String(b.name), 'es'));
   }
   const U = (id) => UW.GameData?.units?.[id] || {};
   const atkUnitName = (id) => U(id).name || id;
