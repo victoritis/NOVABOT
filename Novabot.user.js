@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.6.1
+// @version      1.6.2
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -50,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.6.1';
+  const VERSION = '1.6.2';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -261,7 +261,12 @@
   // Iconos del propio juego: sus clases CSS (sprites) ya están cargadas en la
   // página, así que basta con ponerlas (p. ej. "unit_icon40x40 big_transporter").
   const unitIcon = (id, size = 40) => el('span', { class: `nb-icon nb-icon-${size} unit_icon${size}x${size} ${id}` });
-  const buildingIcon = (id, small = false) => el('span', { class: `nb-icon ${small ? 'nb-icon-20' : 'nb-icon-40'} building_icon40x40 ${id}` });
+  // small: el sprite de 40 px reducido dentro de una caja de 22 px (no depende de "zoom").
+  const buildingIcon = (id, small = false) => small
+    ? el('span', { class: 'nb-icon-sm' }, [el('span', { class: `building_icon40x40 ${id}` })])
+    : el('span', { class: `nb-icon nb-icon-40 building_icon40x40 ${id}` });
+  // Aldea de recolección (icono de misión del juego: requiere el contenedor .quest_type).
+  const villageIcon = () => el('span', { class: 'nb-icon-sm nb-icon-sm-44 quest_type' }, [el('span', { class: 'loot_village_icon' })]);
   const resIcon = (k) => el('span', { class: `nb-res-icon resources_small ${k}`, title: ({ wood: 'Madera', stone: 'Piedra', iron: 'Plata', favor: 'Favor', population: 'Población' })[k] || k });
   const heroIcon = (type) => el('span', { class: `nb-icon nb-icon-25 hero_icon hero25x25 ${type}` });
   // Recursos con sus iconos del juego: [icono 1200] [icono 300]…
@@ -273,12 +278,15 @@
   const TITLE_ICON = [
     [/prioridad/i, 'storage'], [/en camino|necesidades/i, 'market'], [/lote|tropa/i, 'barracks'],
     [/aptas|festival/i, 'place'], [/cola del juego|edificio|objetivos del bot/i, 'main'],
-    [/recolec|aldea|almacén llega/i, 'farm'], [/programados|nuevo|objetivo|origen/i, 'wall'], [/actividad/i, 'hide']
+    [/recolec|aldea|almacén llega/i, 'farm'], [/programados|nuevo|objetivo|origen/i, 'wall']
   ];
   function decorateTitles(root) {
     for (const t of root.querySelectorAll('.nb-card-title')) {
-      if (t.querySelector('.nb-icon')) continue;
+      if (t.querySelector('.nb-icon, .nb-icon-sm')) continue;
       const txt = t.textContent || '';
+      // Sin icono: Construcción (ya lleva uno por edificio) y "Actividad".
+      if (state.activeTab === 'construccion' || /actividad|aviso/i.test(txt)) continue;
+      if (state.activeTab === 'granjas') { t.prepend(villageIcon()); continue; }
       const hit = TITLE_ICON.find(([re]) => re.test(txt));
       const id = hit ? hit[1] : MODULE_ICON[state.activeTab];
       if (id) t.prepend(buildingIcon(id, true));
