@@ -7,7 +7,7 @@
    ===================================================================================== */
 
 :root{
-  --nb-css-version:   "1.5.8";
+  --nb-css-version:   "1.5.9";
 
   /* superficies */
   --nb-bg:            #111419;
@@ -487,3 +487,12 @@
 #novabot-panel .nb-countdown small{ font-size: 11px; color: var(--nb-text-faint); }
 #novabot-panel .nb-alert + .nb-alert, #novabot-panel .nb-countdown + .nb-alert{ margin-top: 6px; }
 #novabot-panel .nb-alert + div{ margin-top: 8px; }
+
+/* ---------- iconos del juego (sprites de Grepolis) ---------- */
+#novabot-panel .nb-icon{ display: inline-block; flex: 0 0 auto; border-radius: 7px; background-repeat: no-repeat;
+  box-shadow: 0 0 0 1px var(--nb-border), 0 2px 6px rgba(0,0,0,.35); }
+#novabot-panel .nb-icon-40{ width: 40px; height: 40px; }
+#novabot-panel .nb-icon-25{ width: 25px; height: 25px; border-radius: 5px; }
+#novabot-panel .nb-goal > .nb-icon, #novabot-panel .nb-add-row > .nb-icon{ margin-right: 10px; }
+#novabot-panel .nb-add-row > .nb-add-name{ flex: 1 1 auto; min-width: 0; }
+#novabot-panel .nb-unit-cell > .nb-icon{ margin-right: 6px; }

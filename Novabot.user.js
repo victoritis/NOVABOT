@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.5.8
+// @version      1.5.9
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -50,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.5.8';
+  const VERSION = '1.5.9';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -256,6 +256,11 @@
     sw.addEventListener('keydown', (e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); flip(); } });
     return sw;
   }
+  // Iconos del propio juego: sus clases CSS (sprites) ya están cargadas en la
+  // página, así que basta con ponerlas (p. ej. "unit_icon40x40 big_transporter").
+  const unitIcon = (id, size = 40) => el('span', { class: `nb-icon nb-icon-${size} unit_icon${size}x${size} ${id}` });
+  const buildingIcon = (id) => el('span', { class: `nb-icon nb-icon-40 building_icon40x40 ${id}` });
+
   function optionRow(label, hint, on, onToggle) {
     return el('div', { class: 'nb-row nb-option' }, [
       el('div', { class: 'nb-option-text' }, [el('span', { class: 'nb-option-label' }, label), hint ? el('span', { class: 'nb-option-hint' }, hint) : null]),
@@ -1417,6 +1422,7 @@
         const isNext = next.id === g.id && next.gi === i;
         goalsBox.appendChild(el('div', { class: `nb-goal${isNext ? ' nb-goal-next' : ''}${done ? ' nb-goal-done' : ''}` }, [
           el('span', { class: 'nb-goal-idx' }, String(i + 1)),
+          buildingIcon(g.id),
           el('div', { class: 'nb-goal-main' }, [
             el('div', { class: 'nb-goal-name' }, buildingName(g.id)),
             el('div', { class: 'nb-goal-sub' }, done ? 'completado' : isNext ? 'siguiente' : (reason || 'en espera'))
@@ -1465,6 +1471,7 @@
         input.addEventListener('keydown', (e) => { if (e.key === 'Enter') add(); });
         const inList = tcfg.goals.some((g) => g.id === id);
         return el('div', { class: `nb-add-row${atMax ? ' nb-add-row-off' : ''}` }, [
+          buildingIcon(id),
           el('div', { class: 'nb-add-name' }, [buildingName(id), el('span', { class: 'nb-add-level' }, inList ? `nivel ${committedLevel(info)} · en la lista hasta ${cur}` : `nivel ${cur}`)]),
           atMax
             ? el('span', { class: 'nb-pill nb-pill-off' }, 'máximo')
@@ -2713,6 +2720,7 @@
       const input = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '0', value: g.target });
       input.addEventListener('change', () => setTarget(g.id, pos(input.value, g.target)));
       goalsBox.appendChild(el('div', { class: `nb-goal${h >= g.target ? ' nb-goal-done' : ''}` }, [
+        unitIcon(g.id),
         el('div', { class: 'nb-goal-main' }, [
           el('div', { class: 'nb-goal-name' }, [unitName(g.id), unitTag(g.id)]),
           el('div', { class: 'nb-goal-sub' }, `tienes ${+have[g.id] || 0}${queued[g.id] ? ` + ${queued[g.id]} en cola` : ''} · faltan ${Math.max(0, g.target - h)}`)
@@ -2750,6 +2758,7 @@
       };
       input.addEventListener('keydown', (e) => { if (e.key === 'Enter') add(); });
       addList.appendChild(el('div', { class: 'nb-add-row' }, [
+        unitIcon(id),
         el('div', { class: 'nb-add-name' }, [
           el('span', {}, unitName(id)),
           unitTag(id),
@@ -3548,6 +3557,7 @@
       input.addEventListener('input', () => { f.units[k] = clamp(pos(input.value, 0), 0, n); if (+input.value > n) input.value = n; atkPaintPlan(); markSlow(); });
       const d = +info?.units?.[k]?.duration;
       grid.appendChild(el('div', { class: `nb-unit-cell${plan?.slow === k ? ' nb-slow' : ''}`, 'data-unit': k, title: d ? `Viaje de ${atkUnitName(k)}: ${fmtDur(d * 1000)}` : atkUnitName(k) }, [
+        unitIcon(k, 25),
         el('div', { class: 'nb-unit-info' }, [el('span', { class: 'nb-unit-name' }, atkUnitName(k)), el('span', { class: 'nb-unit-sub' }, `${n}${d ? ` · ${fmtDur(d * 1000)}` : ''}`)]),
         el('span', { class: 'nb-mini', title: 'Todas', onclick: () => { input.value = n; f.units[k] = n; atkPaintPlan(); markSlow(); } }, 'máx'),
         input
