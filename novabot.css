@@ -7,7 +7,7 @@
    ===================================================================================== */
 
 :root{
-  --nb-css-version:   "1.6.9";
+  --nb-css-version:   "1.7.0";
 
   /* superficies */
   --nb-bg:            #111419;
@@ -568,29 +568,29 @@
 #novabot-panel .nb-ov-dim{ color: var(--nb-text-faint); font-size: 10.5px; }
 
 /* ---------- selectores con imagen (héroe / hechizo) ---------- */
-#novabot-panel .nb-chip-label{ font-size: 11px; font-weight: 700; color: var(--nb-text-dim); margin-bottom: 6px; }
-#novabot-panel .nb-chips{ display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 6px; }
-#novabot-panel .nb-chip{ display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: var(--nb-radius-sm); cursor: pointer;
-  background: var(--nb-surface-2); border: 1px solid transparent; transition: border-color .12s, background .12s; }
-#novabot-panel .nb-chip:hover{ background: var(--nb-surface-3); border-color: var(--nb-border); }
-#novabot-panel .nb-chip.active{ border-color: var(--nb-gold); background: var(--nb-gold-soft); }
-#novabot-panel .nb-chip-text{ display: flex; flex-direction: column; min-width: 0; line-height: 1.2; }
-#novabot-panel .nb-chip-text b{ color: var(--nb-text); font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-#novabot-panel .nb-chip-text small{ color: var(--nb-text-faint); font-size: 10px; }
-#novabot-panel .nb-chip-none{ width: 25px; height: 25px; display: flex; align-items: center; justify-content: center; border-radius: 5px; background: rgba(255,255,255,.05); color: var(--nb-text-faint); flex: none; }
+#novabot-panel .nb-pick-label{ font-size: 11px; font-weight: 700; color: var(--nb-text-dim); margin-bottom: 6px; }
+#novabot-panel .nb-picks{ display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 6px; }
+#novabot-panel .nb-pick{ display: flex; align-items: center; gap: 9px; min-height: 44px; padding: 6px 9px; border-radius: var(--nb-radius-sm); cursor: pointer;
+  background: var(--nb-surface-2); border: 1px solid var(--nb-border-soft); transition: border-color .12s, background .12s; }
+#novabot-panel .nb-pick:hover{ background: var(--nb-surface-3); border-color: var(--nb-border); }
+#novabot-panel .nb-pick.active{ border-color: var(--nb-gold); background: var(--nb-gold-soft); }
+#novabot-panel .nb-pick > .nb-icon, #novabot-panel .nb-pick > .nb-pick-none{ flex: none; position: static; margin: 0; }
+#novabot-panel .nb-pick-text{ display: flex; flex-direction: column; gap: 2px; min-width: 0; line-height: 1.2; }
+#novabot-panel .nb-pick-text b{ color: var(--nb-text); font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#novabot-panel .nb-pick-text small{ color: var(--nb-text-faint); font-size: 10px; }
+#novabot-panel .nb-pick-none{ width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; border-radius: 6px; background: rgba(255,255,255,.05); color: var(--nb-text-faint); }
+#novabot-panel .nb-pick-off{ opacity: .45; cursor: default; }
+#novabot-panel .nb-pick-off:hover{ background: var(--nb-surface-2); border-color: var(--nb-border-soft); }
 #novabot-panel .nb-icon-30{ width: 30px; height: 30px; border-radius: 6px; }
 /* rango de llegada */
 #novabot-panel .nb-range{ display: flex; flex-direction: column; gap: 8px; margin-top: 8px; padding: 8px; border-radius: var(--nb-radius-sm); background: var(--nb-surface-2); }
 #novabot-panel .nb-range .nb-input-time{ max-width: 160px; font-size: 15px; height: 34px; }
 
-/* héroe no disponible / hechizos por dios */
-#novabot-panel .nb-chip-off{ opacity: .45; cursor: default; }
-#novabot-panel .nb-chip-off:hover{ background: var(--nb-surface-2); border-color: transparent; }
+/* hechizos agrupados por dios */
 #novabot-panel .nb-spells{ display: flex; flex-direction: column; gap: 8px; }
-#novabot-panel .nb-spells > .nb-chip{ max-width: 200px; }
-#novabot-panel .nb-spell-god{ padding: 6px; border-radius: var(--nb-radius-sm); background: rgba(255,255,255,.02); border: 1px solid var(--nb-border-soft); }
-#novabot-panel .nb-spell-god-head{ display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
-#novabot-panel .nb-spell-god-head b{ color: var(--nb-text); font-size: 11.5px; }
+#novabot-panel .nb-spells > .nb-pick{ max-width: 220px; }
+#novabot-panel .nb-spell-god{ padding: 8px; border-radius: var(--nb-radius-sm); background: rgba(255,255,255,.02); border: 1px solid var(--nb-border-soft); }
+#novabot-panel .nb-spell-god-head{ display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+#novabot-panel .nb-spell-god-head b{ color: var(--nb-text); font-size: 12px; }
 #novabot-panel .nb-spell-god-head small{ color: var(--nb-text-faint); font-size: 10.5px; margin-left: auto; }
-#novabot-panel .nb-spell-god-head .nb-icon-sm{ margin-right: 0; }
-#novabot-panel .nb-icon-sm-30 > span{ width: 30px; height: 30px; transform: scale(.733); }
+#novabot-panel .nb-god-ico{ display: inline-block; flex: none; width: 22px; height: 22px; overflow: hidden; border-radius: 50%; box-shadow: 0 0 0 1px var(--nb-border); }

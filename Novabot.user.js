@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.7.2
+// @version      1.7.3
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -50,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.7.2';
+  const VERSION = '1.7.3';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -3796,11 +3796,11 @@
 
     // 5) Héroe / hechizo
     // Selectores con imagen: héroes de la ciudad de origen y hechizos (uno solo).
-    const chip = (active, icon, title, sub, onclick, disabled = false, tip = '') => el('div', { class: `nb-chip${active ? ' active' : ''}${disabled ? ' nb-chip-off' : ''}`, title: tip || null, onclick: disabled ? null : onclick }, [icon, el('div', { class: 'nb-chip-text' }, [el('b', {}, title), sub ? el('small', {}, sub) : null])]);
-    const noneIcon = () => el('span', { class: 'nb-chip-none' }, '∅');
+    const chip = (active, icon, title, sub, onclick, disabled = false, tip = '') => el('div', { class: `nb-pick${active ? ' active' : ''}${disabled ? ' nb-pick-off' : ''}`, title: tip || null, onclick: disabled ? null : onclick }, [icon, el('div', { class: 'nb-pick-text' }, [el('b', {}, title), sub ? el('small', {}, sub) : null])]);
+    const noneIcon = () => el('span', { class: 'nb-pick-none' }, '∅');
     const heroesAll = heroesIn(f.source, true);
     if (f.hero && !heroesAll.some((h) => h.id === f.hero && h.available)) f.hero = '';
-    const heroSel = el('div', { class: 'nb-chips' }, [
+    const heroSel = el('div', { class: 'nb-picks' }, [
       chip(!f.hero, noneIcon(), 'Sin héroe', null, () => { f.hero = ''; renderBody(); }),
       ...heroesAll.map((h) => chip(f.hero === h.id, el('span', { class: `nb-icon nb-icon-25 hero_icon hero25x25 ${h.id}` }), heroName(h.id),
         h.available ? (h.level ? `nivel ${h.level}` : null) : h.why, () => { f.hero = h.id; renderBody(); }, !h.available))
@@ -3812,9 +3812,9 @@
     for (const god of [...new Set(spells.map((p) => p.god))]) {
       const fav = Math.floor(godFavor(god));
       spellSel.appendChild(el('div', { class: 'nb-spell-god' }, [
-        el('div', { class: 'nb-spell-god-head' }, [el('span', { class: 'nb-icon-sm nb-icon-sm-30' }, [el('span', { class: `god_micro ${god}` })]),
+        el('div', { class: 'nb-spell-god-head' }, [el('span', { class: 'nb-god-ico' }, [el('span', { class: `god_micro ${god}`, style: 'display:block;width:30px;height:30px;transform:scale(.733);transform-origin:0 0' })]),
           el('b', {}, UW.GameData?.gods?.[god]?.name || god), el('small', {}, `${fav} favor`)]),
-        el('div', { class: 'nb-chips' }, spells.filter((p) => p.god === god).map((p) => chip(f.spell === p.id,
+        el('div', { class: 'nb-picks' }, spells.filter((p) => p.god === god).map((p) => chip(f.spell === p.id,
           el('span', { class: `nb-icon nb-icon-30 power_icon30x30 ${p.id}` }), p.name, `${p.cost} favor${p.cost > fav ? ' · falta favor' : ''}`,
           () => { f.spell = f.spell === p.id ? '' : p.id; renderBody(); }, false, p.effect)))
       ]));
@@ -3893,8 +3893,8 @@
           el('span', { class: 'nb-mini', onclick: () => setUnits(() => false) }, 'Ninguna')
         ]),
         grid,
-        el('div', { class: 'nb-mt nb-chip-label' }, 'Héroe'), heroSel,
-        el('div', { class: 'nb-mt nb-chip-label' }, 'Hechizo (solo uno)'), spellSel
+        el('div', { class: 'nb-mt nb-pick-label' }, 'Héroe'), heroSel,
+        el('div', { class: 'nb-mt nb-pick-label' }, 'Hechizo (solo uno)'), spellSel
       ] : el('p', { class: 'nb-placeholder' }, 'No hay tropas en esta ciudad.')),
       section(5, 'Hora del servidor', [modeSeg, el('div', { class: 'nb-time-row' }, [timeIn, quick]), rangeBox]),
       atkPlanEl,
