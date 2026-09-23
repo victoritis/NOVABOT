@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.6.7
+// @version      1.6.8
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -50,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.6.7';
+  const VERSION = '1.6.8';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -285,7 +285,7 @@
       if (t.querySelector('.nb-icon, .nb-icon-sm')) continue;
       const txt = t.textContent || '';
       // Sin icono: Construcción (ya lleva uno por edificio) y "Actividad".
-      if (state.activeTab === 'construccion' || /actividad|aviso/i.test(txt)) continue;
+      if (state.activeTab === 'construccion' || /actividad|aviso|siguiente lote/i.test(txt)) continue; // (el lote puede ser de Cuartel o de Puerto)
       if (state.activeTab === 'granjas') { t.prepend(villageIcon()); continue; }
       const hit = TITLE_ICON.find(([re]) => re.test(txt));
       const id = hit ? hit[1] : MODULE_ICON[state.activeTab];
