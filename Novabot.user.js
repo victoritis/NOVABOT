@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.7.9
+// @version      1.8.0
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -50,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.7.9';
+  const VERSION = '1.8.0';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -379,8 +379,90 @@
 
   // Resumen: una tarjeta por módulo con su estado, interruptor y dato clave.
   // Clic en la tarjeta = ir a la pestaña.
+  /* Vista general · Reclutamiento del bot: por ciudad, qué tropas se piden, cuánto
+     falta, el lote siguiente (y si está listo), colas y hechizos. Solo lectura. */
+  function renderResumenRecruit() {
+    const towns = allTownIds().filter((id) => townRecruitCfg(id).goals.length)
+      .sort((a, b) => farmTownName(a).localeCompare(farmTownName(b), 'es'));
+    const limit = buildQueueLimit();
+    let pendingUnits = 0, readyLots = 0, waiting = 0;
+    const cards = towns.map((id) => {
+      const cfg = townRecruitCfg(id);
+      const have = townUnitsHave(id), queued = queuedUnits(id);
+      let b = null; try { b = recruitBatch(id); } catch {}
+      const cur = townResources(id);
+      // Estado de la ciudad
+      const now = Date.now();
+      let st, cls;
+      if (!recruitOnFor(id)) { st = 'Desactivado'; cls = 'off'; }
+      else if (cfg.hold) { st = 'En espera (sin hora)'; cls = 'wait'; }
+      else if (+cfg.startAt > now) { st = ['Empieza en ', el('b', { 'data-nb-until': Math.round(cfg.startAt / 1000) }, formatLeft(Math.round(cfg.startAt / 1000)))]; cls = 'wait'; }
+      else if (recruitRuntime.wait.get(id)) { st = recruitRuntime.wait.get(id); cls = 'wait'; }
+      else if (!b) { st = 'Objetivos cumplidos'; cls = 'done'; }
+      else if (b.queueFull) { st = 'Cola llena'; cls = 'wait'; }
+      else if (b.reason) { st = b.reason; cls = 'wait'; }
+      else if (RES.every((k) => cur[k] >= b.cost[k])) { st = 'Lote listo para reclutar'; cls = 'ok'; readyLots++; }
+      else { st = 'Reuniendo recursos'; cls = 'run'; }
+      if (cls === 'wait') waiting++;
+      // Tropas pedidas
+      const rows = cfg.goals.map((g) => {
+        const h = +have[g.id] || 0, q = +queued[g.id] || 0, rem = Math.max(0, g.target - h - q);
+        pendingUnits += rem;
+        const pct = g.target ? Math.min(100, Math.round((h + q) / g.target * 100)) : 100;
+        const pctHave = g.target ? Math.min(100, Math.round(h / g.target * 100)) : 100;
+        return el('div', { class: 'nb-rc-unit' }, [
+          unitIcon(g.id, 25),
+          el('div', { class: 'nb-rc-unit-main' }, [
+            el('div', { class: 'nb-rc-unit-top' }, [el('b', {}, unitName(g.id)), el('span', {}, `${h}${q ? ` + ${q} en cola` : ''} / ${g.target}`)]),
+            el('div', { class: 'nb-bar nb-rc-bar' }, [el('div', { class: 'nb-bar-fill nb-rc-q', style: `width:${pct}%` }), el('div', { class: 'nb-bar-fill', style: `width:${pctHave}%` })]),
+            el('div', { class: 'nb-rc-unit-sub' }, rem ? `faltan ${rem}${unitResearched(id, g.id) ? '' : ' · esperando investigación'}` : 'completo')
+          ])
+        ]);
+      });
+      // Siguiente lote
+      let lot = null;
+      if (b && !b.reason && sumRes(b.cost)) {
+        const pctOf = (k) => b.cost[k] ? Math.min(100, Math.floor(cur[k] / b.cost[k] * 100)) : 100;
+        const tot = Math.min(...RES.filter((k) => b.cost[k] > 0).map(pctOf));
+        lot = el('div', { class: 'nb-rc-lot' }, [
+          el('div', { class: 'nb-rc-lot-head' }, [el('span', {}, 'Siguiente lote'), el('b', {}, Object.entries(b.units).map(([u, n]) => `${n} ${unitName(u)}`).join(' + ')), el('span', { class: 'nb-rc-pct' }, `${tot} %`)]),
+          el('div', { class: 'nb-res-list' }, RES.filter((k) => b.cost[k] > 0).map((k) => el('span', { class: `nb-res${cur[k] >= b.cost[k] ? ' nb-ok' : ''}` }, [resIcon(k), `${Math.floor(cur[k])}/${Math.ceil(b.cost[k])}`])))
+        ]);
+      }
+      // Colas y hechizos
+      const orders = townUnitOrders(id);
+      const qInfo = (naval) => { const n = orders.filter((o) => (o.kind === 'naval') === naval).length; return el('span', { class: 'nb-rc-q-item' }, [buildingIcon(naval ? 'docks' : 'barracks', true), `${n}/${limit}`]); };
+      const spells = Object.entries(cfg.spells || {}).map(([sid, mode]) => {
+        const on = spellEnd(id, sid) > now;
+        return el('span', { class: `nb-rc-spell${on ? ' on' : ''}`, title: `${UW.GameData?.powers?.[sid]?.name || sid} · ${mode === 'required' ? 'obligatorio' : 'opcional'} · ${on ? 'activo' : 'inactivo'}` }, [el('span', { class: `nb-icon nb-icon-25 power_icon30x30 ${sid}` })]);
+      });
+      return el('div', { class: `nb-rc-card nb-rc-${cls}${+UW.Game?.townId === id ? ' nb-rc-current' : ''}` }, [
+        el('div', { class: 'nb-rc-head' }, [
+          el('b', { class: 'nb-rc-town' }, farmTownName(id)),
+          el('span', { class: `nb-rc-state nb-rc-state-${cls}` }, st)
+        ]),
+        el('div', { class: 'nb-rc-units' }, rows),
+        lot,
+        el('div', { class: 'nb-rc-foot' }, [qInfo(false), qInfo(true), spells.length ? el('span', { class: 'nb-rc-spells' }, spells) : null])
+      ]);
+    });
+    bodyEl.appendChild(el('div', { class: 'nb-stats nb-rc-stats' }, [
+      el('div', { class: 'nb-stat' }, [el('span', {}, 'Ciudades reclutando'), el('b', {}, String(towns.length))]),
+      el('div', { class: 'nb-stat' }, [el('span', {}, 'Tropas por reclutar'), el('b', {}, pendingUnits.toLocaleString('es-ES'))]),
+      el('div', { class: 'nb-stat' }, [el('span', {}, 'Lotes listos'), el('b', {}, String(readyLots))]),
+      el('div', { class: 'nb-stat' }, [el('span', {}, 'En espera'), el('b', {}, String(waiting))])
+    ]));
+    bodyEl.appendChild(towns.length ? el('div', { class: 'nb-rc-grid' }, cards)
+      : el('div', { class: 'nb-card' }, [el('p', { class: 'nb-placeholder' }, 'Ninguna ciudad tiene tropas pedidas en el bot.')]));
+    updateCountdown();
+  }
+
   /* Vista general: una fila por ciudad con lo que está en curso (solo lectura). */
   function renderResumenTab() {
+    const view = state.resumenView === 'reclutamiento' ? 'reclutamiento' : 'ciudades';
+    bodyEl.appendChild(el('div', { class: 'nb-seg nb-seg-main' }, [['ciudades', 'Ciudades'], ['reclutamiento', 'Reclutamiento del bot']].map(([v, l]) =>
+      el('span', { class: `nb-seg-btn${view === v ? ' active' : ''}`, onclick: () => { state.resumenView = v; saveState(); renderBody(); } }, l))));
+    if (view === 'reclutamiento') { renderResumenRecruit(); return; }
     const now = Date.now();
     const transit = (() => { try { return transitRows(); } catch { return []; } })();
     const cd = (ms) => el('b', { class: 'nb-ov-time', 'data-nb-until': Math.round(ms / 1000) }, formatLeft(Math.round(ms / 1000)));

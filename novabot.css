@@ -7,7 +7,7 @@
    ===================================================================================== */
 
 :root{
-  --nb-css-version:   "1.7.3";
+  --nb-css-version:   "1.7.4";
 
   /* superficies */
   --nb-bg:            #111419;
@@ -610,3 +610,44 @@
 #novabot-panel .nb-lvl-input.nb-lvl-up{ color: var(--nb-ok) !important; border-color: rgba(124,199,154,.55) !important; }
 #novabot-panel .nb-lvl-input.nb-lvl-down{ color: var(--nb-danger) !important; border-color: rgba(227,110,99,.55) !important; }
 #novabot-panel .nb-mini-add.nb-mini-off{ opacity: .35; }
+
+/* ---------- Vista general · Reclutamiento del bot ---------- */
+#novabot-panel .nb-seg-main + .nb-card, #novabot-panel .nb-seg-main + .nb-stats{ margin-top: 10px; }
+#novabot-panel .nb-rc-stats{ margin-bottom: 10px; }
+#novabot-panel .nb-rc-grid{ display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; }
+#novabot-panel .nb-rc-card{ background: var(--nb-surface); border: 1px solid var(--nb-border-soft); border-left: 3px solid var(--nb-border); border-radius: var(--nb-radius-md); padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+#novabot-panel .nb-rc-ok{ border-left-color: var(--nb-ok); }
+#novabot-panel .nb-rc-run{ border-left-color: var(--nb-gold); }
+#novabot-panel .nb-rc-wait{ border-left-color: #d9a441; }
+#novabot-panel .nb-rc-off, #novabot-panel .nb-rc-done{ border-left-color: var(--nb-border-strong); opacity: .75; }
+#novabot-panel .nb-rc-current{ box-shadow: 0 0 0 1px var(--nb-gold-line); }
+#novabot-panel .nb-rc-head{ display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+#novabot-panel .nb-rc-town{ color: var(--nb-text); font-size: 13px; }
+#novabot-panel .nb-rc-state{ font-size: 10.5px; font-weight: 700; padding: 2px 8px; border-radius: 999px; background: rgba(255,255,255,.06); color: var(--nb-text-dim); text-align: right; max-width: 65%; }
+#novabot-panel .nb-rc-state-ok{ background: rgba(124,199,154,.15); color: var(--nb-ok); }
+#novabot-panel .nb-rc-state-run{ background: var(--nb-gold-soft); color: var(--nb-gold-bright); }
+#novabot-panel .nb-rc-state-wait{ background: rgba(217,164,65,.14); color: #e3b55a; }
+#novabot-panel .nb-rc-units{ display: flex; flex-direction: column; gap: 6px; }
+#novabot-panel .nb-rc-unit{ display: flex; align-items: center; gap: 8px; }
+#novabot-panel .nb-rc-unit-main{ flex: 1; min-width: 0; }
+#novabot-panel .nb-rc-unit-top{ display: flex; justify-content: space-between; gap: 6px; font-size: 11.5px; }
+#novabot-panel .nb-rc-unit-top b{ color: var(--nb-text); }
+#novabot-panel .nb-rc-unit-top span{ color: var(--nb-text-dim); font-variant-numeric: tabular-nums; }
+#novabot-panel .nb-rc-unit-sub{ font-size: 10px; color: var(--nb-text-faint); margin-top: 2px; }
+#novabot-panel .nb-rc-bar{ position: relative; height: 5px; margin-top: 3px; }
+#novabot-panel .nb-rc-bar .nb-bar-fill{ position: absolute; left: 0; top: 0; bottom: 0; }
+#novabot-panel .nb-rc-bar .nb-rc-q{ opacity: .35; }
+#novabot-panel .nb-rc-lot{ padding: 7px 8px; border-radius: var(--nb-radius-sm); background: var(--nb-surface-2); display: flex; flex-direction: column; gap: 5px; }
+#novabot-panel .nb-rc-lot-head{ display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--nb-text-faint); }
+#novabot-panel .nb-rc-lot-head b{ color: var(--nb-text); flex: 1; }
+#novabot-panel .nb-rc-pct{ color: var(--nb-gold-bright); font-weight: 800; font-variant-numeric: tabular-nums; }
+#novabot-panel .nb-rc-lot .nb-res{ font-size: 11px; color: var(--nb-text-dim); }
+#novabot-panel .nb-rc-lot .nb-res.nb-ok{ color: var(--nb-ok); }
+#novabot-panel .nb-rc-foot{ display: flex; align-items: center; gap: 12px; font-size: 11px; color: var(--nb-text-dim); border-top: 1px solid var(--nb-border-soft); padding-top: 7px; }
+#novabot-panel .nb-rc-q-item{ display: inline-flex; align-items: center; gap: 5px; font-variant-numeric: tabular-nums; }
+#novabot-panel .nb-rc-q-item .nb-icon-sm{ margin-right: 0; width: 18px; height: 18px; }
+#novabot-panel .nb-rc-q-item .nb-icon-sm > span{ transform: scale(.45); }
+#novabot-panel .nb-rc-spells{ margin-left: auto; display: inline-flex; gap: 4px; }
+#novabot-panel .nb-rc-spell{ opacity: .35; filter: grayscale(1); }
+#novabot-panel .nb-rc-spell.on{ opacity: 1; filter: none; }
+#novabot-panel .nb-rc-spell .nb-icon-25{ width: 22px; height: 22px; overflow: hidden; }
