@@ -7,7 +7,7 @@
    ===================================================================================== */
 
 :root{
-  --nb-css-version:   "1.1.0";
+  --nb-css-version:   "1.5.0";
 
   /* superficies */
   --nb-bg:            #111419;
@@ -469,3 +469,7 @@
 
 /* ---------- Festivales ---------- */
 #novabot-panel .nb-bar-mini{ flex: none; width: 70px; height: 6px; }
+
+/* ---------- Prioridad de recursos ---------- */
+#novabot-panel .nb-seg-wrap{ flex-wrap: wrap; }
+#novabot-panel .nb-seg-wrap .nb-seg-btn{ flex: 1 1 auto; white-space: nowrap; }
