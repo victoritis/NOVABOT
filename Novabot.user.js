@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.8.7
+// @version      1.8.8
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.8.7';
+  const VERSION = '1.8.8';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -126,7 +126,8 @@
         towns: {}             // townId -> { goals: [{id, target}], lastId } (orden = prioridad; un edificio puede repetirse)
       },
       festivales: {
-        enabled: true
+        enabled: true,
+        event: false          // "Festival evento": solo durante el evento; apaga los normales
       },
       investigacion: {
         enabled: true,
@@ -570,7 +571,7 @@
       mod('construccion', 'Construcción', state.construccion, 'Sube edificios por objetivos'),
       mod('reclutamiento', 'Reclutamiento', state.reclutamiento, 'Lotes que llenan el almacén'),
       mod('comercio', 'Comercio', state.comercio, 'Reparte recursos entre ciudades'),
-      mod('festivales', 'Festivales', state.festivales, 'Academia 30+, sin festival en curso'),
+      mod('festivales', 'Festivales', state.festivales, state.festivales.event ? 'Festival evento activo (normales apagados)' : 'Academia 30+, sin festival en curso'),
       (() => {
         const nx = nextPending();
         const n = atk.queue.filter((a) => a.status === 'pending').length;
@@ -2055,7 +2056,7 @@
         const b = recruitBatch(townId);
         return b && !b.reason ? { ...b.cost } : zero;
       }
-      if (mod === 'festivales') return festivalPending(townId) ? { ...FESTIVAL_COST } : zero;
+      if (mod === 'festivales') return festivalPending(townId) ? { ...festCost() } : zero;
       if (mod === 'investigacion') { const n = researchPlan(townId).find((x) => !x.block); return n ? { ...n.cost } : zero; }
     } catch {}
     return zero;
@@ -4832,34 +4833,67 @@
       return end;
     } catch { return 0; }
   }
-  const canFestival = (townId) => academyLevel(townId) >= FESTIVAL_ACADEMY;
+  /* Festival evento ("Temporada de festivales"), leído del juego (24/09/2026):
+     MM.getCollections().Benefit → { type:'party', start, end,
+       params:{ hours:'12', wood:'5000', stone:'5000', iron:'5000', min_academy_level:'5' } }
+     Mientras está activo, el mismo festival (celebration_type:'party') cuesta eso y pide
+     esa Academia. hours son horas de juego → reales = hours / velocidad (12/4 = 3 h). */
+  function partyEvent() {
+    try {
+      const now = Date.now() / 1000;
+      for (const c of [].concat(UW.MM.getCollections().Benefit || [])) for (const m of c?.models || []) {
+        const a = m.attributes || {};
+        if (a.type !== 'party' || !(+a.start <= now && +a.end > now)) continue;
+        const p = a.params || {};
+        return {
+          cost: { wood: +p.wood || 0, stone: +p.stone || 0, iron: +p.iron || 0 },
+          academy: +p.min_academy_level || 0,
+          hours: (+p.hours || 12) / Math.max(1, +UW.Game?.game_speed || 1),
+          end: +a.end * 1000
+        };
+      }
+    } catch {}
+    return null;
+  }
+  // Festival que toca ahora: el del evento (si está elegido y activo) o el normal.
+  function festCfg() {
+    const f = state.festivales;
+    if (f.event) { const e = partyEvent(); return e ? { ...e, event: true } : null; }
+    if (f.enabled) return { cost: FESTIVAL_COST, academy: FESTIVAL_ACADEMY, hours: 6, event: false };
+    return null;
+  }
+  const festCost = () => festCfg()?.cost || FESTIVAL_COST;
+  const festAcademy = () => festCfg()?.academy ?? (state.festivales.event ? (partyEvent()?.academy ?? 5) : FESTIVAL_ACADEMY);
+  const canFestival = (townId) => academyLevel(townId) >= festAcademy();
   // (tras iniciarlo, hasta que el juego actualice sus datos, se da por en marcha)
-  const festivalPending = (townId) => state.festivales.enabled && canFestival(townId) && !festivalEnd(townId) && !((festRuntime.startedUntil.get(+townId) || 0) > Date.now());
+  const festivalPending = (townId) => !!festCfg() && canFestival(townId) && !festivalEnd(townId) && !((festRuntime.startedUntil.get(+townId) || 0) > Date.now());
 
   tradeDemandProviders.push(function festivalDemands() {
-    if (!state.festivales.enabled || !state.comercio.forFestival) return [];
+    const f = festCfg();
+    if (!f || !state.comercio.forFestival) return [];
     const out = [];
     for (const townId of allTownIds()) {
       if (!festivalPending(townId)) continue;
-      out.push({ townId, module: 'festivales', label: 'Festival', ...FESTIVAL_COST });
+      out.push({ townId, module: 'festivales', label: f.event ? 'Festival evento' : 'Festival', ...f.cost });
     }
     return out;
   });
 
   async function festTick() {
-    if (!state.festivales.enabled) return;
+    if (!festCfg()) return;
     for (const townId of allTownIds()) {
-      if (!state.festivales.enabled) return;
+      const f = festCfg();
+      if (!f) return;
       if (!festivalPending(townId)) continue;
       if ((festRuntime.cooldown.get(townId) || 0) > Date.now()) continue;
       const cur = townResources(townId);
       const fr = reserveAbove(townId, 'festivales');
-      if (RES.some((k) => cur[k] - fr[k] < FESTIVAL_COST[k])) continue;
+      if (RES.some((k) => cur[k] - fr[k] < f.cost[k])) continue;
       try {
         await gpPostAs(townId, 'building_place', 'start_celebration', { celebration_type: 'party', nl_init: true });
-        festLog(`${farmTownName(townId)}: festival iniciado.`, 'ok');
+        festLog(`${farmTownName(townId)}: ${f.event ? 'festival evento' : 'festival'} iniciado.`, 'ok');
         festRuntime.cooldown.set(townId, Date.now() + 60000);
-        festRuntime.startedUntil.set(+townId, Date.now() + 6 * 3600000); // dura 6 h
+        festRuntime.startedUntil.set(+townId, Date.now() + f.hours * 3600000);
       } catch (e) {
         festLog(`${farmTownName(townId)}: ${e.message}`, 'error');
         festRuntime.cooldown.set(townId, Date.now() + 5 * 60000);
@@ -4872,7 +4906,7 @@
   function startFestivalEngine() {
     if (festRuntime.timer) return;
     festRuntime.timer = setInterval(() => {
-      if (!state.festivales.enabled || festRuntime.running) return;
+      if (!festCfg() || festRuntime.running) return;
       festRuntime.running = true;
       festTick().catch((e) => festLog(`Error: ${e.message}`, 'error')).finally(() => { festRuntime.running = false; });
     }, 10000);
@@ -4886,33 +4920,52 @@
 
   function renderFestivalesTab() {
     const cfg = state.festivales;
+    const fmtN = (n) => Math.round(n).toLocaleString('es-ES');
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, [el('b', {}, 'Festivales automáticos')]),
-        switchEl(!!cfg.enabled, (v) => { cfg.enabled = v; saveState(); renderBody(); festLog(v ? 'Festivales activados.' : 'Festivales desactivados.'); }, false)]),
+        switchEl(!!cfg.enabled, (v) => { cfg.enabled = v; if (v) cfg.event = false; saveState(); renderBody(); festLog(v ? 'Festivales activados.' : 'Festivales desactivados.'); }, false)]),
       optionRow('Pedir recursos al Comercio', 'Envía justo lo que falta para el festival', !!state.comercio.forFestival, (v) => { state.comercio.forFestival = v; saveState(); }),
 
       el('p', { class: 'nb-placeholder' }, `Solo ciudades con Academia ${FESTIVAL_ACADEMY}+ y sin festival en curso. Coste: 15 000 madera · 18 000 piedra · 15 000 plata.`)
     ]));
 
+    // Festival evento ("Temporada de festivales")
+    const ev = partyEvent();
+    bodyEl.appendChild(el('div', { class: `nb-card${cfg.event ? ' nb-card-accent' : ''}` }, [
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, [el('b', {}, 'Festival evento')]),
+        switchEl(!!cfg.event, (v) => { cfg.event = v; if (v) cfg.enabled = false; saveState(); renderBody(); festLog(v ? 'Festival evento activado (festivales normales desactivados).' : 'Festival evento desactivado.'); }, false)]),
+      ev
+        ? el('div', {}, [
+            el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Coste'), el('span', { class: 'nb-row-value' }, fmtResEl(ev.cost))]),
+            el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Requisito'), el('span', { class: 'nb-row-value' }, `Academia ${ev.academy}`)]),
+            el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Duración'), el('span', { class: 'nb-row-value' }, `${+ev.hours.toFixed(2)} h reales`)]),
+            el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Evento activo hasta'), el('span', { class: 'nb-row-value' }, new Date(ev.end).toLocaleString('es-ES', { weekday: 'short', hour: '2-digit', minute: '2-digit' }))])
+          ])
+        : el('div', { class: 'nb-alert nb-alert-warn nb-mt' }, 'Ahora no hay «Temporada de festivales» activa: no se hace nada hasta que empiece.'),
+      el('p', { class: 'nb-placeholder' }, `Al activarlo se apagan los festivales normales. En cuanto termina uno, lanza otro en todas las ciudades con la Academia pedida${ev ? ` (${fmtN(ev.cost.wood)} / ${fmtN(ev.cost.stone)} / ${fmtN(ev.cost.iron)})` : ''}.`)
+    ]));
+
     // Estado por ciudad
     const transit = (() => { try { return transitRows(); } catch { return []; } })();
+    const ACAD = festAcademy(), COST = festCost();
     const rows = allTownIds().map((id) => ({ id, name: farmTownName(id), acad: academyLevel(id), end: festivalEnd(id) }))
-      .sort((a, b) => (b.acad >= FESTIVAL_ACADEMY) - (a.acad >= FESTIVAL_ACADEMY) || a.name.localeCompare(b.name, 'es'));
-    const apt = rows.filter((r) => r.acad >= FESTIVAL_ACADEMY);
+      .sort((a, b) => (b.acad >= ACAD) - (a.acad >= ACAD) || a.name.localeCompare(b.name, 'es'));
+    const apt = rows.filter((r) => r.acad >= ACAD);
     const list = el('div', { class: 'nb-goals' });
     for (const r of apt) {
       const cur = townResources(r.id), inc = incomingTo(r.id, transit);
       let sub, cls = '';
       if (r.end) { sub = el('span', {}, ['En curso · termina en ', el('b', { 'data-nb-until': Math.round(r.end / 1000) }, formatLeft(Math.round(r.end / 1000)))]); cls = ' nb-goal-done'; }
       else {
-        const miss = Object.fromEntries(RES.map((k) => [k, Math.max(0, FESTIVAL_COST[k] - cur[k])]));
+        const miss = Object.fromEntries(RES.map((k) => [k, Math.max(0, COST[k] - cur[k])]));
         const missAfter = Object.fromEntries(RES.map((k) => [k, Math.max(0, miss[k] - inc[k])]));
         const fr = reserveAbove(r.id, 'festivales');
-        if (!sumRes(miss) && RES.some((k) => cur[k] - fr[k] < FESTIVAL_COST[k])) sub = `Esperando: recursos reservados para ${reserveOwner(r.id, 'festivales') || 'otro módulo'} (prioridad)`;
+        if (!festCfg()) sub = 'Desactivado';
+        else if (!sumRes(miss) && RES.some((k) => cur[k] - fr[k] < COST[k])) sub = `Esperando: recursos reservados para ${reserveOwner(r.id, 'festivales') || 'otro módulo'} (prioridad)`;
         else if (!sumRes(miss)) { sub = 'Listo: se inicia en el próximo ciclo'; cls = ' nb-goal-next'; }
         else sub = el('span', {}, ['Faltan ', fmtResEl(miss), ...(sumRes(inc) ? [' · en camino ', fmtResEl(inc), sumRes(missAfter) ? '' : ' (cubre)'] : [])]);
       }
-      const pct = Math.min(100, Math.round(RES.reduce((s, k) => s + Math.min(cur[k], FESTIVAL_COST[k]), 0) / sumRes(FESTIVAL_COST) * 100));
+      const pct = Math.min(100, Math.round(RES.reduce((s, k) => s + Math.min(cur[k], COST[k]), 0) / Math.max(1, sumRes(COST)) * 100));
       list.appendChild(el('div', { class: `nb-goal${cls}` }, [
         el('div', { class: 'nb-goal-main' }, [el('div', { class: 'nb-goal-name' }, r.name), el('div', { class: 'nb-goal-sub' }, [sub])]),
         r.end ? el('span', { class: 'nb-pill' }, 'festival') : el('div', { class: 'nb-bar nb-bar-mini' }, [el('div', { class: 'nb-bar-fill', style: `width:${pct}%` })])
@@ -4921,8 +4974,8 @@
     const noApt = rows.length - apt.length;
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
       el('div', { class: 'nb-card-title' }, `Ciudades aptas (${apt.length})`),
-      apt.length ? list : el('p', { class: 'nb-placeholder' }, 'Ninguna ciudad tiene Academia 30.'),
-      noApt ? el('p', { class: 'nb-placeholder nb-mt' }, `${noApt} ciudades con Academia < ${FESTIVAL_ACADEMY} (no pueden festejar).`) : null
+      apt.length ? list : el('p', { class: 'nb-placeholder' }, `Ninguna ciudad tiene Academia ${ACAD}.`),
+      noApt ? el('p', { class: 'nb-placeholder nb-mt' }, `${noApt} ciudades con Academia < ${ACAD} (no pueden festejar).`) : null
     ]));
 
     const logBox = el('div', { class: 'nb-log' });

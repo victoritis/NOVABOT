@@ -7,7 +7,7 @@
    ===================================================================================== */
 
 :root{
-  --nb-css-version:   "1.7.6";
+  --nb-css-version:   "1.7.7";
 
   /* superficies */
   --nb-bg:            #111419;
@@ -664,3 +664,6 @@
 #novabot-panel .nb-ex-off b{ color: var(--nb-text-faint); }
 #novabot-panel .nb-ex-name{ flex: 1; min-width: 0; font-size: 11.5px; color: var(--nb-text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #novabot-panel .nb-ex-trade{ display: inline-flex; align-items: center; gap: 3px; color: var(--nb-text-faint); font-size: 11px; }
+
+/* ---------- festival evento ---------- */
+#novabot-panel .nb-card-accent{ border-color: var(--nb-gold); box-shadow: inset 0 0 0 1px var(--nb-gold-soft); }
