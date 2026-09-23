@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.8.3
+// @version      1.8.5
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -9,7 +9,11 @@
 // @grant        GM_addStyle
 // @grant        GM_getResourceText
 // @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @connect      raw.githubusercontent.com
+// @connect      api.github.com
+// @connect      gist.githubusercontent.com
 // @grant        unsafeWindow
 // @run-at       document-idle
 // ==/UserScript==
@@ -50,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.8.3';
+  const VERSION = '1.8.5';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -176,6 +180,7 @@
 
   function saveState() {
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch {}
+    try { cloudMarkDirty(); } catch {}
   }
 
   let state = loadState();
@@ -554,6 +559,7 @@
       return tile;
     };
     bodyEl.appendChild(renderPriorityCard());
+    bodyEl.appendChild(renderCloudCard());
     bodyEl.appendChild(el('div', { class: 'nb-tiles' }, [
       mod('granjas', 'Granjas', state.granjas, 'Recolecta todas las aldeas'),
       mod('construccion', 'Construcción', state.construccion, 'Sube edificios por objetivos'),
@@ -1774,8 +1780,8 @@
   const PRIO_DEFAULT_ORDER = ['construccion', 'investigacion', 'reclutamiento', 'festivales'];
   const PRIO_MODES = {
     equilibrado: { label: 'Equilibrado', hint: 'El de siempre. Todos reciben a la vez; en cada ciudad gasta primero Construcción, luego Investigación, Reclutamiento y Festivales.' },
-    orden: { label: 'Personalizado · por orden', hint: 'Uno cada vez, en tu orden. Si el de arriba tiene la cola llena o nada que hacer, pasa al siguiente; cuando vuelve a tener hueco recupera el turno.' },
-    paralelo: { label: 'Personalizado · por niveles', hint: 'Pon a cada uno un nivel. Los del mismo nivel reciben recursos a la vez (en paralelo). Cuando todos los de un nivel tienen la cola llena o nada que hacer, pasa al nivel siguiente; en cuanto vuelven a tener hueco recuperan el turno.' }
+    orden: { label: 'Personalizado · por orden', hint: 'Uno cada vez, en tu orden. El comercio abastece primero al 1º en todas las ciudades; si en ninguna puede producir más (colas llenas o nada pendiente) pasa al siguiente, y cuando vuelve a tener hueco recupera el turno.' },
+    paralelo: { label: 'Personalizado · por niveles', hint: 'Pon a cada uno un nivel. Los del mismo nivel reciben recursos a la vez (en paralelo). El comercio abastece primero TODO lo del nivel 1 en todas las ciudades; solo cuando ninguna ciudad puede producir más en ese nivel (colas llenas o nada pendiente) pasa al nivel 2, y así sucesivamente.' }
   };
   // Presets antiguos → modos nuevos (una sola vez).
   const PRIO_OLD = {
@@ -2165,9 +2171,13 @@
     if (cfg.mode !== 'equilibrado') {
       // Por orden / por niveles: en cada ciudad solo piden (y reservan) los módulos del
       // nivel que tiene el turno (varios a la vez si comparten nivel).
-      const act = new Map();
-      const turn = (t) => { if (!act.has(t)) act.set(t, activeLevel(t)); return act.get(t); };
-      list = list.filter((d) => !d.module || prioLevel(d.module, cfg) === turn(d.townId));
+      // El turno es GLOBAL: mientras en CUALQUIER ciudad un módulo de nivel superior
+      // pueda producir (cola con hueco y algo pendiente), el comercio solo abastece ese
+      // nivel. Se pasa al siguiente cuando ninguna ciudad tiene nada que hacer en él
+      // (colas llenas o todo pedido).
+      let level = null;
+      for (const t of allTownIds()) { const L = activeLevel(t); if (L !== null && (level === null || L < level)) level = L; }
+      list = list.filter((d) => !d.module || prioLevel(d.module, cfg) === level);
     }
     return list.map((d) => ({ ...d, prio: d.module ? prioRank(d.module) : (d.prio ?? 9) }));
   }
@@ -3707,6 +3717,7 @@
   function atkSave() {
     // (los campos "_" son de esta sesión: precarga, armado… no se guardan)
     try { localStorage.setItem(ATK_KEY, JSON.stringify(atk.queue.map((a) => Object.fromEntries(Object.entries(a).filter(([k]) => !k.startsWith('_')))))); } catch {}
+    try { cloudMarkDirty(); } catch {}
   }
   const atkCorrection = () => clamp(+state.ataques?.correctionMs || 0, -1500, 1500);
 
@@ -4748,6 +4759,213 @@
     obj.ajaxPost = wrapped;
   }
 
+
+  /* ---------------------------------------------------------------------------------
+     9) SINCRONIZACIÓN EN LA NUBE (misma configuración en cualquier PC)
+     -----------------------------------------------------------------------------
+     Dónde: un Gist SECRETO de tu cuenta de GitHub ("NOVABOT sync"), un archivo por
+     mundo y jugador (novabot_<mundo>_<jugador>.json).
+     Seguridad:
+       · El token de GitHub (solo permiso "Gists") y la contraseña se guardan en el
+         almacenamiento privado de Tampermonkey de ESE PC: no van en el script ni en
+         GitHub, y la página del juego no puede leerlos.
+       · Los datos se CIFRAN (AES-GCM 256, clave PBKDF2 de tu contraseña) antes de
+         subirlos: quien viera el gist solo vería texto cifrado, y cualquier cambio
+         hecho por otro rompe el cifrado y se descarta.
+       · Lo que se descarga son solo datos (JSON): nunca se ejecuta nada, así que no
+         puede afectar al PC.
+     Qué se sincroniza: toda la configuración del bot (objetivos, colas, prioridad,
+     comercio…) y los ataques programados. NO: posición/tamaño del panel.
+     Al conectar: si ya hay datos en la nube se CARGAN; si no, se suben los de este PC.
+     Después: cada cambio se sube (a los 8 s) y cada 60 s se baja lo del otro PC.
+  --------------------------------------------------------------------------------- */
+  const CLOUD_LOCAL_ONLY = new Set(['open', 'activeTab', 'pos', 'fabPos', 'size', 'layoutV', 'resumenView']);
+  const gmGet = (k, d = '') => { try { return typeof GM_getValue === 'function' ? GM_getValue(k, d) : d; } catch { return d; } };
+  const gmSet = (k, v) => { try { if (typeof GM_setValue === 'function') GM_setValue(k, v); } catch {} };
+  const cloud = {
+    token: gmGet('nb_cloud_token'), pass: gmGet('nb_cloud_pass'), gistId: gmGet('nb_cloud_gist'),
+    pcId: gmGet('nb_pc_id') || (() => { const id = Math.random().toString(36).slice(2, 10); gmSet('nb_pc_id', id); return id; })(),
+    status: '', error: '', lastPush: 0, lastPull: 0, remoteAt: 0, dirty: false, applying: false, busy: false, pushTimer: null, pollTimer: null, started: false
+  };
+  const cloudOn = () => !!(cloud.token && cloud.pass && cloud.gistId);
+  const cloudFile = () => `novabot_${UW.Game?.world_id || 'mundo'}_${UW.Game?.player_id || 'jugador'}.json`;
+
+  function ghApi(method, path, body) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method, url: `https://api.github.com${path}`, timeout: 20000,
+        headers: { Authorization: `Bearer ${cloud.token}`, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json', 'X-GitHub-Api-Version': '2022-11-28' },
+        data: body ? JSON.stringify(body) : undefined,
+        onload: (r) => { let j = null; try { j = JSON.parse(r.responseText || 'null'); } catch {} (r.status >= 200 && r.status < 300) ? resolve(j) : reject(new Error(`GitHub ${r.status}${j?.message ? `: ${j.message}` : ''}`)); },
+        onerror: () => reject(new Error('Sin conexión con GitHub')), ontimeout: () => reject(new Error('GitHub no responde'))
+      });
+    });
+  }
+  function rawGet(url) {
+    return new Promise((resolve, reject) => GM_xmlhttpRequest({ method: 'GET', url, timeout: 20000, headers: { Authorization: `Bearer ${cloud.token}` },
+      onload: (r) => (r.status === 200 ? resolve(r.responseText) : reject(new Error(`GitHub ${r.status}`))), onerror: () => reject(new Error('Sin conexión')), ontimeout: () => reject(new Error('Tiempo agotado')) }));
+  }
+  // ---- cifrado (WebCrypto) ----
+  const b64 = (u8) => { let s = ''; for (const b of u8) s += String.fromCharCode(b); return btoa(s); };
+  const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+  async function cloudKey(salt) {
+    const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(cloud.pass), 'PBKDF2', false, ['deriveKey']);
+    return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: 200000, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+  }
+  async function cloudEncrypt(obj) {
+    const salt = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12));
+    const data = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, await cloudKey(salt), new TextEncoder().encode(JSON.stringify(obj)));
+    return JSON.stringify({ novabot: 1, alg: 'AES-GCM-256/PBKDF2-200k', salt: b64(salt), iv: b64(iv), data: b64(new Uint8Array(data)) });
+  }
+  async function cloudDecrypt(text) {
+    const o = JSON.parse(text);
+    if (!o?.novabot || !o.data) throw new Error('Formato desconocido en la nube');
+    try {
+      const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(o.iv) }, await cloudKey(unb64(o.salt)), unb64(o.data));
+      return JSON.parse(new TextDecoder().decode(plain));
+    } catch { throw new Error('No se pudo descifrar: contraseña distinta o datos alterados'); }
+  }
+  // ---- qué se sube / cómo se aplica ----
+  function cloudPayload() {
+    const st = {};
+    for (const [k, v] of Object.entries(state)) if (!CLOUD_LOCAL_ONLY.has(k)) st[k] = v;
+    const attacks = atk.queue.map((a) => Object.fromEntries(Object.entries(a).filter(([k]) => !k.startsWith('_'))));
+    return { v: 1, updatedAt: Date.now(), pcId: cloud.pcId, version: VERSION, state: st, attacks };
+  }
+  function cloudApply(r) {
+    if (!r || typeof r !== 'object' || typeof r.state !== 'object') return;
+    cloud.applying = true;
+    try {
+      const def = defaultState();
+      for (const [k, v] of Object.entries(r.state)) {
+        if (CLOUD_LOCAL_ONLY.has(k) || !(k in def)) continue;          // solo claves conocidas
+        if (typeof v !== typeof def[k] && def[k] !== null) continue;    // y del tipo esperado
+        state[k] = (v && typeof v === 'object' && !Array.isArray(v) && def[k] && typeof def[k] === 'object') ? { ...def[k], ...v } : v;
+      }
+      saveState();
+      if (Array.isArray(r.attacks)) {
+        const sending = atk.queue.filter((a) => a.status === 'sending');
+        for (const a of atk.queue) atkTimerClear(a.id);
+        atk.queue = [...r.attacks.filter((a) => a && typeof a === 'object' && a.id && !sending.some((x) => x.id === a.id)), ...sending];
+        atkSave();
+      }
+      cloud.remoteAt = +r.updatedAt || Date.now();
+    } finally { cloud.applying = false; }
+    if (bodyEl) renderIfIdle();
+  }
+  function cloudMarkDirty() {
+    if (cloud.applying || !cloudOn()) return;
+    cloud.dirty = true;
+    clearTimeout(cloud.pushTimer);
+    cloud.pushTimer = setTimeout(cloudPush, 8000);
+  }
+  async function cloudPush() {
+    if (!cloudOn() || cloud.busy) { if (cloudOn()) cloud.pushTimer = setTimeout(cloudPush, 5000); return; }
+    cloud.busy = true;
+    try {
+      const content = await cloudEncrypt(cloudPayload());
+      await ghApi('PATCH', `/gists/${cloud.gistId}`, { files: { [cloudFile()]: { content } } });
+      cloud.dirty = false; cloud.lastPush = Date.now(); cloud.error = ''; cloud.status = 'Sincronizado';
+    } catch (e) { cloud.error = e.message; cloud.pushTimer = setTimeout(cloudPush, 60000); }
+    finally { cloud.busy = false; paintCloudStatus(); }
+  }
+  async function cloudReadRemote() {
+    const g = await ghApi('GET', `/gists/${cloud.gistId}`);
+    const f = g?.files?.[cloudFile()];
+    if (!f) return null;
+    const text = f.truncated && f.raw_url ? await rawGet(f.raw_url) : f.content;
+    return cloudDecrypt(text);
+  }
+  async function cloudPull(force = false) {
+    if (!cloudOn() || cloud.busy) return;
+    cloud.busy = true;
+    try {
+      const r = await cloudReadRemote();
+      cloud.lastPull = Date.now(); cloud.error = '';
+      if (r && (force || (r.pcId !== cloud.pcId && +r.updatedAt > Math.max(cloud.remoteAt, cloud.lastPush) && !cloud.dirty))) {
+        cloudApply(r); cloud.status = `Cargado de la nube (${new Date(+r.updatedAt).toLocaleTimeString('es-ES')})`;
+      } else if (!r) { cloud.busy = false; await cloudPush(); return; }
+      else cloud.status = 'Sincronizado';
+    } catch (e) { cloud.error = e.message; }
+    finally { cloud.busy = false; paintCloudStatus(); }
+  }
+  // Conectar: busca (o crea) el gist secreto "NOVABOT sync". Si ya hay datos de esta
+  // cuenta, se CARGAN; si no, se suben los de este PC.
+  async function cloudConnect(token, pass) {
+    cloud.token = token.trim(); cloud.pass = pass;
+    cloud.error = ''; cloud.status = 'Conectando…'; paintCloudStatus();
+    try {
+      let gist = null;
+      for (let page = 1; page <= 5 && !gist; page++) {
+        const list = await ghApi('GET', `/gists?per_page=100&page=${page}`);
+        if (!Array.isArray(list) || !list.length) break;
+        gist = list.find((g) => g.description === 'NOVABOT sync') || null;
+      }
+      if (!gist) {
+        const content = await cloudEncrypt(cloudPayload());
+        gist = await ghApi('POST', '/gists', { description: 'NOVABOT sync', public: false, files: { [cloudFile()]: { content } } });
+        cloud.gistId = gist.id; cloud.lastPush = Date.now(); cloud.status = 'Conectado: configuración de este PC subida a la nube';
+      } else {
+        cloud.gistId = gist.id;
+        const r = await cloudReadRemote();
+        if (r) { cloudApply(r); cloud.status = 'Conectado: configuración cargada de la nube'; }
+        else { cloud.busy = false; await cloudPush(); cloud.status = 'Conectado: configuración de este PC subida a la nube'; }
+      }
+      gmSet('nb_cloud_token', cloud.token); gmSet('nb_cloud_pass', cloud.pass); gmSet('nb_cloud_gist', cloud.gistId);
+      startCloudSync();
+    } catch (e) { cloud.error = e.message; cloud.status = ''; cloud.gistId = ''; }
+    renderIfIdle('inicio'); paintCloudStatus();
+  }
+  function cloudDisconnect() {
+    clearTimeout(cloud.pushTimer); clearInterval(cloud.pollTimer); cloud.pollTimer = null; cloud.started = false;
+    cloud.token = cloud.pass = cloud.gistId = ''; cloud.status = ''; cloud.error = '';
+    gmSet('nb_cloud_token', ''); gmSet('nb_cloud_pass', ''); gmSet('nb_cloud_gist', '');
+    renderIfIdle('inicio');
+  }
+  function startCloudSync() {
+    if (!cloudOn() || cloud.started) return;
+    cloud.started = true;
+    cloudPull();
+    cloud.pollTimer = setInterval(() => cloudPull(), 60000);
+    window.addEventListener('beforeunload', () => { if (cloud.dirty) cloudPush(); });
+  }
+  let cloudStatusEl = null;
+  function paintCloudStatus() {
+    if (!cloudStatusEl) return;
+    cloudStatusEl.textContent = cloud.error ? `Error: ${cloud.error}` : cloud.busy ? 'Sincronizando…' : cloud.dirty ? 'Cambios pendientes de subir…'
+      : (cloud.status || 'Sincronizado') + (cloud.lastPull ? ` · última comprobación ${new Date(Math.max(cloud.lastPull, cloud.lastPush)).toLocaleTimeString('es-ES')}` : '');
+    cloudStatusEl.className = `nb-goal-sub${cloud.error ? ' nb-err' : ''}`;
+  }
+  function renderCloudCard() {
+    if (cloudOn()) {
+      cloudStatusEl = el('div', { class: 'nb-goal-sub' });
+      paintCloudStatus();
+      return el('div', { class: 'nb-card' }, [
+        el('div', { class: 'nb-card-title' }, 'Sincronización en la nube'),
+        el('div', { class: 'nb-row' }, [el('div', { class: 'nb-option-text' }, [el('span', { class: 'nb-option-label' }, `Conectada · ${cloudFile()}`), cloudStatusEl]),
+          el('span', { class: 'nb-btn-group' }, [
+            el('span', { class: 'nb-btn nb-btn-sm', onclick: () => cloudPull(true) }, 'Bajar de la nube'),
+            el('span', { class: 'nb-btn nb-btn-sm', onclick: () => { cloud.dirty = true; cloudPush(); } }, 'Subir ahora'),
+            el('span', { class: 'nb-btn nb-btn-sm', onclick: () => { if (confirm('¿Desconectar la nube en este PC? (los datos de la nube no se borran)')) cloudDisconnect(); } }, 'Desconectar')
+          ])]),
+        el('p', { class: 'nb-placeholder nb-mt' }, 'Usa el bot en un solo PC a la vez: si está abierto en dos, los dos actuarían (envíos, ataques…).')
+      ]);
+    }
+    cloudStatusEl = el('div', { class: 'nb-goal-sub' }); paintCloudStatus();
+    const tok = el('input', { class: 'nb-input', type: 'password', placeholder: 'Token de GitHub (solo permiso Gists)', autocomplete: 'off' });
+    const pw = el('input', { class: 'nb-input', type: 'password', placeholder: 'Contraseña para cifrar (la misma en todos tus PC)', autocomplete: 'new-password' });
+    return el('div', { class: 'nb-card' }, [
+      el('div', { class: 'nb-card-title' }, 'Sincronización en la nube (opcional)'),
+      el('p', { class: 'nb-placeholder' }, 'Guarda la configuración en un Gist SECRETO de tu GitHub, cifrada con tu contraseña, para tenerla igual en cualquier PC. Crea un token en github.com/settings/tokens (Fine-grained → Account permissions → Gists: Read and write; nada más).'),
+      el('div', { class: 'nb-field-row nb-mt' }, [tok, pw]),
+      el('div', { class: 'nb-row nb-mt' }, [cloudStatusEl, el('span', { class: 'nb-btn nb-btn-primary', onclick: () => {
+        if (!tok.value.trim()) return tok.focus();
+        if (pw.value.length < 8) { alert('La contraseña debe tener al menos 8 caracteres.'); return pw.focus(); }
+        cloudConnect(tok.value, pw.value);
+      } }, 'Conectar')])
+    ]);
+  }
+
   async function init() {
     await waitFor(() => !!document.body);
     buildUI();
@@ -4760,6 +4978,7 @@
     startRecruitEngine();
     startAttackEngine();
     startFestivalEngine();
+    waitFor(() => !!(UW.Game && UW.Game.player_id)).then(startCloudSync);
 
     // En cuanto el cliente del juego termine de cargar, refresca el nombre de ciudad.
     waitFor(() => !!(UW.Game && UW.ITowns)).then(() => {
