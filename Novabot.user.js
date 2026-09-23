@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.8.2
+// @version      1.8.3
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -50,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.8.2';
+  const VERSION = '1.8.3';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -383,6 +383,7 @@
   /* Vista general · Reclutamiento del bot: por ciudad, qué tropas se piden, cuánto
      falta, el lote siguiente (y si está listo), colas y hechizos. Solo lectura. */
   function renderResumenRecruit() {
+    if (overviewReady()) for (const id of allTownIds()) pruneRecruitGoals(id);
     const towns = allTownIds().filter((id) => townRecruitCfg(id).goals.length)
       .sort((a, b) => farmTownName(a).localeCompare(farmTownName(b), 'es'));
     const limit = buildQueueLimit();
@@ -3023,16 +3024,17 @@
     return null;
   }
 
-  // Objetivos cumplidos (ya tienes esas tropas, en casa o fuera): se quitan del bot.
+  // Objetivos cumplidos: en cuanto todo lo que faltaba está ya en la cola del juego (o
+  // hecho), el bot no tiene nada más que hacer → se quitan (como en Construcción).
   function pruneRecruitGoals(townId) {
     const cfg = townRecruitCfg(townId);
     if (!cfg.goals.length) return;
-    const have = townUnitsHave(townId);
-    const done = cfg.goals.filter((g) => (+have[g.id] || 0) >= g.target);
+    const have = townUnitsHave(townId), queued = queuedUnits(townId);
+    const done = cfg.goals.filter((g) => (+have[g.id] || 0) + (+queued[g.id] || 0) >= g.target);
     if (!done.length) return;
     cfg.goals = cfg.goals.filter((g) => !done.includes(g));
     saveState();
-    recruitLog(`${farmTownName(townId)}: completado ${done.map((g) => `${g.target} ${unitName(g.id)}`).join(', ')} (se quita del bot).`, 'ok');
+    recruitLog(`${farmTownName(townId)}: ${done.map((g) => `${g.target} ${unitName(g.id)}`).join(', ')} ya en cola del juego o hechas (se quita del bot).`, 'ok');
   }
 
   async function recruitTick() {
@@ -3108,6 +3110,7 @@
   function renderReclutamientoTab() {
     const cfg = state.reclutamiento;
     const townId = +UW.Game?.townId || allTownIds()[0];
+    if (overviewReady()) pruneRecruitGoals(townId);
     const tcfg = townRecruitCfg(townId);
     if (realCostsStale(townId) && !renderReclutamientoTab.loading) {
       renderReclutamientoTab.loading = true;
