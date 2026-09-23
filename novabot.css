@@ -7,7 +7,7 @@
    ===================================================================================== */
 
 :root{
-  --nb-css-version:   "1.6.6";
+  --nb-css-version:   "1.6.8";
 
   /* superficies */
   --nb-bg:            #111419;
@@ -550,3 +550,35 @@
 /* aviso de héroe: retrato + texto seguido (sin repartir por la fila) */
 #novabot-panel .nb-hero-note{ display: flex; align-items: center; justify-content: flex-start; gap: 10px; text-align: left; }
 #novabot-panel .nb-hero-note > span:last-child{ flex: 1 1 auto; min-width: 0; }
+
+/* ---------- Vista general ---------- */
+#novabot-panel .nb-ov-wrap{ overflow-x: auto; }
+#novabot-panel .nb-ov{ width: 100%; border-collapse: separate; border-spacing: 0; font-size: 11.5px; }
+#novabot-panel .nb-ov th{ position: sticky; top: 0; background: var(--nb-surface); text-align: left; font-size: 10px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; color: var(--nb-text-faint); padding: 6px 8px; border-bottom: 1px solid var(--nb-border); white-space: nowrap; }
+#novabot-panel .nb-ov td{ padding: 7px 8px; border-bottom: 1px solid var(--nb-border-soft); vertical-align: top; color: var(--nb-text-dim); }
+#novabot-panel .nb-ov tbody tr:hover td{ background: rgba(255,255,255,.025); }
+#novabot-panel .nb-ov-current td{ background: var(--nb-gold-soft); }
+#novabot-panel .nb-ov-town{ color: var(--nb-text) !important; font-weight: 700; white-space: nowrap; }
+#novabot-panel .nb-ov-cell{ display: flex; flex-direction: column; gap: 3px; }
+#novabot-panel .nb-ov-cell > div{ display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+#novabot-panel .nb-ov-cell .nb-icon-sm{ width: 18px; height: 18px; margin-right: 0; }
+#novabot-panel .nb-ov-cell .nb-icon-sm > span{ transform: scale(.45); }
+#novabot-panel .nb-ov-count{ color: var(--nb-text); font-weight: 700; font-variant-numeric: tabular-nums; }
+#novabot-panel .nb-ov-time{ color: var(--nb-gold-bright); font-variant-numeric: tabular-nums; }
+#novabot-panel .nb-ov-dim{ color: var(--nb-text-faint); font-size: 10.5px; }
+
+/* ---------- selectores con imagen (héroe / hechizo) ---------- */
+#novabot-panel .nb-chip-label{ font-size: 11px; font-weight: 700; color: var(--nb-text-dim); margin-bottom: 6px; }
+#novabot-panel .nb-chips{ display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 6px; }
+#novabot-panel .nb-chip{ display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: var(--nb-radius-sm); cursor: pointer;
+  background: var(--nb-surface-2); border: 1px solid transparent; transition: border-color .12s, background .12s; }
+#novabot-panel .nb-chip:hover{ background: var(--nb-surface-3); border-color: var(--nb-border); }
+#novabot-panel .nb-chip.active{ border-color: var(--nb-gold); background: var(--nb-gold-soft); }
+#novabot-panel .nb-chip-text{ display: flex; flex-direction: column; min-width: 0; line-height: 1.2; }
+#novabot-panel .nb-chip-text b{ color: var(--nb-text); font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#novabot-panel .nb-chip-text small{ color: var(--nb-text-faint); font-size: 10px; }
+#novabot-panel .nb-chip-none{ width: 25px; height: 25px; display: flex; align-items: center; justify-content: center; border-radius: 5px; background: rgba(255,255,255,.05); color: var(--nb-text-faint); flex: none; }
+#novabot-panel .nb-icon-30{ width: 30px; height: 30px; border-radius: 6px; }
+/* rango de llegada */
+#novabot-panel .nb-range{ display: flex; flex-direction: column; gap: 8px; margin-top: 8px; padding: 8px; border-radius: var(--nb-radius-sm); background: var(--nb-surface-2); }
+#novabot-panel .nb-range .nb-input-time{ max-width: 160px; font-size: 15px; height: 34px; }

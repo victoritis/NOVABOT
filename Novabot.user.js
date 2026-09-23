@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.6.8
+// @version      1.7.1
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -50,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.6.8';
+  const VERSION = '1.7.1';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -59,6 +59,7 @@
 
   const TABS = [
     { id: 'inicio',      label: 'Inicio',        icon: 'home',   disabled: false },
+    { id: 'resumen',     label: 'Vista general', icon: 'grid',   disabled: false },
     { id: 'granjas',     label: 'Granjas',       icon: 'farm',   disabled: false },
     { id: 'construccion', label: 'Construcción', icon: 'build',  disabled: false },
     { id: 'reclutamiento', label: 'Reclutamiento', icon: 'shield', disabled: false },
@@ -87,9 +88,9 @@
       else if (k.startsWith('on') && typeof v === 'function') node.addEventListener(k.slice(2), v);
       else if (v !== null && v !== undefined) node.setAttribute(k, v);
     }
-    for (const c of [].concat(children)) {
-      if (c === null || c === undefined) continue;
-      node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+    for (const c of [].concat(children).flat(Infinity)) {
+      if (c === null || c === undefined || c === false) continue;
+      node.appendChild(typeof c === 'string' || typeof c === 'number' ? document.createTextNode(String(c)) : c);
     }
     return node;
   }
@@ -231,6 +232,7 @@
   --------------------------------------------------------------------------------- */
   const ICON = {
     logo: '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 3 7v2h18V7L12 2Z"/><path d="M5 10v9M9 10v9M15 10v9M19 10v9"/><path d="M3 21h18"/></svg>',
+    grid: '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>',
     home: '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m3 11 9-8 9 8"/><path d="M5 10v10h14V10"/></svg>',
     build: '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 6l4 4-9 9H5v-4l9-9Z"/><path d="M13 7l4 4"/></svg>',
     shield: '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4 6v6c0 5 3.4 7.9 8 9 4.6-1.1 8-4 8-9V6l-8-3Z"/></svg>',
@@ -342,6 +344,8 @@
 
     if (state.activeTab === 'inicio') {
       renderInicioTab();
+    } else if (state.activeTab === 'resumen') {
+      renderResumenTab();
     } else if (state.activeTab === 'festivales') {
       renderFestivalesTab();
     } else if (state.activeTab === 'ataques') {
@@ -363,6 +367,58 @@
 
   // Resumen: una tarjeta por módulo con su estado, interruptor y dato clave.
   // Clic en la tarjeta = ir a la pestaña.
+  /* Vista general: una fila por ciudad con lo que está en curso (solo lectura). */
+  function renderResumenTab() {
+    const now = Date.now();
+    const transit = (() => { try { return transitRows(); } catch { return []; } })();
+    const cd = (ms) => el('b', { class: 'nb-ov-time', 'data-nb-until': Math.round(ms / 1000) }, formatLeft(Math.round(ms / 1000)));
+    const dim = (t) => el('span', { class: 'nb-ov-dim' }, t);
+    const towns = allTownIds().sort((a, b) => farmTownName(a).localeCompare(farmTownName(b), 'es'));
+    const limit = buildQueueLimit();
+    const rows = towns.map((id) => {
+      // Construcción: cola del juego (lo primero que termina) + objetivos del bot
+      const bo = townBuildOrders(id).slice().sort((a, b) => (+a.to_be_completed_at || 0) - (+b.to_be_completed_at || 0));
+      const goals = townBuildCfg(id).goals.length;
+      const build = el('div', { class: 'nb-ov-cell' }, [
+        el('div', {}, [el('span', { class: 'nb-ov-count' }, `${bo.length}/${limit}`), bo[0] ? [' ', buildingName(bo[0].building_type), ' ', cd(+bo[0].to_be_completed_at * 1000)] : dim(' sin cola')]),
+        goals ? dim(`${goals} objetivo(s) en el bot${buildEnabledFor(id) ? '' : ' · desactivado'}`) : null
+      ]);
+      // Reclutamiento: Cuartel y Puerto
+      const uo = (() => { try { return townUnitOrders(id); } catch { return []; } })();
+      const kindCell = (naval) => {
+        const list = uo.filter((o) => (o.kind === 'naval') === naval).sort((a, b) => +a.to_be_completed_at - +b.to_be_completed_at);
+        const last = list[list.length - 1];
+        return el('div', {}, [buildingIcon(naval ? 'docks' : 'barracks', true), el('span', { class: 'nb-ov-count' }, `${list.length}/${limit}`),
+          last ? [' hasta ', cd(+last.to_be_completed_at * 1000)] : dim(' libre')]);
+      };
+      const rc = townRecruitCfg(id);
+      const recState = !rc.goals.length ? null : !recruitOnFor(id) ? 'bot: desactivado' : rc.hold ? 'bot: en espera' : +rc.startAt > now ? 'bot: programado' : 'bot: activo';
+      const recruit = el('div', { class: 'nb-ov-cell' }, [kindCell(false), kindCell(true), recState ? dim(recState) : null]);
+      // Festival
+      const fEnd = festivalEnd(id);
+      const fest = el('div', { class: 'nb-ov-cell' }, [fEnd ? el('div', {}, ['En curso ', cd(fEnd)]) : canFestival(id) ? dim('apta, sin festival') : dim('—')]);
+      // Comercio: lo que llega
+      const inc = transit.filter((r) => r.to === id);
+      const nextInc = inc.slice().sort((a, b) => a.arrival - b.arrival)[0];
+      const trade = el('div', { class: 'nb-ov-cell' }, [inc.length ? el('div', {}, [el('span', { class: 'nb-ov-count' }, String(inc.length)), ' en camino · 1º ', cd(nextInc.arrival)]) : dim('—')]);
+      // Ataques del bot que salen de esta ciudad
+      const atks = atk.queue.filter((a) => +a.source === id && a.status === 'pending').sort((a, b) => a.executeAt - b.executeAt);
+      const attacks = el('div', { class: 'nb-ov-cell' }, [atks.length ? el('div', {}, [el('span', { class: 'nb-ov-count' }, String(atks.length)), ' · sale ', el('b', { 'data-atk-at': atks[0].executeAt }, fmtCount(atks[0].executeAt - srvNow()))]) : dim('—')]);
+      const cur = +UW.Game?.townId === id;
+      return el('tr', { class: cur ? 'nb-ov-current' : '' }, [
+        el('td', { class: 'nb-ov-town' }, farmTownName(id)),
+        el('td', {}, build), el('td', {}, recruit), el('td', {}, fest), el('td', {}, trade), el('td', {}, attacks)
+      ]);
+    });
+    const head = el('tr', {}, ['Ciudad', 'Construcción', 'Reclutamiento', 'Festival', 'Llega (comercio)', 'Ataques del bot'].map((h) => el('th', {}, h)));
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+      el('div', { class: 'nb-card-title' }, `Vista general · ${towns.length} ciudades`),
+      el('div', { class: 'nb-ov-wrap' }, [el('table', { class: 'nb-ov' }, [el('thead', {}, [head]), el('tbody', {}, rows)])]),
+      el('p', { class: 'nb-placeholder nb-mt' }, 'Solo lectura. Se actualiza al abrir la pestaña; las cuentas atrás van solas.')
+    ]));
+    updateCountdown();
+  }
+
   function renderInicioTab() {
     const townId = +UW.Game?.townId;
     bodyEl.appendChild(el('div', { class: 'nb-card nb-hero' }, [
@@ -954,7 +1010,8 @@
       });
       const anyBooty = towns.some((id) => farmTownData(id).booty_researched);
       const seconds = anyBooty ? booty : base;
-      farmRuntime.nextCycleAt = Date.now() + seconds * 1000 + randomDelayMs();
+      farmRuntime.lastClaim = { at: Date.now(), booty: anyBooty, delay: randomDelayMs() };
+      farmRuntime.nextCycleAt = Date.now() + seconds * 1000 + farmRuntime.lastClaim.delay;
       farmLog(`Recogidas ${towns.length} ciudades de una vez (${Math.round(seconds / 60)} min). Próximo a las ${new Date(farmRuntime.nextCycleAt).toLocaleTimeString('es-ES')}.`, 'ok');
     } catch (e) {
       farmRuntime.nextCycleAt = Date.now() + 60000;
@@ -1057,7 +1114,18 @@
     ['10 min', '40 min', '3 horas', '8 horas'].forEach((label, i) => {
       tierRow.appendChild(el('div', {
         class: `nb-btn${cfg.tier === i ? ' active' : ''}`,
-        onclick: () => { cfg.tier = i; saveState(); renderBody(); }
+        onclick: () => {
+          cfg.tier = i; saveState();
+          // Si ya se recogió, el próximo ciclo pasa a contar con el tiempo NUEVO desde
+          // la última recogida (no se queda con el que había antes).
+          const lc = farmRuntime.lastClaim;
+          if (lc && farmRuntime.nextCycleAt > Date.now()) {
+            const secs = (lc.booty ? FARM_TIME_SETS.booty : FARM_TIME_SETS.normal)[clamp(i, 0, 3)];
+            farmRuntime.nextCycleAt = lc.at + secs * 1000 + lc.delay;
+            farmLog(`Tiempo cambiado: próximo ciclo a las ${new Date(Math.max(Date.now(), farmRuntime.nextCycleAt)).toLocaleTimeString('es-ES')}.`, 'info');
+          }
+          renderBody(); updateCountdown();
+        }
       }, label));
     });
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
@@ -3069,6 +3137,17 @@
   }
   function heroesIn(townId) { return heroModels().map((m) => ({ id: heroIdOf(m), town: heroTownOf(m), level: +mval(m, 'level') || null })).filter((h) => h.id && h.town === +townId); }
   const heroName = (id) => UW.GameData?.heroes?.[id]?.name || String(id).replace(/_/g, ' ');
+  // Hechizos que se pueden lanzar al enviar: poderes de dios que se aplican a una
+  // orden propia (targets: target_command / target_support_command), no negativos,
+  // y solo del dios de la ciudad de origen (es el favor que se gasta).
+  function attackSpells(sourceId, type) {
+    const god = townGod(sourceId);
+    const need = type === 'support' ? 'target_support_command' : 'target_command';
+    return Object.entries(UW.GameData?.powers || {})
+      .filter(([, d]) => d && typeof d.name === 'string' && d.god_id && d.god_id === god && !d.negative && !d.is_fake_power && [].concat(d.targets || []).includes(need))
+      .map(([k, d]) => ({ id: k, name: d.name, cost: +d.favor || 0, god: d.god_id }))
+      .sort((a, b) => a.cost - b.cost);
+  }
   function powerList() {
     const out = new Map();
     for (const src of [UW.GameData?.powers, UW.GameData?.god_powers].filter(Boolean)) {
@@ -3229,39 +3308,84 @@
     return Math.abs(vals[0] - expectedMs) < 6 * 3600000 ? vals[0] : null;
   }
 
+  // Id de la orden creada (para poder cancelarla): el objeto de la respuesta que
+  // trae esa llegada y su command_id / id.
+  function commandIdFromResponse(res, arrivalMs) {
+    let txt = ''; try { txt = JSON.stringify(res).replace(/\\/g, ''); } catch {}
+    const want = Math.round(arrivalMs / 1000);
+    for (const m of txt.matchAll(/\{[^{}]*"arrival_at"\s*:\s*"?(\d{10})"?[^{}]*\}/g)) {
+      if (Math.abs(+m[1] - want) > 1) continue;
+      const id = /"command_id"\s*:\s*"?(\d+)/.exec(m[0]) || /"id"\s*:\s*"?(\d+)/.exec(m[0]);
+      if (id) return +id[1];
+    }
+    return null;
+  }
+  // Último momento (hora del servidor) en que aún tiene sentido enviar.
+  const atkLastSend = (a) => (a.windowEnd ? a.windowEnd + 999 - a.duration : a.executeAt + ATK_MISS_TOLERANCE_MS);
+
   async function atkFire(a) {
     if (a.status !== 'pending') return;
     // El temporizador puede dispararse tarde (PC en reposo, pestaña congelada): no se envía tarde.
     const late = srvNow() - a.executeAt;
-    if (late > ATK_MISS_TOLERANCE_MS) {
+    if (srvNow() > atkLastSend(a)) {
       a.status = 'missed'; a.error = `No se envió: la hora de salida pasó hace ${fmtDur(late)} (¿página cerrada o PC en reposo?).`;
       atkLog(`${farmTownName(a.source)} → ${a.targetName}: perdido (no se envía tarde).`, 'error');
       delete a._pre; delete a._armed; atkSave(); atkRefreshQueue(); return;
     }
     a.status = 'sending'; atkRefreshQueue();
+    const retry = !!a.windowEnd && (a.method === 'ultra' || a.method === 'human');
+    const inWindow = (t) => !a.windowEnd || (t >= a.wantAt && t < a.windowEnd + 1000);
+    a.attempts = 0;
     try {
-      let pre = a._pre;
-      if (!pre || Date.now() - pre.at > 20000) {
-        const info = await attackInfo(a.source, a.target, 0);
-        pre = { at: Date.now(), ...buildPayload(a, info) };
-      }
-      const res = await gpPostAs(a.source, 'town_info', 'send_units', pre.payload);
-      a.status = 'sent'; a.sentAt = srvNow();
-      if (pre.missing.length) a.note = `Enviado con menos tropas: ${pre.missing.join(', ')}`;
-      const expected = a.executeAt + a.duration;
-      const real = arrivalFromResponse(res, expected);
-      if (real) {
-        a.realArrival = real;
-        const errS = Math.round((real - expected) / 1000);
-        a.arrivalErr = errS;
-        // Auto-corrección: si llegó 1 s tarde/pronto, adelantar/retrasar los próximos.
-        // (solo con el reloj bien sincronizado; si no, el error sería del reloj, no del disparo)
-        if (errS !== 0 && Math.abs(errS) <= 2 && clockOffset().err < 250) {
-          state.ataques.correctionMs = clamp(atkCorrection() + (errS > 0 ? 250 : -250), -1500, 1500);
-          saveState();
+      for (;;) {
+        a.attempts += 1;
+        let pre = a.attempts === 1 ? a._pre : null;
+        if (!pre || Date.now() - pre.at > 20000) {
+          const info = await attackInfo(a.source, a.target, 0);
+          pre = { at: Date.now(), ...buildPayload(a, info) };
         }
+        const sentLocal = Date.now();
+        const res = await gpPostAs(a.source, 'town_info', 'send_units', pre.payload);
+        const expected = a.executeAt + a.duration;
+        const real = arrivalFromResponse(res, expected);
+        if (!retry || !real || inWindow(real)) {
+          a.status = 'sent'; a.sentAt = srvNow();
+          if (pre.missing.length) a.note = `Enviado con menos tropas: ${pre.missing.join(', ')}`;
+          if (real) {
+            a.realArrival = real;
+            const errS = Math.round((real - expected) / 1000);
+            a.arrivalErr = a.windowEnd ? (inWindow(real) ? 0 : errS) : errS;
+            // Auto-corrección (solo envío único y con el reloj bien sincronizado).
+            if (!retry && errS !== 0 && Math.abs(errS) <= 2 && clockOffset().err < 250) {
+              state.ataques.correctionMs = clamp(atkCorrection() + (errS > 0 ? 250 : -250), -1500, 1500);
+              saveState();
+            }
+          }
+          const tries = a.attempts > 1 ? ` · ${a.attempts} intentos` : '';
+          atkLog(`${farmTownName(a.source)} → ${a.targetName}: ${a.type === 'support' ? 'apoyo' : 'ataque'} enviado${real ? ` · llega ${fmtClock(real)}${a.windowEnd ? (inWindow(real) ? ' ✓ dentro del rango' : ' (fuera del rango)') : a.arrivalErr ? ` (${a.arrivalErr > 0 ? '+' : ''}${a.arrivalErr} s)` : ' ✓ exacto'}` : ''}${tries}.`, 'ok');
+          break;
+        }
+        // Fuera del rango: cancelar y reintentar si aún da tiempo.
+        const cmd = commandIdFromResponse(res, real);
+        if (!cmd) {
+          a.status = 'sent'; a.sentAt = srvNow(); a.realArrival = real;
+          a.note = 'Llegada fuera del rango y no se pudo identificar la orden para cancelarla.';
+          atkLog(`${farmTownName(a.source)} → ${a.targetName}: llega ${fmtClock(real)}, fuera del rango (no se pudo cancelar).`, 'error');
+          break;
+        }
+        await gpPostAs(a.source, 'command_info', 'cancel_command', { id: cmd });
+        const away = Date.now() - sentLocal; // las tropas tardan lo mismo en volver
+        atkLog(`${farmTownName(a.source)} → ${a.targetName}: intento ${a.attempts} llegaba ${fmtClock(real)} → cancelado.`, 'info');
+        if (real >= a.windowEnd + 1000) throw new Error(`Llegaba ${fmtClock(real)}, después del rango: ya no se puede acertar.`);
+        if (a.attempts >= 60) throw new Error('Demasiados intentos sin acertar el rango.');
+        let wait = away + 300 + (a.method === 'human' ? 1000 + Math.random() * 1500 : 100 + Math.random() * 200);
+        // Si llegaba antes del rango, esperar al momento ideal de salida.
+        const ideal = a.wantAt - a.duration + ATK_INTO_SECOND_MS - clockOffset().off - latencyOneWay();
+        wait = Math.max(wait, ideal - Date.now());
+        if (srvNow() + wait > atkLastSend(a)) throw new Error('Ya no da tiempo a acertar el rango.');
+        atkRefreshQueue();
+        await sleep(wait);
       }
-      atkLog(`${farmTownName(a.source)} → ${a.targetName}: ${a.type === 'support' ? 'apoyo' : 'ataque'} enviado${real ? ` · llega ${fmtClock(real)}${a.arrivalErr ? ` (${a.arrivalErr > 0 ? '+' : ''}${a.arrivalErr} s)` : ' ✓ exacto'}` : ''}.`, 'ok');
     } catch (e) {
       a.status = /configurado para no enviar/.test(e.message) ? 'skipped' : 'error';
       a.error = e.message;
@@ -3293,7 +3417,7 @@
     for (const a of atk.queue) {
       if (a.status !== 'pending') continue;
       const left = a.executeAt - now;
-      if (left < -ATK_MISS_TOLERANCE_MS) {
+      if (now > atkLastSend(a)) {
         a.status = 'missed'; a.error = `No se envió: la hora de salida pasó hace ${fmtDur(-left)} (¿página cerrada o PC en reposo?).`;
         atkLog(`${farmTownName(a.source)} → ${a.targetName}: perdido (no se envía tarde).`, 'error');
         atkSave(); atkRefreshQueue(); continue;
@@ -3467,7 +3591,14 @@
         executeAt = wantAt; arrivalAt = wantAt + t.ms;
       }
     }
-    return { ms: t.ms, slow: t.slow, executeAt, arrivalAt, wantAt, note };
+    // Fin del rango (solo al fijar la llegada): la misma hora o una posterior.
+    let windowEnd = null;
+    const u = normTime(f.until || '');
+    if (f.mode === 'arrival' && wantAt && /^\d{2}:\d{2}:\d{2}$/.test(u)) {
+      windowEnd = nextWallTime(u, wantAt - 1000);
+      if (windowEnd - wantAt > 3600000) windowEnd = null; // rango absurdo (> 1 h): se ignora
+    }
+    return { ms: t.ms, slow: t.slow, executeAt, arrivalAt, wantAt, windowEnd, note };
   }
 
   function atkPaintPlan() {
@@ -3508,6 +3639,7 @@
       id: `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`, source: +f.source, target: +f.target.id,
       targetName: f.target.name + (f.target.player ? ` (${f.target.player})` : ''), type: f.type, strategy: f.strategy,
       units, hero: f.hero, spell: f.spell, mode: f.mode, wantAt: plan.wantAt, duration: plan.ms,
+      windowEnd: plan.windowEnd || null, method: plan.windowEnd ? (f.method || 'exact') : 'exact',
       executeAt: plan.executeAt, arrivalAt: plan.arrivalAt, onMissing: f.onMissing, status: 'pending',
       note: plan.note || '', error: '', createdAt: Date.now()
     };
@@ -3644,14 +3776,23 @@
     }
 
     // 5) Héroe / hechizo
-    const heroSel = el('select', { class: 'nb-input' });
-    heroSel.appendChild(el('option', { value: '' }, 'Sin héroe'));
-    for (const h of heroesIn(f.source)) { const o = el('option', { value: h.id }, `${heroName(h.id)}${h.level ? ` · nv ${h.level}` : ''}`); if (h.id === f.hero) o.selected = true; heroSel.appendChild(o); }
-    heroSel.addEventListener('change', () => { f.hero = heroSel.value; atkPaintPlan(); });
-    const spellSel = el('select', { class: 'nb-input' });
-    spellSel.appendChild(el('option', { value: '' }, 'Sin hechizo'));
-    for (const p of powerList()) { const o = el('option', { value: p.id }, `${p.name}${p.cost ? ` · ${p.cost} favor` : ''}`); if (p.id === f.spell) o.selected = true; spellSel.appendChild(o); }
-    spellSel.addEventListener('change', () => { f.spell = spellSel.value; });
+    // Selectores con imagen (fichas): héroes de la ciudad de origen y hechizos de su dios.
+    const chip = (active, icon, title, sub, onclick) => el('div', { class: `nb-chip${active ? ' active' : ''}`, onclick }, [icon, el('div', { class: 'nb-chip-text' }, [el('b', {}, title), sub ? el('small', {}, sub) : null])]);
+    const noneIcon = () => el('span', { class: 'nb-chip-none' }, '∅');
+    const heroes = heroesIn(f.source);
+    if (f.hero && !heroes.some((h) => h.id === f.hero)) f.hero = '';
+    const heroSel = el('div', { class: 'nb-chips' }, [
+      chip(!f.hero, noneIcon(), 'Sin héroe', null, () => { f.hero = ''; renderBody(); }),
+      ...heroes.map((h) => chip(f.hero === h.id, el('span', { class: `nb-icon nb-icon-25 hero_icon hero25x25 ${h.id}` }), heroName(h.id), h.level ? `nivel ${h.level}` : null, () => { f.hero = h.id; renderBody(); }))
+    ]);
+    const spells = attackSpells(f.source, f.type);
+    if (f.spell && !spells.some((p) => p.id === f.spell)) f.spell = '';
+    const favorNow = Math.floor(godFavor(townGod(f.source)));
+    const spellSel = el('div', { class: 'nb-chips' }, [
+      chip(!f.spell, noneIcon(), 'Sin hechizo', null, () => { f.spell = ''; renderBody(); }),
+      ...spells.map((p) => chip(f.spell === p.id, el('span', { class: `nb-icon nb-icon-30 power_icon30x30 ${p.id}` }), p.name, `${p.cost} favor${p.cost > favorNow ? ' · falta favor' : ''}`, () => { f.spell = p.id; renderBody(); }))
+    ]);
+    if (!spells.length) spellSel.appendChild(el('span', { class: 'nb-placeholder' }, townGod(f.source) ? 'Tu dios no tiene hechizos para esta orden.' : 'La ciudad no tiene dios.'));
 
     // 6) Hora
     const modeSeg = el('div', { class: 'nb-seg' }, [['arrival', 'Llegar a las'], ['departure', 'Salir a las']].map(([m, l]) =>
@@ -3676,6 +3817,21 @@
       el('span', { class: 'nb-mini', onclick: () => shift(60) }, '+1m'),
       el('span', { class: 'nb-mini', onclick: () => shift(600) }, '+10m')
     ]);
+
+    // Rango de llegada + método de envío (solo con "Llegar a las")
+    const untilIn = el('input', { class: 'nb-input nb-input-time', type: 'text', inputmode: 'numeric', placeholder: 'hasta (opcional)', value: f.until || '', maxlength: '8' });
+    untilIn.addEventListener('input', () => { f.until = untilIn.value; atkPaintPlan(); });
+    untilIn.addEventListener('blur', () => { const n = normTime(untilIn.value); if (untilIn.value && n !== untilIn.value) { untilIn.value = n; f.until = n; atkPaintPlan(); } });
+    const methodSeg = el('div', { class: 'nb-seg nb-seg-sm' }, [
+      ['exact', 'Preciso (1 envío)'], ['ultra', 'Ultra (envía y cancela rápido)'], ['human', 'Humano (reintenta cada 1-2 s)']
+    ].map(([v, l]) => el('span', { class: `nb-seg-btn${(f.method || 'exact') === v ? ' active' : ''}`, onclick: () => { f.method = v; renderBody(); } }, l)));
+    const rangeBox = f.mode === 'arrival' ? el('div', { class: 'nb-range' }, [
+      el('div', { class: 'nb-time-row' }, [el('span', { class: 'nb-row-label' }, 'Rango aceptado: de la hora de arriba hasta'), untilIn]),
+      methodSeg,
+      el('p', { class: 'nb-placeholder' }, (f.method || 'exact') === 'exact'
+        ? 'Un solo envío calculado al milisegundo.'
+        : 'Envía; si la llegada cae fuera del rango, cancela la orden y vuelve a intentarlo (esperando a que vuelvan las tropas) hasta acertar o hasta que ya no dé tiempo.')
+    ]) : null;
 
     atkPlanEl = el('div', { class: 'nb-plan' });
 
@@ -3710,9 +3866,10 @@
           el('span', { class: 'nb-mini', onclick: () => setUnits(() => false) }, 'Ninguna')
         ]),
         grid,
-        el('div', { class: 'nb-field-row nb-mt' }, [el('label', { class: 'nb-field' }, ['Héroe', heroSel]), el('label', { class: 'nb-field' }, ['Hechizo', spellSel])])
+        el('div', { class: 'nb-mt nb-chip-label' }, 'Héroe'), heroSel,
+        el('div', { class: 'nb-mt nb-chip-label' }, `Hechizo${townGod(f.source) ? ` (${UW.GameData?.gods?.[townGod(f.source)]?.name || townGod(f.source)} · ${favorNow} favor)` : ''}`), spellSel
       ] : el('p', { class: 'nb-placeholder' }, 'No hay tropas en esta ciudad.')),
-      section(5, 'Hora del servidor', [modeSeg, el('div', { class: 'nb-time-row' }, [timeIn, quick])]),
+      section(5, 'Hora del servidor', [modeSeg, el('div', { class: 'nb-time-row' }, [timeIn, quick]), rangeBox]),
       atkPlanEl,
       el('div', { class: 'nb-options' }, [
         el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Si faltan tropas al salir'), missSeg]),
