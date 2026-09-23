@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.5.2
+// @version      1.5.3
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -50,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.5.2';
+  const VERSION = '1.5.3';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -334,7 +334,7 @@
       metrics = {
         granjas: el('span', { 'data-nb-countdown': '' }, '—'),
         construccion: `${goalsBuild} objetivos · ${buildQueueLimit()} huecos de cola`,
-        reclutamiento: `${goalsRec} ciudades con tropas pedidas`,
+        reclutamiento: (() => { const sch = allTownIds().filter((id) => +townRecruitCfg(id).startAt > Date.now()).length; return `${goalsRec} ciudades con tropas pedidas${sch ? ` · ${sch} programada(s)` : ''}`; })(),
         comercio: `${transit} en camino · ${needs} ciudades esperando`,
         festivales: (() => { const apt = allTownIds().filter(canFestival); const on = apt.filter((id) => festivalEnd(id)).length; return `${on}/${apt.length} con festival`; })()
       };
@@ -2105,11 +2105,48 @@
     return heroArrivalsIn(townId).some((t) => t > c.at && t <= Date.now()); // un héroe llegó después de la última lectura
   }
 
+  /* Héroes que abaratan tropas. El % sale de los datos del propio juego:
+     GameData.heroes[tipo].description_args["1"] = { value, level_mod } → % = value + level_mod × nivel
+     (Aristóteles nivel 11: 0,20 + 0,02 × 11 = 42 %). Tropas afectadas: tabla conocida
+     y, si no está, se deducen del texto del héroe ("costes … de las <tropa>"). */
+  const HERO_UNIT_DISCOUNT = { aristotle: ['attack_ship'] };
+  function heroCostBonuses(townId) {
+    const out = [];
+    try {
+      const models = [].concat(UW.MM.getCollections().PlayerHero || []).flatMap((c) => c?.models || []).map((m) => m.attributes);
+      for (const h of models) {
+        if (+h.home_town_id !== +townId || (h.assignment_type && h.assignment_type !== 'town')) continue;
+        const gd = UW.GameData?.heroes?.[h.type];
+        const arg = gd?.description_args?.['1'];
+        const desc = String(gd?.description || '').toLowerCase();
+        if (!arg || !/cost/.test(desc)) continue;
+        let units = HERO_UNIT_DISCOUNT[h.type];
+        if (!units) {
+          units = Object.entries(UW.GameData?.units || {}).filter(([, u]) => [u.name, u.name_plural].filter(Boolean).some((n) => desc.includes(String(n).toLowerCase()))).map(([id]) => id);
+        }
+        if (!units.length) continue;
+        const pct = clamp((+arg.value || 0) + (+arg.level_mod || 0) * (+h.level || 0), 0, 0.9);
+        out.push({ type: h.type, name: gd?.name || h.type, units, pct, arrival: +h.town_arrival_at * 1000 || 0 });
+      }
+    } catch {}
+    return out;
+  }
+
   // Coste por tropa: tabla base del juego (GameData.units[id].resources).
   // No se aplica el descuento de la Leva: en una orden real de 19. NOVA (con
   // Leva) el reembolso por unidad es justo el 50% del coste BASE, así que no está
   // claro que se aplique; usando la base el lote nunca se queda corto.
-  function unitCost(townId, id) {
+  // atMs: momento en que se va a reclutar. Si para entonces habrá llegado un héroe
+  // que abarata esa tropa (y ahora aún no está), se aplica su descuento por adelantado.
+  function unitCost(townId, id, atMs = null) {
+    const base = unitCostNow(townId, id);
+    if (!atMs) return base;
+    let f = 1;
+    for (const h of heroCostBonuses(townId)) if (h.units.includes(id) && h.arrival > Date.now() && h.arrival <= atMs) f *= 1 - h.pct;
+    if (f === 1) return base;
+    return { ...base, wood: Math.ceil(base.wood * f), stone: Math.ceil(base.stone * f), iron: Math.ceil(base.iron * f) };
+  }
+  function unitCostNow(townId, id) {
     const real = realCosts.get(+townId)?.units?.[id];
     if (real && (real.wood || real.stone || real.iron)) return { wood: real.wood, stone: real.stone, iron: real.iron, pop: real.pop || +UW.GameData?.units?.[id]?.population || 1, favor: real.favor };
     const u = UW.GameData?.units?.[id];
@@ -2221,8 +2258,9 @@
     const fill = clamp(+state.reclutamiento.fillPct || 95, 10, 100) / 100;
     const fr = reserveAbove(townId, 'reclutamiento');
     const cap = { wood: Math.max(0, storage * fill - fr.wood), stone: Math.max(0, storage * fill - fr.stone), iron: Math.max(0, storage * fill - fr.iron), favor: godMaxFavor() * fill };
+    const costAt = +cfg.startAt > Date.now() ? +cfg.startAt : null; // inicio programado: coste de entonces (héroe incluido)
     const rows = cfg.goals.map((g) => {
-      const c = unitCost(townId, g.id);
+      const c = unitCost(townId, g.id, costAt);
       const rem = Math.max(0, g.target - (+have[g.id] || 0) - (+queued[g.id] || 0));
       let fit = Infinity;
       for (const k of [...RES, 'favor']) if (c[k] > 0) fit = Math.min(fit, Math.floor(cap[k] / c[k]));
@@ -2369,19 +2407,24 @@
       saveState(); renderBody();
       recruitLog(`${farmTownName(townId)}: reclutamiento ${v ? 'activado' : 'desactivado'} solo en esta ciudad.`);
     });
-    // Inicio programado (solo esta ciudad)
-    const delayIn = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '1', value: '45' });
-    const startBox = tcfg.startAt && tcfg.startAt > Date.now()
+    // Inicio programado (solo esta ciudad) — desactivado por defecto
+    const delayIn = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '1', value: '', placeholder: 'min' });
+    const scheduled = tcfg.startAt && tcfg.startAt > Date.now();
+    const startBox = !scheduled && !renderReclutamientoTab.delayOpen
+      ? optionRow('Empezar más tarde', 'Solo en esta ciudad. Hasta esa hora no recibe ni reserva recursos (puede donar)', false, (v) => { renderReclutamientoTab.delayOpen = v; renderBody(); })
+      : scheduled
       ? el('div', { class: 'nb-alert nb-alert-info' }, [
           el('span', {}, ['Empieza en ', el('b', { 'data-nb-until': Math.round(tcfg.startAt / 1000) }, formatLeft(Math.round(tcfg.startAt / 1000))), ` (${new Date(tcfg.startAt).toLocaleTimeString('es-ES')})`]),
           el('span', { class: 'nb-btn nb-btn-sm', onclick: () => { delete tcfg.startAt; saveState(); renderBody(); recruitLog(`${farmTownName(townId)}: inicio programado cancelado.`); } }, 'Cancelar')
         ])
       : el('div', { class: 'nb-row' }, [
-          el('div', { class: 'nb-option-text' }, [el('span', { class: 'nb-option-label' }, 'Empezar más tarde'), el('span', { class: 'nb-option-hint' }, 'Solo en esta ciudad. Hasta esa hora no recibe ni reserva recursos (puede donar)')]),
+          el('div', { class: 'nb-option-text' }, [el('span', { class: 'nb-option-label' }, 'Empezar dentro de'), el('span', { class: 'nb-option-hint' }, 'Minutos hasta empezar a reclutar en esta ciudad')]),
           el('span', { class: 'nb-stepper' }, [delayIn, el('span', { class: 'nb-add-level' }, 'min'),
+            el('span', { class: 'nb-mini', title: 'Cerrar', onclick: () => { renderReclutamientoTab.delayOpen = false; renderBody(); } }, '✕'),
             el('span', { class: 'nb-btn nb-btn-sm', onclick: () => {
-              const min = Math.max(1, pos(delayIn.value, 45));
-              tcfg.startAt = Date.now() + min * 60000; tcfg.enabled = true; saveState(); renderBody();
+              const min = pos(delayIn.value, 0);
+              if (!min) { delayIn.focus(); return; }
+              tcfg.startAt = Date.now() + min * 60000; tcfg.enabled = true; renderReclutamientoTab.delayOpen = false; saveState(); renderBody();
               recruitLog(`${farmTownName(townId)}: reclutamiento programado para dentro de ${min} min.`, 'ok');
             } }, 'Programar')])
         ]);
@@ -2423,7 +2466,20 @@
         ...bars
       ]);
     }
-    bodyEl.appendChild(el('div', { class: 'nb-card' }, [el('div', { class: 'nb-card-title' }, 'Siguiente lote'), lotBox]));
+    const heroNotes = [];
+    for (const h of heroCostBonuses(townId)) {
+      const units = h.units.map((u) => unitName(u)).join(', ');
+      const pctTxt = `−${Math.round(h.pct * 100)} % en ${units}`;
+      if (h.arrival <= Date.now()) heroNotes.push(el('div', { class: 'nb-alert nb-alert-info' }, `${h.name} está en la ciudad: ${pctTxt} (ya incluido en el coste del juego).`));
+      else if (scheduled && h.arrival <= tcfg.startAt) heroNotes.push(el('div', { class: 'nb-alert nb-alert-info' }, [`${h.name} llega en `, el('b', { 'data-nb-until': Math.round(h.arrival / 1000) }, formatLeft(Math.round(h.arrival / 1000))), `, antes de empezar: el lote ya cuenta con su descuento (${pctTxt}).`]));
+      else heroNotes.push(el('div', { class: 'nb-alert nb-alert-warn' }, [`${h.name} (${pctTxt}) llega en `, el('b', { 'data-nb-until': Math.round(h.arrival / 1000) }, formatLeft(Math.round(h.arrival / 1000))), scheduled ? ', DESPUÉS de empezar: retrasa el inicio para aprovecharlo.' : '. Programa "Empezar más tarde" para esperarlo.']));
+    }
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+      el('div', { class: 'nb-card-title' }, 'Siguiente lote'),
+      scheduled ? el('div', { class: 'nb-countdown' }, [el('span', {}, 'Empieza a reclutar en'), el('b', { 'data-nb-until': Math.round(tcfg.startAt / 1000) }, formatLeft(Math.round(tcfg.startAt / 1000))), el('small', {}, new Date(tcfg.startAt).toLocaleTimeString('es-ES'))]) : null,
+      ...heroNotes,
+      lotBox
+    ]));
 
     // Objetivos
     const have = townUnitsHave(townId), queued = queuedUnits(townId);

@@ -7,7 +7,7 @@
    ===================================================================================== */
 
 :root{
-  --nb-css-version:   "1.5.0";
+  --nb-css-version:   "1.5.3";
 
   /* superficies */
   --nb-bg:            #111419;
@@ -473,3 +473,15 @@
 /* ---------- Prioridad de recursos ---------- */
 #novabot-panel .nb-seg-wrap{ flex-wrap: wrap; }
 #novabot-panel .nb-seg-wrap .nb-seg-btn{ flex: 1 1 auto; white-space: nowrap; }
+
+/* ---------- Reclutamiento: cuenta atrás de inicio programado ---------- */
+#novabot-panel .nb-countdown{
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  padding: 10px 12px; margin-bottom: 8px; border-radius: var(--nb-radius-sm);
+  background: linear-gradient(135deg, rgba(212,175,106,.14), rgba(212,175,106,.03)); border: 1px solid var(--nb-gold-line);
+}
+#novabot-panel .nb-countdown span{ font-size: 11px; font-weight: 700; color: var(--nb-text-dim); text-transform: uppercase; letter-spacing: .05em; }
+#novabot-panel .nb-countdown b{ font-size: 20px; font-weight: 800; color: var(--nb-gold-bright); font-variant-numeric: tabular-nums; }
+#novabot-panel .nb-countdown small{ font-size: 11px; color: var(--nb-text-faint); }
+#novabot-panel .nb-alert + .nb-alert, #novabot-panel .nb-countdown + .nb-alert{ margin-top: 6px; }
+#novabot-panel .nb-alert + div{ margin-top: 8px; }
