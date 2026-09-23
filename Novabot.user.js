@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.6.4
+// @version      1.6.7
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -50,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.6.4';
+  const VERSION = '1.6.7';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -2514,7 +2514,9 @@
     const fill = clamp(+state.reclutamiento.fillPct || 95, 10, 100) / 100;
     const fr = reserveAbove(townId, 'reclutamiento');
     const cap = { wood: Math.max(0, storage * fill - fr.wood), stone: Math.max(0, storage * fill - fr.stone), iron: Math.max(0, storage * fill - fr.iron), favor: godMaxFavor() * fill };
-    const costAt = +cfg.startAt > Date.now() ? +cfg.startAt : null; // inicio programado: coste de entonces (héroe incluido)
+    // Inicio programado: coste de entonces (héroe incluido). En espera sin hora aún
+    // ("Empezar más tarde" activado): se da por hecho que se esperará a los héroes en camino.
+    const costAt = +cfg.startAt > Date.now() ? +cfg.startAt : cfg.hold ? Infinity : null;
     const rows = cfg.goals.map((g) => {
       const c = unitCost(townId, g.id, costAt);
       const rem = Math.max(0, g.target - (+have[g.id] || 0) - (+queued[g.id] || 0));
@@ -2543,7 +2545,9 @@
     const full = n === Math.min(pick.rem, pick.fit);
     return {
       rows, units: { [pick.id]: n }, full, tail: pick.rem < pick.fit,
-      cost: { wood: n * pick.c.wood, stone: n * pick.c.stone, iron: n * pick.c.iron },
+      // El juego cobra el coste exacto por unidad (p. ej. 49,5) y redondea el TOTAL hacia arriba:
+      // 323 honderos = 15 988,5 → 15 989 de madera (visto en una orden real).
+      cost: { wood: Math.ceil(n * pick.c.wood), stone: Math.ceil(n * pick.c.stone), iron: Math.ceil(n * pick.c.iron) },
       pop: n * pick.c.pop, favor: n * pick.c.favor
     };
   }
@@ -2743,9 +2747,13 @@
     for (const h of heroCostBonuses(townId)) {
       const units = h.units.map((u) => unitName(u)).join(', ');
       const pctTxt = `−${Math.round(h.pct * 100)} %${h.favorOnly ? ' de favor' : ''} en ${h.units.length > 4 ? (h.favorOnly ? 'unidades míticas' : 'todas las naves') : units}`;
-      if (h.arrival <= Date.now()) heroNotes.push(el('div', { class: 'nb-alert nb-alert-info nb-with-icon' }, [heroIcon(h.type), `${h.name} está en la ciudad: ${pctTxt} (ya incluido en el coste del juego).`]));
-      else if (scheduled && h.arrival <= tcfg.startAt) heroNotes.push(el('div', { class: 'nb-alert nb-alert-info nb-with-icon' }, [heroIcon(h.type), `${h.name} llega en `, el('b', { 'data-nb-until': Math.round(h.arrival / 1000) }, formatLeft(Math.round(h.arrival / 1000))), `, antes de empezar: el lote ya cuenta con su descuento (${pctTxt}).`]));
-      else heroNotes.push(el('div', { class: 'nb-alert nb-alert-warn nb-with-icon' }, [heroIcon(h.type), `${h.name} (${pctTxt}) llega en `, el('b', { 'data-nb-until': Math.round(h.arrival / 1000) }, formatLeft(Math.round(h.arrival / 1000))), scheduled ? ', DESPUÉS de empezar: retrasa el inicio para aprovecharlo.' : '. Programa "Empezar más tarde" para esperarlo.']));
+      const left = el('b', { 'data-nb-until': Math.round(h.arrival / 1000) }, formatLeft(Math.round(h.arrival / 1000)));
+      const note = (kind, parts) => heroNotes.push(el('div', { class: `nb-alert nb-alert-${kind} nb-hero-note` }, [heroIcon(h.type), el('span', {}, parts)]));
+      if (h.arrival <= Date.now()) note('info', [`${h.name} está en la ciudad: ${pctTxt} (ya incluido en el coste).`]);
+      else if (scheduled && h.arrival <= tcfg.startAt) note('info', [`${h.name} llega en `, left, `, antes de empezar: el lote ya cuenta con su descuento (${pctTxt}).`]);
+      else if (scheduled) note('warn', [`${h.name} (${pctTxt}) llega en `, left, ', DESPUÉS de empezar: retrasa el inicio para aprovecharlo.']);
+      else if (tcfg.hold) note('info', [`${h.name} llega en `, left, `: el lote ya cuenta con su descuento (${pctTxt}). Programa el inicio para después de que llegue.`]);
+      else note('warn', [`${h.name} (${pctTxt}) llega en `, left, '. Activa "Empezar más tarde" para esperarlo.']);
     }
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
       el('div', { class: 'nb-card-title' }, 'Siguiente lote'),
@@ -2786,14 +2794,13 @@
       ]));
     }
     const nNaval = tcfg.goals.filter((g) => isNavalUnit(g.id)).length, nLand = tcfg.goals.length - nNaval;
-    bodyEl.appendChild(el('div', { class: 'nb-card' }, [
-      el('div', { class: 'nb-card-title' }, `Tropas objetivo (${tcfg.goals.length})`),
-      !tcfg.goals.length ? el('p', { class: 'nb-placeholder' }, 'Añade tropas abajo.') : null,
-      nLand ? el('div', { class: 'nb-subtitle' }, [buildingIcon('barracks', true), `Cuartel (${nLand})`]) : null,
-      nLand ? goalsBox : null,
-      nNaval ? el('div', { class: 'nb-subtitle' }, [buildingIcon('docks', true), `Puerto (${nNaval})`]) : null,
-      nNaval ? goalsNaval : null
-    ]));
+    // Una tarjeta por edificio, con el mismo formato que las de "añadir".
+    const goalCard = (bid, title, n, box, empty) => el('div', { class: 'nb-card' }, [
+      el('div', { class: 'nb-card-title' }, [buildingIcon(bid, true), `${title} (${n})`]),
+      n ? box : el('p', { class: 'nb-placeholder' }, empty)
+    ]);
+    bodyEl.appendChild(goalCard('barracks', 'Cuartel · tropas objetivo', nLand, goalsBox, 'Sin tropas pedidas. Añádelas abajo.'));
+    bodyEl.appendChild(goalCard('docks', 'Puerto · barcos objetivo', nNaval, goalsNaval, 'Sin barcos pedidos. Añádelos abajo.'));
 
     // Añadir tropa
     const avail = landUnitsFor(townId).filter((id) => !tcfg.goals.some((g) => g.id === id));
@@ -2819,7 +2826,7 @@
         unitIcon(id),
         el('div', { class: 'nb-add-name' }, [
           el('span', {}, unitName(id)),
-          el('span', { class: 'nb-add-level' }, `tienes ${h} · ${c.wood}/${c.stone}/${c.iron}${c.favor ? ` · ${c.favor} favor` : ''} · ${c.pop} pob`)
+          el('span', { class: 'nb-add-level' }, `tienes ${h} · ${Math.round(c.wood)}/${Math.round(c.stone)}/${Math.round(c.iron)}${c.favor ? ` · ${Math.round(c.favor)} favor` : ''} · ${c.pop} pob`)
         ]),
         el('div', { class: 'nb-stepper' }, [input, el('span', { class: 'nb-mini nb-mini-add', title: 'Añadir (total objetivo)', onclick: add }, '✓')])
       ]));
@@ -2827,11 +2834,11 @@
     // Cuartel y Puerto por separado (cada uno con su cola).
     const nAddNaval = avail.filter(isNavalUnit).length, nAddLand = avail.length - nAddNaval;
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
-      el('div', { class: 'nb-card-title' }, [buildingIcon('barracks', true), 'Cuartel · añadir tropa (número = total que quieres tener)']),
+      el('div', { class: 'nb-card-title' }, [buildingIcon('barracks', true), 'Cuartel · añadir tropa']),
       nAddLand ? addList : el('p', { class: 'nb-placeholder' }, 'No hay más tropas de cuartel disponibles en esta ciudad.')
     ]));
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
-      el('div', { class: 'nb-card-title' }, [buildingIcon('docks', true), 'Puerto · añadir barco (número = total que quieres tener)']),
+      el('div', { class: 'nb-card-title' }, [buildingIcon('docks', true), 'Puerto · añadir barco']),
       nAddNaval ? addListNaval : el('p', { class: 'nb-placeholder' }, 'No hay barcos disponibles en esta ciudad (¿sin Puerto?).')
     ]));
 

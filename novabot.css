@@ -7,7 +7,7 @@
    ===================================================================================== */
 
 :root{
-  --nb-css-version:   "1.6.5";
+  --nb-css-version:   "1.6.6";
 
   /* superficies */
   --nb-bg:            #111419;
@@ -546,3 +546,7 @@
 #novabot-panel .nb-queue-item{ gap: 12px; }
 #novabot-panel .nb-queue-item > span:first-child{ min-width: 0; flex: 1 1 auto; overflow-wrap: anywhere; }
 #novabot-panel .nb-queue-item > .nb-queue-time{ flex: none; white-space: nowrap; }
+
+/* aviso de héroe: retrato + texto seguido (sin repartir por la fila) */
+#novabot-panel .nb-hero-note{ display: flex; align-items: center; justify-content: flex-start; gap: 10px; text-align: left; }
+#novabot-panel .nb-hero-note > span:last-child{ flex: 1 1 auto; min-width: 0; }
