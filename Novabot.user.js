@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.5.3
+// @version      1.5.5
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -50,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.5.3';
+  const VERSION = '1.5.5';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -334,7 +334,7 @@
       metrics = {
         granjas: el('span', { 'data-nb-countdown': '' }, '—'),
         construccion: `${goalsBuild} objetivos · ${buildQueueLimit()} huecos de cola`,
-        reclutamiento: (() => { const sch = allTownIds().filter((id) => +townRecruitCfg(id).startAt > Date.now()).length; return `${goalsRec} ciudades con tropas pedidas${sch ? ` · ${sch} programada(s)` : ''}`; })(),
+        reclutamiento: (() => { const sch = allTownIds().filter((id) => recruitOnFor(id) && recruitWaiting(id)).length; return `${goalsRec} ciudades con tropas pedidas${sch ? ` · ${sch} programada(s)` : ''}`; })(),
         comercio: `${transit} en camino · ${needs} ciudades esperando`,
         festivales: (() => { const apt = allTownIds().filter(canFestival); const on = apt.filter((id) => festivalEnd(id)).length; return `${on}/${apt.length} con festival`; })()
       };
@@ -1114,7 +1114,7 @@
   const anyBuildEnabled = () => allTownIds().some(buildEnabledFor);
   function setModuleGlobal(key, v) {
     state[key].enabled = v;
-    for (const t of Object.values(state[key].towns || {})) { delete t.enabled; delete t.startAt; }
+    for (const t of Object.values(state[key].towns || {})) { delete t.enabled; delete t.startAt; delete t.hold; }
     saveState();
   }
 
@@ -2046,8 +2046,10 @@
   let recruitLogEl = null;
 
   const recruitOnFor = (townId) => { const v = state.reclutamiento.towns[townId]?.enabled; return typeof v === 'boolean' ? v : !!state.reclutamiento.enabled; };
-  // Activo y, si tiene inicio programado, ya ha llegado la hora.
-  const recruitEnabledFor = (townId) => recruitOnFor(townId) && !((+state.reclutamiento.towns[townId]?.startAt || 0) > Date.now());
+  // En espera: "Empezar más tarde" activado (aún sin hora) o con la hora sin llegar.
+  // Mientras tanto la ciudad no pide ni reserva nada (y puede donar).
+  const recruitWaiting = (townId) => { const t = state.reclutamiento.towns[townId]; return !!t && (!!t.hold || (+t.startAt || 0) > Date.now()); };
+  const recruitEnabledFor = (townId) => recruitOnFor(townId) && !recruitWaiting(townId);
   const anyRecruitOn = () => allTownIds().some(recruitOnFor);
 
   function townRecruitCfg(townId) {
@@ -2109,7 +2111,17 @@
      GameData.heroes[tipo].description_args["1"] = { value, level_mod } → % = value + level_mod × nivel
      (Aristóteles nivel 11: 0,20 + 0,02 × 11 = 42 %). Tropas afectadas: tabla conocida
      y, si no está, se deducen del texto del héroe ("costes … de las <tropa>"). */
-  const HERO_UNIT_DISCOUNT = { aristotle: ['attack_ship'] };
+  // Comprobado con Daidalos (nv 8) en 02. NOVA: birreme base 800 → 800 × 0,90 (investigación)
+  // × 0,82 (héroe: 10 % + 1 % × 8) = 590,4, justo lo que cobra el juego. Los descuentos se MULTIPLICAN.
+  const HERO_UNIT_DISCOUNT = {
+    aristotle: ['attack_ship'],   // naves ligeras
+    daidalos: ['bireme'],
+    eurybia: ['trireme'],
+    odysseus: ['sword'],
+    cheiron: ['hoplite'],
+    argus: 'naval',               // todas las unidades navales
+    anysia: 'myth_favor'          // solo el FAVOR de las unidades míticas
+  };
   function heroCostBonuses(townId) {
     const out = [];
     try {
@@ -2121,12 +2133,15 @@
         const desc = String(gd?.description || '').toLowerCase();
         if (!arg || !/cost/.test(desc)) continue;
         let units = HERO_UNIT_DISCOUNT[h.type];
+        let favorOnly = false;
+        if (units === 'naval') units = Object.entries(UW.GameData?.units || {}).filter(([, u]) => u?.is_naval).map(([id]) => id);
+        else if (units === 'myth_favor') { units = Object.entries(UW.GameData?.units || {}).filter(([, u]) => +u?.favor > 0).map(([id]) => id); favorOnly = true; }
         if (!units) {
           units = Object.entries(UW.GameData?.units || {}).filter(([, u]) => [u.name, u.name_plural].filter(Boolean).some((n) => desc.includes(String(n).toLowerCase()))).map(([id]) => id);
         }
         if (!units.length) continue;
         const pct = clamp((+arg.value || 0) + (+arg.level_mod || 0) * (+h.level || 0), 0, 0.9);
-        out.push({ type: h.type, name: gd?.name || h.type, units, pct, arrival: +h.town_arrival_at * 1000 || 0 });
+        out.push({ type: h.type, name: gd?.name || h.type, units, pct, favorOnly, arrival: +h.town_arrival_at * 1000 || 0 });
       }
     } catch {}
     return out;
@@ -2141,10 +2156,13 @@
   function unitCost(townId, id, atMs = null) {
     const base = unitCostNow(townId, id);
     if (!atMs) return base;
-    let f = 1;
-    for (const h of heroCostBonuses(townId)) if (h.units.includes(id) && h.arrival > Date.now() && h.arrival <= atMs) f *= 1 - h.pct;
-    if (f === 1) return base;
-    return { ...base, wood: Math.ceil(base.wood * f), stone: Math.ceil(base.stone * f), iron: Math.ceil(base.iron * f) };
+    let f = 1, ff = 1;
+    for (const h of heroCostBonuses(townId)) {
+      if (!h.units.includes(id) || !(h.arrival > Date.now() && h.arrival <= atMs)) continue;
+      if (h.favorOnly) ff *= 1 - h.pct; else f *= 1 - h.pct;   // se multiplican (como hace el juego)
+    }
+    if (f === 1 && ff === 1) return base;
+    return { ...base, wood: Math.ceil(base.wood * f), stone: Math.ceil(base.stone * f), iron: Math.ceil(base.iron * f), favor: Math.ceil((base.favor || 0) * ff) };
   }
   function unitCostNow(townId, id) {
     const real = realCosts.get(+townId)?.units?.[id];
@@ -2403,31 +2421,41 @@
     const isExc = typeof tcfg.enabled === 'boolean' && tcfg.enabled !== !!cfg.enabled;
     const townSw = switchEl(recruitOnFor(townId), (v) => {
       if (v === !!cfg.enabled) delete tcfg.enabled; else tcfg.enabled = v;
-      if (!v) delete tcfg.startAt;
+      if (!v) { delete tcfg.startAt; delete tcfg.hold; }
       saveState(); renderBody();
       recruitLog(`${farmTownName(townId)}: reclutamiento ${v ? 'activado' : 'desactivado'} solo en esta ciudad.`);
     });
     // Inicio programado (solo esta ciudad) — desactivado por defecto
+    // Al activar el interruptor la ciudad queda YA en espera (no pide ni reserva
+    // recursos) aunque todavía no se haya puesto la hora.
     const delayIn = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '1', value: '', placeholder: 'min' });
     const scheduled = tcfg.startAt && tcfg.startAt > Date.now();
-    const startBox = !scheduled && !renderReclutamientoTab.delayOpen
-      ? optionRow('Empezar más tarde', 'Solo en esta ciudad. Hasta esa hora no recibe ni reserva recursos (puede donar)', false, (v) => { renderReclutamientoTab.delayOpen = v; renderBody(); })
-      : scheduled
+    const program = () => {
+      const min = pos(delayIn.value, 0);
+      if (!min) { delayIn.focus(); return; }
+      tcfg.startAt = Date.now() + min * 60000; delete tcfg.hold;
+      if (!recruitOnFor(townId)) tcfg.enabled = true;
+      saveState(); renderBody();
+      recruitLog(`${farmTownName(townId)}: reclutamiento programado para dentro de ${min} min.`, 'ok');
+    };
+    delayIn.addEventListener('keydown', (e) => { if (e.key === 'Enter') program(); });
+    const startBox = scheduled
       ? el('div', { class: 'nb-alert nb-alert-info' }, [
           el('span', {}, ['Empieza en ', el('b', { 'data-nb-until': Math.round(tcfg.startAt / 1000) }, formatLeft(Math.round(tcfg.startAt / 1000))), ` (${new Date(tcfg.startAt).toLocaleTimeString('es-ES')})`]),
-          el('span', { class: 'nb-btn nb-btn-sm', onclick: () => { delete tcfg.startAt; saveState(); renderBody(); recruitLog(`${farmTownName(townId)}: inicio programado cancelado.`); } }, 'Cancelar')
+          el('span', { class: 'nb-btn nb-btn-sm', onclick: () => { delete tcfg.startAt; delete tcfg.hold; saveState(); renderBody(); recruitLog(`${farmTownName(townId)}: inicio programado cancelado.`); } }, 'Cancelar')
         ])
-      : el('div', { class: 'nb-row' }, [
-          el('div', { class: 'nb-option-text' }, [el('span', { class: 'nb-option-label' }, 'Empezar dentro de'), el('span', { class: 'nb-option-hint' }, 'Minutos hasta empezar a reclutar en esta ciudad')]),
+      : tcfg.hold
+      ? el('div', { class: 'nb-row' }, [
+          el('div', { class: 'nb-option-text' }, [el('span', { class: 'nb-option-label' }, 'Empezar dentro de'), el('span', { class: 'nb-option-hint nb-warn-txt' }, 'En espera: no recibe ni reserva recursos hasta que empiece')]),
           el('span', { class: 'nb-stepper' }, [delayIn, el('span', { class: 'nb-add-level' }, 'min'),
-            el('span', { class: 'nb-mini', title: 'Cerrar', onclick: () => { renderReclutamientoTab.delayOpen = false; renderBody(); } }, '✕'),
-            el('span', { class: 'nb-btn nb-btn-sm', onclick: () => {
-              const min = pos(delayIn.value, 0);
-              if (!min) { delayIn.focus(); return; }
-              tcfg.startAt = Date.now() + min * 60000; tcfg.enabled = true; renderReclutamientoTab.delayOpen = false; saveState(); renderBody();
-              recruitLog(`${farmTownName(townId)}: reclutamiento programado para dentro de ${min} min.`, 'ok');
-            } }, 'Programar')])
-        ]);
+            el('span', { class: 'nb-mini', title: 'Quitar la espera', onclick: () => { delete tcfg.hold; saveState(); renderBody(); recruitLog(`${farmTownName(townId)}: espera quitada.`); } }, '✕'),
+            el('span', { class: 'nb-btn nb-btn-sm', onclick: program }, 'Programar')])
+        ])
+      : optionRow('Empezar más tarde', 'Solo en esta ciudad. Desde que lo activas no recibe ni reserva recursos (puede donar)', false, (v) => {
+          if (!v) return;
+          tcfg.hold = true; saveState(); renderBody();
+          recruitLog(`${farmTownName(townId)}: en espera, sin pedir recursos hasta que se programe.`);
+        });
 
     const fillIn = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '10', max: '100', value: cfg.fillPct });
     fillIn.addEventListener('change', () => { cfg.fillPct = clamp(pos(fillIn.value, 95), 10, 100); saveState(); renderBody(); });
@@ -2469,14 +2497,15 @@
     const heroNotes = [];
     for (const h of heroCostBonuses(townId)) {
       const units = h.units.map((u) => unitName(u)).join(', ');
-      const pctTxt = `−${Math.round(h.pct * 100)} % en ${units}`;
+      const pctTxt = `−${Math.round(h.pct * 100)} %${h.favorOnly ? ' de favor' : ''} en ${h.units.length > 4 ? (h.favorOnly ? 'unidades míticas' : 'todas las naves') : units}`;
       if (h.arrival <= Date.now()) heroNotes.push(el('div', { class: 'nb-alert nb-alert-info' }, `${h.name} está en la ciudad: ${pctTxt} (ya incluido en el coste del juego).`));
       else if (scheduled && h.arrival <= tcfg.startAt) heroNotes.push(el('div', { class: 'nb-alert nb-alert-info' }, [`${h.name} llega en `, el('b', { 'data-nb-until': Math.round(h.arrival / 1000) }, formatLeft(Math.round(h.arrival / 1000))), `, antes de empezar: el lote ya cuenta con su descuento (${pctTxt}).`]));
       else heroNotes.push(el('div', { class: 'nb-alert nb-alert-warn' }, [`${h.name} (${pctTxt}) llega en `, el('b', { 'data-nb-until': Math.round(h.arrival / 1000) }, formatLeft(Math.round(h.arrival / 1000))), scheduled ? ', DESPUÉS de empezar: retrasa el inicio para aprovecharlo.' : '. Programa "Empezar más tarde" para esperarlo.']));
     }
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
       el('div', { class: 'nb-card-title' }, 'Siguiente lote'),
-      scheduled ? el('div', { class: 'nb-countdown' }, [el('span', {}, 'Empieza a reclutar en'), el('b', { 'data-nb-until': Math.round(tcfg.startAt / 1000) }, formatLeft(Math.round(tcfg.startAt / 1000))), el('small', {}, new Date(tcfg.startAt).toLocaleTimeString('es-ES'))]) : null,
+      scheduled ? el('div', { class: 'nb-countdown' }, [el('span', {}, 'Empieza a reclutar en'), el('b', { 'data-nb-until': Math.round(tcfg.startAt / 1000) }, formatLeft(Math.round(tcfg.startAt / 1000))), el('small', {}, new Date(tcfg.startAt).toLocaleTimeString('es-ES'))])
+        : tcfg.hold ? el('div', { class: 'nb-alert nb-alert-warn' }, 'En espera: no pide recursos. Pon los minutos y pulsa Programar.') : null,
       ...heroNotes,
       lotBox
     ]));
