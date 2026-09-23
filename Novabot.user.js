@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.5.1
+// @version      1.5.2
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -50,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.5.1';
+  const VERSION = '1.5.2';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -2058,11 +2058,60 @@
 
   function unitName(id) { const u = UW.GameData?.units?.[id]; return u?.name_plural || u?.name || id; }
 
+  /* Coste REAL por ciudad y tropa: el que muestra la ventana del Cuartel / Puerto
+     (UnitOrder.init del propio juego), que ya incluye TODO: investigaciones (Leva…),
+     héroes asignados a la ciudad (p. ej. Aristóteles abarata las naves ligeras) y
+     cualquier otra bonificación. Se lee por API (GET building_barracks|docks?index,
+     lo mismo que abrir la ventana) y se refresca cada 5 min, y al llegar un héroe. */
+  const realCosts = new Map(); // townId -> { at, units: { id: {wood,stone,iron,favor,pop} } }
+  function parseUnitOrderInit(html) {
+    const i = html.indexOf('UnitOrder.init('); if (i < 0) return null;
+    const j = html.indexOf('{', i); if (j < 0) return null;
+    let depth = 0, inStr = false, escp = false;
+    for (let k = j; k < html.length; k++) {
+      const c = html[k];
+      if (inStr) { if (escp) escp = false; else if (c === '\\') escp = true; else if (c === '"') inStr = false; continue; }
+      if (c === '"') inStr = true;
+      else if (c === '{') depth++;
+      else if (c === '}') { depth--; if (depth === 0) { try { return JSON.parse(html.slice(j, k + 1)); } catch { return null; } } }
+    }
+    return null;
+  }
+  async function refreshRealCosts(townId) {
+    const units = {};
+    for (const ctrl of ['building_barracks', 'building_docks']) {
+      try {
+        const d = await gpGetAs(townId, ctrl, 'index', { nl_init: true });
+        const u = parseUnitOrderInit(String(d?.html || ''));
+        if (u) for (const [id, v] of Object.entries(u)) {
+          const r = v?.resources || {};
+          units[id] = { wood: +r.wood || 0, stone: +r.stone || 0, iron: +r.iron || 0, favor: +v.favor || 0, pop: +v.population || 0 };
+        }
+      } catch {}
+    }
+    if (Object.keys(units).length) realCosts.set(+townId, { at: Date.now(), units });
+  }
+  // Llegadas de héroes a la ciudad: al llegar cambia el coste (hay que releerlo).
+  function heroArrivalsIn(townId) {
+    try {
+      return [].concat(UW.MM.getCollections().PlayerHero || []).flatMap((c) => c?.models || []).map((m) => m.attributes)
+        .filter((h) => +h.home_town_id === +townId && +h.town_arrival_at > 0).map((h) => +h.town_arrival_at * 1000);
+    } catch { return []; }
+  }
+  function realCostsStale(townId) {
+    const c = realCosts.get(+townId);
+    if (!c) return true;
+    if (Date.now() - c.at > 5 * 60000) return true;
+    return heroArrivalsIn(townId).some((t) => t > c.at && t <= Date.now()); // un héroe llegó después de la última lectura
+  }
+
   // Coste por tropa: tabla base del juego (GameData.units[id].resources).
   // No se aplica el descuento de la Leva: en una orden real de 19. NOVA (con
   // Leva) el reembolso por unidad es justo el 50% del coste BASE, así que no está
   // claro que se aplique; usando la base el lote nunca se queda corto.
   function unitCost(townId, id) {
+    const real = realCosts.get(+townId)?.units?.[id];
+    if (real && (real.wood || real.stone || real.iron)) return { wood: real.wood, stone: real.stone, iron: real.iron, pop: real.pop || +UW.GameData?.units?.[id]?.population || 1, favor: real.favor };
     const u = UW.GameData?.units?.[id];
     const r = u?.resources || {};
     // Factor real del juego (p. ej. 0,9 con la Leva), leído de la vista de reclutamiento.
@@ -2248,6 +2297,9 @@
   async function recruitTick() {
     if (!anyRecruitOn()) return;
     if (!overviewReady()) return; // sin conocer TODAS las colas se podrían pasar de 7 órdenes
+    // Coste real (héroes, investigaciones…): refrescar las ciudades con tropas pedidas.
+    const stale = allTownIds().filter((id) => recruitOnFor(id) && townRecruitCfg(id).goals.length && realCostsStale(id));
+    for (const id of stale.slice(0, 3)) await refreshRealCosts(id);
     for (const townId of allTownIds()) {
       if (!recruitEnabledFor(townId)) continue;
       const tc = townRecruitCfg(townId);
@@ -2304,6 +2356,10 @@
     const cfg = state.reclutamiento;
     const townId = +UW.Game?.townId || allTownIds()[0];
     const tcfg = townRecruitCfg(townId);
+    if (realCostsStale(townId) && !renderReclutamientoTab.loading) {
+      renderReclutamientoTab.loading = true;
+      refreshRealCosts(townId).finally(() => { renderReclutamientoTab.loading = false; if (state.activeTab === 'reclutamiento' && +UW.Game?.townId === townId) renderBody(); });
+    }
 
     const sw = switchEl(!!cfg.enabled, (v) => { setModuleGlobal('reclutamiento', v); renderBody(); recruitLog(v ? 'Reclutamiento activado en todas las ciudades.' : 'Reclutamiento desactivado en todas las ciudades.'); }, false);
     const isExc = typeof tcfg.enabled === 'boolean' && tcfg.enabled !== !!cfg.enabled;
