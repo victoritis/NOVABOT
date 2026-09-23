@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.6.2
+// @version      1.6.3
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -50,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.6.2';
+  const VERSION = '1.6.3';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -2751,14 +2751,15 @@
       saveState(); renderBody();
     };
     const goalsBox = el('div', { class: 'nb-goals' });
+    const goalsNaval = el('div', { class: 'nb-goals' });
     for (const g of tcfg.goals) {
       const h = (+have[g.id] || 0) + (+queued[g.id] || 0);
       const input = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '0', value: g.target });
       input.addEventListener('change', () => setTarget(g.id, pos(input.value, g.target)));
-      goalsBox.appendChild(el('div', { class: `nb-goal${h >= g.target ? ' nb-goal-done' : ''}` }, [
+      (isNavalUnit(g.id) ? goalsNaval : goalsBox).appendChild(el('div', { class: `nb-goal${h >= g.target ? ' nb-goal-done' : ''}` }, [
         unitIcon(g.id),
         el('div', { class: 'nb-goal-main' }, [
-          el('div', { class: 'nb-goal-name' }, [unitName(g.id), unitTag(g.id)]),
+          el('div', { class: 'nb-goal-name' }, unitName(g.id)),
           el('div', { class: 'nb-goal-sub' }, `tienes ${+have[g.id] || 0}${queued[g.id] ? ` + ${queued[g.id]} en cola` : ''} · faltan ${Math.max(0, g.target - h)}`)
         ]),
         el('div', { class: 'nb-stepper' }, [
@@ -2769,14 +2770,20 @@
         ])
       ]));
     }
+    const nNaval = tcfg.goals.filter((g) => isNavalUnit(g.id)).length, nLand = tcfg.goals.length - nNaval;
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
       el('div', { class: 'nb-card-title' }, `Tropas objetivo (${tcfg.goals.length})`),
-      tcfg.goals.length ? goalsBox : el('p', { class: 'nb-placeholder' }, 'Añade tropas abajo.')
+      !tcfg.goals.length ? el('p', { class: 'nb-placeholder' }, 'Añade tropas abajo.') : null,
+      nLand ? el('div', { class: 'nb-subtitle' }, [buildingIcon('barracks', true), `Cuartel (${nLand})`]) : null,
+      nLand ? goalsBox : null,
+      nNaval ? el('div', { class: 'nb-subtitle' }, [buildingIcon('docks', true), `Puerto (${nNaval})`]) : null,
+      nNaval ? goalsNaval : null
     ]));
 
     // Añadir tropa
     const avail = landUnitsFor(townId).filter((id) => !tcfg.goals.some((g) => g.id === id));
     const addList = el('div', { class: 'nb-add-list' });
+    const addListNaval = el('div', { class: 'nb-add-list' });
     // Lo que vas escribiendo se guarda (por ciudad y tropa) para que no se borre
     // al añadir otra tropa o al repintarse el panel. Sin número por defecto.
     const drafts = (renderReclutamientoTab.drafts ||= {});
@@ -2793,19 +2800,24 @@
         setTarget(id, v);
       };
       input.addEventListener('keydown', (e) => { if (e.key === 'Enter') add(); });
-      addList.appendChild(el('div', { class: 'nb-add-row' }, [
+      (isNavalUnit(id) ? addListNaval : addList).appendChild(el('div', { class: 'nb-add-row' }, [
         unitIcon(id),
         el('div', { class: 'nb-add-name' }, [
           el('span', {}, unitName(id)),
-          unitTag(id),
           el('span', { class: 'nb-add-level' }, `tienes ${h} · ${c.wood}/${c.stone}/${c.iron}${c.favor ? ` · ${c.favor} favor` : ''} · ${c.pop} pob`)
         ]),
         el('div', { class: 'nb-stepper' }, [input, el('span', { class: 'nb-mini nb-mini-add', title: 'Añadir (total objetivo)', onclick: add }, '✓')])
       ]));
     }
+    // Cuartel y Puerto por separado (cada uno con su cola).
+    const nAddNaval = avail.filter(isNavalUnit).length, nAddLand = avail.length - nAddNaval;
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
-      el('div', { class: 'nb-card-title' }, 'Añadir tropa (número = total que quieres tener)'),
-      avail.length ? addList : el('p', { class: 'nb-placeholder' }, 'No hay más tropas disponibles en esta ciudad.')
+      el('div', { class: 'nb-card-title' }, [buildingIcon('barracks', true), 'Cuartel · añadir tropa (número = total que quieres tener)']),
+      nAddLand ? addList : el('p', { class: 'nb-placeholder' }, 'No hay más tropas de cuartel disponibles en esta ciudad.')
+    ]));
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+      el('div', { class: 'nb-card-title' }, [buildingIcon('docks', true), 'Puerto · añadir barco (número = total que quieres tener)']),
+      nAddNaval ? addListNaval : el('p', { class: 'nb-placeholder' }, 'No hay barcos disponibles en esta ciudad (¿sin Puerto?).')
     ]));
 
     const logBox = el('div', { class: 'nb-log' });

@@ -7,7 +7,7 @@
    ===================================================================================== */
 
 :root{
-  --nb-css-version:   "1.6.3";
+  --nb-css-version:   "1.6.4";
 
   /* superficies */
   --nb-bg:            #111419;
@@ -534,3 +534,8 @@
 #novabot-panel .nb-add-row > .nb-stepper, #novabot-panel .nb-add-row > .nb-pill{ flex: 1 0 100%; justify-content: flex-end; }
 #novabot-panel .nb-add-row > .nb-pill{ text-align: center; }
 #novabot-panel .nb-add-row .nb-add-level{ white-space: normal; }
+
+/* subtítulo dentro de una tarjeta (Cuartel / Puerto) */
+#novabot-panel .nb-subtitle{ display: flex; align-items: center; gap: 9px; margin: 10px 0 6px; font-size: 11px; font-weight: 700; color: var(--nb-text-dim); }
+#novabot-panel .nb-subtitle:first-of-type{ margin-top: 2px; }
+#novabot-panel .nb-subtitle > .nb-icon-sm{ margin-right: 0; }
