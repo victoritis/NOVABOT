@@ -7,7 +7,7 @@
    ===================================================================================== */
 
 :root{
-  --nb-css-version:   "1.5.3";
+  --nb-css-version:   "1.5.8";
 
   /* superficies */
   --nb-bg:            #111419;
@@ -77,6 +77,7 @@
   box-shadow: var(--nb-shadow);
   display: flex; flex-direction: column; overflow: hidden;
   color: var(--nb-text); font-size: 12.5px; line-height: 1.4;
+  text-align: left; /* el juego centra el texto de sus ventanas: aquí no */
   opacity: 0; transform: translateY(8px) scale(.98);
   transition: opacity .16s var(--nb-ease), transform .16s var(--nb-ease);
 }
@@ -151,7 +152,7 @@
 #novabot-panel .nb-row-value{ color: var(--nb-text); font-weight: 650; font-variant-numeric: tabular-nums; text-align: right; }
 
 /* fila de opción con interruptor */
-#novabot-panel .nb-option-text{ display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+#novabot-panel .nb-option-text{ display: flex; flex-direction: column; align-items: flex-start; gap: 1px; min-width: 0; text-align: left; }
 #novabot-panel .nb-option-label{ color: var(--nb-text); font-weight: 600; }
 #novabot-panel .nb-option-hint{ font-size: 11px; color: var(--nb-text-faint); }
 
@@ -237,6 +238,7 @@
   background: var(--nb-naval-soft); color: var(--nb-naval); vertical-align: middle;
 }
 #novabot-panel .nb-tag-myth{ background: var(--nb-myth-soft); color: var(--nb-myth); }
+#novabot-panel .nb-tag-land{ background: rgba(124,199,154,.14); color: var(--nb-ok); }
 
 /* ---------- Inicio ---------- */
 #novabot-panel .nb-hero{

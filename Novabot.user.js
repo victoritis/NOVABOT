@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.5.5
+// @version      1.5.8
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -50,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.5.5';
+  const VERSION = '1.5.8';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -116,7 +116,8 @@
       construccion: {
         enabled: false,
         strictOrder: false,   // true = no salta a otro edificio si el primero está bloqueado
-        towns: {}             // townId -> { goals: [{id, target}] } (orden = prioridad)
+        interleave: true,     // true = un nivel de cada edificio por turnos (en el orden añadido)
+        towns: {}             // townId -> { goals: [{id, target}], lastId } (orden = prioridad; un edificio puede repetirse)
       },
       festivales: {
         enabled: true
@@ -282,6 +283,14 @@
     }
   }
 
+  // Repintado automático (desde los motores): no mientras escribes en el panel,
+  // para no borrar lo que estás tecleando.
+  function renderIfIdle(tab) {
+    if (!bodyEl || (tab && state.activeTab !== tab)) return;
+    if (document.activeElement?.closest?.('#novabot-panel input, #novabot-panel select, #novabot-panel textarea')) return;
+    renderBody();
+  }
+
   function renderBody() {
     bodyEl.innerHTML = '';
 
@@ -333,7 +342,7 @@
       const needs = (() => { try { return planTrades().needs.length; } catch { return 0; } })();
       metrics = {
         granjas: el('span', { 'data-nb-countdown': '' }, '—'),
-        construccion: `${goalsBuild} objetivos · ${buildQueueLimit()} huecos de cola`,
+        construccion: (() => { const exc = state.construccion.enabled ? 0 : allTownIds().filter(buildEnabledFor).length; return `${goalsBuild} objetivos · ${buildQueueLimit()} huecos de cola${exc ? ` · activa en ${exc} ciudad(es) por excepción` : ''}`; })(),
         reclutamiento: (() => { const sch = allTownIds().filter((id) => recruitOnFor(id) && recruitWaiting(id)).length; return `${goalsRec} ciudades con tropas pedidas${sch ? ` · ${sch} programada(s)` : ''}`; })(),
         comercio: `${transit} en camino · ${needs} ciudades esperando`,
         festivales: (() => { const apt = allTownIds().filter(canFestival); const on = apt.filter((id) => festivalEnd(id)).length; return `${on}/${apt.length} con festival`; })()
@@ -1114,7 +1123,9 @@
   const anyBuildEnabled = () => allTownIds().some(buildEnabledFor);
   function setModuleGlobal(key, v) {
     state[key].enabled = v;
-    for (const t of Object.values(state[key].towns || {})) { delete t.enabled; delete t.startAt; delete t.hold; }
+    // (el inicio programado / la espera de cada ciudad se mantiene: si no, al tocar
+    // el general esas ciudades empezarían a pedir recursos antes de su hora)
+    for (const t of Object.values(state[key].towns || {})) delete t.enabled;
     saveState();
   }
 
@@ -1124,14 +1135,24 @@
     return all[townId];
   }
 
-  // Motivo por el que no se puede subir ahora (null = se puede).
-  function buildBlockReason(townId, info) {
+  // Bloqueos que NO se arreglan mandando recursos (null = ninguno).
+  // OJO: info.population_free NO es la población libre de la ciudad (es la que
+  // se liberaría al derribar un nivel). La libre real es getAvailablePopulation().
+  function buildHardBlock(info, townId) {
     if (!info) return 'sin datos';
     if (info.has_max_level) return 'nivel máximo';
     if (info.group_locked) return 'bloqueado';
     if (Array.isArray(info.missing_dependencies) && info.missing_dependencies.length) return 'faltan requisitos';
     if (!info.enough_storage) return 'almacén pequeño';
-    if ((+info.population_free || 0) < (+info.population_for || 0)) return 'falta población';
+    let free = NaN;
+    try { free = +UW.ITowns.getTown(townId)?.getAvailablePopulation?.(); } catch {}
+    if (Number.isFinite(free) && free < (+info.population_for || 0)) return 'falta población';
+    return null;
+  }
+  // Motivo por el que no se puede subir ahora (null = se puede).
+  function buildBlockReason(townId, info) {
+    const hard = buildHardBlock(info, townId);
+    if (hard) return hard;
     const cost = info.resources_for || {};
     const r = townResources(townId);
     if (r.wood < (+cost.wood || 0) || r.stone < (+cost.stone || 0) || r.iron < (+cost.iron || 0)) return 'faltan recursos';
@@ -1154,17 +1175,63 @@
     return (h ? `${h}:${String(m).padStart(2, '0')}` : `${m}`) + `:${String(sec).padStart(2, '0')}`;
   }
 
+  /* Plan de construcción = lista ordenada de NIVELES sueltos { id, level, gi }.
+     · Normal: objetivo a objetivo, en el orden en que los añadiste. Un edificio puede
+       estar varias veces (p. ej. Senado 20, Muralla 11, Senado 22) para intercalar a mano.
+     · Intercalar: un nivel de cada edificio por turnos, empezando por el siguiente al
+       último que se construyó (tcfg.lastId), así el turno va rotando de verdad. */
+  function buildPlan(townId) {
+    const bd = buildDataFor(townId);
+    if (!bd) return [];
+    const tcfg = townBuildCfg(townId);
+    const maxOf = (id) => +UW.GameData?.buildings?.[id]?.max_level || 99;
+    if (!state.construccion.interleave) {
+      const sim = {}, out = [];
+      tcfg.goals.forEach((g, gi) => {
+        const info = bd.building_data?.[g.id];
+        if (!info) return;
+        let lvl = sim[g.id] ?? committedLevel(info);
+        while (lvl < Math.min(g.target, maxOf(g.id))) { lvl += 1; out.push({ id: g.id, level: lvl, gi }); }
+        sim[g.id] = Math.max(sim[g.id] ?? 0, lvl);
+      });
+      return out;
+    }
+    // Intercalado: por edificio (orden de primera aparición), hasta su objetivo más alto.
+    const ids = [], top = {}, firstGi = {};
+    tcfg.goals.forEach((g, gi) => {
+      if (!(g.id in top)) { ids.push(g.id); firstGi[g.id] = gi; }
+      top[g.id] = Math.max(top[g.id] || 0, g.target);
+    });
+    const k = ids.indexOf(tcfg.lastId);
+    const order = k >= 0 ? [...ids.slice(k + 1), ...ids.slice(0, k + 1)] : ids;
+    const lvl = {};
+    for (const id of order) lvl[id] = committedLevel(bd.building_data?.[id]);
+    const out = [];
+    for (let more = true; more;) {
+      more = false;
+      for (const id of order) {
+        if (!bd.building_data?.[id] || lvl[id] >= Math.min(top[id], maxOf(id))) continue;
+        lvl[id] += 1; more = true;
+        out.push({ id, level: lvl[id], gi: tcfg.goals.findIndex((g) => g.id === id && g.target >= lvl[id]) });
+      }
+    }
+    return out;
+  }
+
   function nextBuildFor(townId) {
     const bd = buildDataFor(townId);
     if (!bd) return { reason: 'sin datos' };
     if (bd.is_building_order_queue_full) return { reason: 'cola llena' };
-    for (const g of townBuildCfg(townId).goals) {
-      const info = bd.building_data?.[g.id];
-      if (!info || committedLevel(info) >= g.target) continue;
-      if ((buildRuntime.cooldown.get(`${townId}:${g.id}`) || 0) > Date.now()) continue;
+    const skip = new Set(); // edificio bloqueado → sus niveles siguientes tampoco
+    for (const s of buildPlan(townId)) {
+      if (skip.has(s.id)) continue;
+      const info = bd.building_data?.[s.id];
+      if (s.level !== committedLevel(info) + 1) { skip.add(s.id); continue; }
+      if ((buildRuntime.cooldown.get(`${townId}:${s.id}`) || 0) > Date.now()) { skip.add(s.id); continue; }
       const reason = buildBlockReason(townId, info);
-      if (!reason) return { id: g.id, level: committedLevel(info) + 1 };
-      if (state.construccion.strictOrder) return { reason: `${buildingName(g.id)}: ${reason}` };
+      if (!reason) return { id: s.id, level: s.level, gi: s.gi };
+      if (state.construccion.strictOrder) return { reason: `${buildingName(s.id)}: ${reason}`, blockedGi: s.gi };
+      skip.add(s.id);
     }
     return { reason: 'nada pendiente' };
   }
@@ -1193,10 +1260,11 @@
           model_url: 'BuildingOrder', action_name: 'buildUp', captcha: null,
           arguments: { building_id: next.id }, nl_init: true
         });
+        townBuildCfg(townId).lastId = next.id; saveState(); // para el turno del intercalado
         buildLog(`${farmTownName(townId)}: ${buildingName(next.id)} → nivel ${next.level} (a la cola del juego).`, 'ok');
         await sleep(300); // pequeño margen para que el modelo Backbone se actualice antes de leerlo
         pruneCompletedGoals(townId);
-        if (state.activeTab === 'construccion') renderBody();
+        renderIfIdle('construccion');
       } catch (e) {
         buildLog(`${farmTownName(townId)}: ${buildingName(next.id)} — ${e.message}`, 'error');
         buildRuntime.cooldown.set(`${townId}:${next.id}`, Date.now() + 5 * 60000);
@@ -1256,8 +1324,11 @@
       el('div', { class: 'nb-row' }, [el('div', { class: 'nb-option-text' }, [el('b', {}, 'Construcción automática'), el('span', { class: 'nb-option-hint' }, `Todas las ciudades${excCount ? ` · ${excCount} excepción(es)` : ''}`)]), sw]),
       el('div', { class: 'nb-row nb-option' }, [el('div', { class: 'nb-option-text' }, [el('span', { class: 'nb-option-label' }, `Solo ${farmTownName(townId)}`),
         el('span', { class: `nb-option-hint${isExc ? ' nb-warn-txt' : ''}` }, isExc ? `Excepción: ${tcfg.enabled ? 'activada' : 'desactivada'} aunque el general esté ${cfg.enabled ? 'activado' : 'desactivado'}` : 'Sigue al general')]), townSw]),
+      optionRow('Intercalar edificios', 'Un nivel de cada uno por turnos, en el orden en que los añades', !!cfg.interleave, (v) => { cfg.interleave = v; saveState(); renderBody(); }),
       optionRow('Orden estricto', 'Si el primero está bloqueado, no salta al siguiente', !!cfg.strictOrder, (v) => { cfg.strictOrder = v; saveState(); })
     ]));
+    const prioWarn = anyBuildEnabled() ? prioExcludedAlert('construccion') : null;
+    if (prioWarn) bodyEl.appendChild(prioWarn);
 
     const copyBtn = el('div', { class: 'nb-btn', title: 'Copia estos objetivos al resto de ciudades' }, 'Copiar a todas');
     copyBtn.addEventListener('click', () => {
@@ -1273,7 +1344,9 @@
       ]),
       el('div', { class: 'nb-row' }, [
         el('span', { class: 'nb-row-label' }, 'Siguiente'),
-        el('span', { class: 'nb-row-value' }, next.id ? `${buildingName(next.id)} → ${next.level}` : next.reason)
+        el('span', { class: 'nb-row-value' }, !buildEnabledFor(townId) ? 'desactivada en esta ciudad'
+          : next.id ? `${buildingName(next.id)} → ${next.level}`
+          : next.reason + (/faltan recursos/.test(next.reason) && !prioIncluded('construccion') ? ' (el comercio no le manda: prioridad)' : ''))
       ]),
       el('div', { class: 'nb-btn-group' }, [copyBtn])
     ]));
@@ -1309,15 +1382,23 @@
       bodyEl.appendChild(el('div', { class: 'nb-card' }, [el('p', { class: 'nb-placeholder' }, 'Sin datos de edificios para esta ciudad todavía.')]));
     } else {
       const maxOf = (id) => +UW.GameData?.buildings?.[id]?.max_level || 99;
-      const setTarget = (id, v) => {
-        const i = tcfg.goals.findIndex((g) => g.id === id);
-        const cur = committedLevel(bd.building_data?.[id]);
-        v = clamp(v, 0, maxOf(id));
-        if (v <= cur) { if (i >= 0) tcfg.goals.splice(i, 1); }       // objetivo alcanzado/menor → se quita
-        else if (i >= 0) tcfg.goals[i].target = v;
-        else tcfg.goals.push({ id, target: v });
+      // Nivel desde el que parte el objetivo i: el actual (con cola) o el objetivo
+      // anterior del mismo edificio (un edificio puede estar varias veces).
+      const fromOf = (i, list = tcfg.goals) => {
+        const id = list[i].id;
+        let f = committedLevel(bd.building_data?.[id]);
+        for (let j = 0; j < i; j++) if (list[j].id === id) f = Math.max(f, list[j].target);
+        return f;
+      };
+      const lastLevelOf = (id) => tcfg.goals.reduce((m, g) => (g.id === id ? Math.max(m, g.target) : m), committedLevel(bd.building_data?.[id]));
+      const setTarget = (i, v) => {
+        const g = tcfg.goals[i];
+        v = clamp(v, 0, maxOf(g.id));
+        if (v <= fromOf(i)) tcfg.goals.splice(i, 1);                 // no sube nada → se quita
+        else g.target = v;
         saveState(); renderBody();
       };
+      const addGoal = (id, v) => { tcfg.goals.push({ id, target: clamp(v, 0, maxOf(id)) }); saveState(); renderBody(); };
       const move = (i, dir) => {
         const j = i + dir;
         if (j < 0 || j >= tcfg.goals.length) return;
@@ -1329,10 +1410,11 @@
       const goalsBox = el('div', { class: 'nb-goals' });
       tcfg.goals.forEach((g, i) => {
         const info = bd.building_data?.[g.id];
-        const cur = committedLevel(info);
-        const done = cur >= g.target;
-        const reason = done ? null : buildBlockReason(townId, info);
-        const isNext = next.id === g.id;
+        const cur = fromOf(i);
+        const done = committedLevel(info) >= g.target;
+        const waitingPrev = !done && committedLevel(info) < cur; // espera al objetivo anterior del mismo edificio
+        const reason = done ? null : waitingPrev ? `tras llegar a ${cur}` : buildBlockReason(townId, info);
+        const isNext = next.id === g.id && next.gi === i;
         goalsBox.appendChild(el('div', { class: `nb-goal${isNext ? ' nb-goal-next' : ''}${done ? ' nb-goal-done' : ''}` }, [
           el('span', { class: 'nb-goal-idx' }, String(i + 1)),
           el('div', { class: 'nb-goal-main' }, [
@@ -1341,9 +1423,9 @@
           ]),
           el('div', { class: 'nb-stepper' }, [
             el('span', { class: 'nb-goal-cur' }, `${cur} →`),
-            el('span', { class: 'nb-mini', title: '−1', onclick: () => setTarget(g.id, g.target - 1) }, '−'),
+            el('span', { class: 'nb-mini', title: '−1', onclick: () => setTarget(i, g.target - 1) }, '−'),
             el('span', { class: 'nb-goal-target' }, String(g.target)),
-            el('span', { class: 'nb-mini', title: '+1', onclick: () => setTarget(g.id, g.target + 1) }, '+')
+            el('span', { class: 'nb-mini', title: '+1', onclick: () => setTarget(i, g.target + 1) }, '+')
           ]),
           el('div', { class: 'nb-goal-actions' }, [
             el('span', { class: `nb-mini${i === 0 ? ' nb-mini-off' : ''}`, title: 'Subir prioridad', onclick: () => move(i, -1) }, '▲'),
@@ -1361,26 +1443,29 @@
       ]));
 
       // ---- Añadir edificios: fila por edificio, con su propio nivel objetivo ----
-      const available = buildingIds().filter((id) => !tcfg.goals.some((g) => g.id === id));
+      // Se puede añadir un edificio aunque ya esté en la lista: el nuevo objetivo
+      // parte de donde acaba el anterior (así se intercala a mano: Senado 20,
+      // Muralla 11, Senado 22…). Se añade SIEMPRE al final.
+      const available = buildingIds();
       const addSearch = el('input', { class: 'nb-input', type: 'text', placeholder: 'Buscar edificio…' });
       const addList = el('div', { class: 'nb-add-list' });
 
       function renderAddRow(id) {
         const info = bd.building_data?.[id];
-        const cur = committedLevel(info);
+        const cur = lastLevelOf(id);
         const max = maxOf(id);
-        const atMax = cur >= max || info?.has_max_level;
+        const atMax = cur >= max || (info?.has_max_level && cur <= committedLevel(info));
         const input = el('input', {
           class: 'nb-input nb-input-inline', type: 'number', min: String(cur + 1), max: String(max), value: String(Math.min(cur + 1, max))
         });
         const add = () => {
           if (atMax) return;
-          const v = clamp(pos(input.value, cur + 1), cur + 1, max);
-          setTarget(id, v);
+          addGoal(id, clamp(pos(input.value, cur + 1), cur + 1, max));
         };
         input.addEventListener('keydown', (e) => { if (e.key === 'Enter') add(); });
+        const inList = tcfg.goals.some((g) => g.id === id);
         return el('div', { class: `nb-add-row${atMax ? ' nb-add-row-off' : ''}` }, [
-          el('div', { class: 'nb-add-name' }, [buildingName(id), el('span', { class: 'nb-add-level' }, `nivel ${cur}`)]),
+          el('div', { class: 'nb-add-name' }, [buildingName(id), el('span', { class: 'nb-add-level' }, inList ? `nivel ${committedLevel(info)} · en la lista hasta ${cur}` : `nivel ${cur}`)]),
           atMax
             ? el('span', { class: 'nb-pill nb-pill-off' }, 'máximo')
             : el('div', { class: 'nb-stepper' }, [
@@ -1403,8 +1488,8 @@
       renderAddList('');
 
       bodyEl.appendChild(el('div', { class: 'nb-card' }, [
-        el('div', { class: 'nb-card-title' }, `Añadir edificio (${available.length} disponibles)`),
-        available.length ? el('div', {}, [addSearch, addList]) : el('p', { class: 'nb-placeholder' }, 'Ya tienes objetivo en todos los edificios.')
+        el('div', { class: 'nb-card-title' }, 'Añadir edificio (se pone al final)'),
+        el('div', {}, [addSearch, addList])
       ]));
     }
 
@@ -1456,10 +1541,14 @@
         if (!buildEnabledFor(townId)) return zero;
         const bd = buildDataFor(townId);
         if (!bd || bd.is_building_order_queue_full) return zero;
-        for (const g of townBuildCfg(townId).goals) {
-          const info = bd.building_data?.[g.id];
-          if (!info || committedLevel(info) >= g.target || info.has_max_level) continue;
-          if (info.group_locked || !info.enough_storage || (Array.isArray(info.missing_dependencies) && info.missing_dependencies.length)) continue;
+        // El mismo edificio que construiría nextBuildFor (sin mirar los recursos).
+        const skip = new Set();
+        for (const s of buildPlan(townId)) {
+          if (skip.has(s.id)) continue;
+          const info = bd.building_data?.[s.id];
+          if (!info || s.level !== committedLevel(info) + 1) { skip.add(s.id); continue; }
+          if ((buildRuntime.cooldown.get(`${townId}:${s.id}`) || 0) > Date.now()) { skip.add(s.id); continue; }
+          if (buildHardBlock(info, townId)) { if (state.construccion.strictOrder) return zero; skip.add(s.id); continue; }
           const c = info.resources_for || {};
           return { wood: +c.wood || 0, stone: +c.stone || 0, iron: +c.iron || 0 };
         }
@@ -1495,6 +1584,29 @@
     const my = ranked.indexOf(mod);
     const names = ranked.filter((m, i) => m !== mod && inc.has(m) && (!inc.has(mod) || i < my) && sumRes(moduleClaim(townId, m)) > 0);
     return names.map((m) => PRIO_MODULES[m].toLowerCase()).join(' y ');
+  }
+
+  // Aviso para las pestañas de módulo: si la prioridad actual deja fuera este
+  // módulo, el comercio NO le manda recursos (solo gasta lo que ya tenga la ciudad).
+  function prioExcludedAlert(mod) {
+    if (prioIncluded(mod)) return null;
+    const p = state.prioridad || {};
+    const presetName = PRIO_PRESETS[p.preset]?.label || 'Personalizado';
+    const include = () => {
+      if (p.preset === 'reclutamiento' && mod === 'construccion') p.preset = 'recl_constr';
+      else if (p.preset === 'construccion' && mod === 'reclutamiento') p.preset = 'recl_constr';
+      else {
+        const { ranked, inc } = priorityConfig();
+        p.order = ranked.slice();
+        p.include = Object.fromEntries(Object.keys(PRIO_MODULES).map((m) => [m, inc.has(m) || m === mod]));
+        p.preset = 'custom';
+      }
+      saveState(); renderBody();
+    };
+    return el('div', { class: 'nb-alert nb-alert-warn' }, [
+      el('span', {}, `Prioridad «${presetName}»: ${PRIO_MODULES[mod].toLowerCase()} no recibe recursos del comercio; solo usa lo que ya tenga cada ciudad.`),
+      el('span', { class: 'nb-btn nb-btn-sm', onclick: include }, 'Incluir')
+    ]);
   }
 
   function renderPriorityCard() {
@@ -1549,7 +1661,7 @@
      Se refrescan al arrancar, cada 60 s y tras cada acción propia. Comercio y
      Reclutamiento no actúan hasta tener la primera lectura.
   --------------------------------------------------------------------------------- */
-  const overview = { at: 0, trades: [], recruit: new Map(), busy: false, timer: null };
+  const overview = { at: 0, tradesAt: 0, recruitAt: 0, trades: [], recruit: new Map(), busy: false, timer: null, retry: null, failLogged: false };
 
   function linkTownId(html) {
     const m = /#([A-Za-z0-9+/=]{8,})/.exec(String(html || ''));
@@ -1565,24 +1677,38 @@
         gpGet('town_overviews', 'trade_overview', { nl_init: true }).catch(() => null),
         gpGet('town_overviews', 'recruit_overview', { nl_init: true }).catch(() => null)
       ]);
-      if (tr && Array.isArray(tr.movements)) {
-        overview.trades = tr.movements.map((m) => ({
+      // Cada vista cuenta por separado: el comercio no puede fiarse de "ya leído"
+      // si la de envíos falló aunque la de reclutamiento saliera bien.
+      if (tr && typeof tr === 'object' && (Array.isArray(tr.movements) || 'mov_tmpl' in tr)) {
+        overview.trades = (tr.movements || []).map((m) => ({
           id: +m.id, from: linkTownId(m.from?.link), to: linkTownId(m.to?.link),
           wood: +m.res?.wood || 0, stone: +m.res?.stone || 0, iron: +m.res?.iron || 0, arrival: +m.arrival * 1000
         })).filter((m) => m.to);
+        overview.tradesAt = Date.now();
       }
       const towns = rc?.data?.towns;
       if (Array.isArray(towns)) {
         const map = new Map();
         for (const t of towns) {
-          const orders = [...(t.orders?.barracks || []), ...(t.orders?.docks || [])];
+          const orders = [
+            ...(t.orders?.barracks || []).map((o) => ({ kind: 'ground', ...o })),
+            ...(t.orders?.docks || []).map((o) => ({ kind: 'naval', ...o }))
+          ];
           const units = {};
           for (const u of t.units || []) units[u.id] = { count: +u.count || 0, total: +u.total || 0, rf: +u.research_factor || 1 };
           map.set(+t.id, { orders, units, freePop: +t.free_population, storage: +t.storage_volume || 0 });
         }
         overview.recruit = map;
+        overview.recruitAt = Date.now();
       }
-      if (tr || rc) overview.at = Date.now();
+      overview.at = Math.min(overview.tradesAt, overview.recruitAt);
+      const failed = [overview.tradesAt ? null : 'envíos', overview.recruitAt ? null : 'reclutamiento'].filter(Boolean);
+      if (failed.length) {
+        // Aún sin primera lectura completa: reintentar pronto (no esperar 60 s).
+        clearTimeout(overview.retry);
+        overview.retry = setTimeout(refreshOverviews, 10000);
+        if (!overview.failLogged) { overview.failLogged = true; console.warn(`[NOVABOT] No se pudo leer la vista de ${failed.join(' y ')}; reintentando cada 10 s.`); }
+      }
     } finally { overview.busy = false; }
     // Repintar las pestañas que dependen de estos datos (salvo si estás escribiendo).
     const typing = document.activeElement?.closest?.('#novabot-panel input, #novabot-panel select');
@@ -1667,26 +1793,22 @@
         const goals = townBuildCfg(townId).goals;
         if (!goals.length) continue;
         const bd = buildDataFor(townId);
-        if (!bd) continue;
+        if (!bd || bd.is_building_order_queue_full) continue;
         let free = Math.max(0, limit - townBuildOrders(townId).length);
         if (!free) continue;
-        const sim = {}; // nivel simulado por edificio conforme se "encargan" niveles
-        for (const g of goals) {
+        // Mismo orden que construirá (buildPlan). Bloqueos que el comercio no puede
+        // resolver (requisitos, almacén, población): se salta ese edificio; si no, sus
+        // recursos llegarían y no se gastarían.
+        const skip = new Set();
+        for (const s of buildPlan(townId)) {
           if (!free) break;
-          const info = bd.building_data?.[g.id];
-          if (!info || info.has_max_level) continue;
-          // Bloqueos que el comercio no puede resolver: se salta ese edificio.
-          const hard = info.group_locked || (Array.isArray(info.missing_dependencies) && info.missing_dependencies.length) || !info.enough_storage;
-          if (hard) { if (state.construccion.strictOrder) break; continue; }
-          let lvl = sim[g.id] ?? committedLevel(info);
-          while (free && lvl < g.target) {
-            lvl += 1;
-            const cost = levelCost(g.id, lvl, info);
-            if (!cost) break;
-            out.push({ townId, module: 'construccion', label: `${buildingName(g.id)} ${lvl}`, ...cost });
-            free -= 1;
-          }
-          sim[g.id] = lvl;
+          if (skip.has(s.id)) continue;
+          const info = bd.building_data?.[s.id];
+          if (buildHardBlock(info, townId)) { if (state.construccion.strictOrder) break; skip.add(s.id); continue; }
+          const cost = levelCost(s.id, s.level, info);
+          if (!cost) { skip.add(s.id); continue; }
+          out.push({ townId, module: 'construccion', label: `${buildingName(s.id)} ${s.level}`, ...cost });
+          free -= 1;
         }
       }
       return out;
@@ -1717,8 +1839,9 @@
   }
   function calibrateTravel() {
     const samples = [];
+    const own = new Set(allTownIds());
     for (const t of gameTrades()) {
-      if (!t.started || !t.arrival) continue;
+      if (!t.started || !t.arrival || !own.has(t.from)) continue; // envíos de otros jugadores: distancia desconocida
       const d = townDist(t.from, t.to);
       if (d < 1) continue;
       samples.push((t.arrival - t.started) / 1000 / d);
@@ -1750,8 +1873,20 @@
     const now = Date.now();
     // Lo ya llegado está en el almacén: dejarlo en "en camino" lo contaría dos veces.
     tradeRuntime.ledger = tradeRuntime.ledger.filter((l) => l.arrival > now && l.expires > now);
-    // Lo enviado por el bot cuenta hasta que el juego lo muestre en su colección.
-    const extra = tradeRuntime.ledger.filter((l) => !game.some((g) => g.from === l.from && g.to === l.to && Math.abs(sumRes(g) - sumRes(l)) <= 50));
+    // Lo enviado por el bot cuenta hasta que el juego lo muestre en su lista. Cada
+    // envío del juego tapa como mucho UN registro del bot (el de llegada más
+    // parecida): así dos envíos iguales seguidos no se confunden en uno.
+    const used = new Set();
+    const extra = tradeRuntime.ledger.filter((l) => {
+      let best = null, bestD = Infinity;
+      for (const g of game) {
+        if (used.has(g) || g.from !== l.from || g.to !== l.to || Math.abs(sumRes(g) - sumRes(l)) > 50) continue;
+        const d = Math.abs((g.arrival || 0) - l.arrival);
+        if (d < bestD) { bestD = d; best = g; }
+      }
+      if (best) { used.add(best); return false; }
+      return true;
+    });
     return [...game, ...extra];
   }
   function incomingTo(townId, rows) {
@@ -1784,8 +1919,11 @@
       que en el momento de cada llegada no se supera el almacén. Así se puede
       enviar más de lo que cabe si antes se va a gastar, sin perder nada.
   */
-  function simulateOk(s, items, arrivals, storageCap) {
+  // Devuelve cuánto de cada recurso se perdería (por encima de storageCap) al ir
+  // llegando los envíos.
+  function simulateWaste(s, items, arrivals, storageCap) {
     const lvl = { ...s.cur };
+    const waste = { wood: 0, stone: 0, iron: 0 };
     const queue = items.map((i) => ({ wood: i.wood, stone: i.stone, iron: i.iron }));
     const consume = () => {
       while (queue.length && RES.every((k) => lvl[k] >= queue[0][k])) {
@@ -1803,11 +1941,18 @@
       for (const k of RES) {
         if (!a[k]) continue;
         lvl[k] += a[k];
-        if (lvl[k] > storageCap + 1) return false; // se desperdiciaría al llegar
+        if (lvl[k] > storageCap) { waste[k] += lvl[k] - storageCap; lvl[k] = Math.min(lvl[k], s.storage); }
       }
       consume();
     }
-    return true;
+    return waste;
+  }
+  // Un envío nuevo vale si NO aumenta lo que se pierde de ningún recurso. (Si un
+  // envío que ya viene de camino va a rebosar, eso no bloquea los demás recursos.)
+  function simulateOk(s, items, arrivals, storageCap, base = null) {
+    const b = base || simulateWaste(s, items, arrivals.slice(0, -1), storageCap); // (el nuevo va el último)
+    const w = simulateWaste(s, items, arrivals, storageCap);
+    return RES.every((k) => w[k] <= b[k] + 1);
   }
 
   function planTrades() {
@@ -1852,7 +1997,18 @@
       const miss = Object.fromEntries(RES.map((k) => [k, Math.max(0, s.total[k] - s.cur[k] - s.incoming[k])]));
       if (sumRes(miss) <= 0) { tradeRuntime.waitingSince.delete(id); continue; }
       if (!tradeRuntime.waitingSince.has(id)) tradeRuntime.waitingSince.set(id, now);
-      needs.push({ townId: id, miss, label: itemsBy[id].map((i) => i.label).join(', '), items: itemsBy[id],
+      // Primer encargo (en orden de prioridad) que aún no está cubierto: su módulo
+      // decide el turno de la ciudad y lo que le falta hasta él se envía primero.
+      const have = Object.fromEntries(RES.map((k) => [k, s.cur[k] + s.incoming[k]]));
+      const cum = { wood: 0, stone: 0, iron: 0 };
+      let top = null;
+      for (const it of itemsBy[id]) {
+        for (const k of RES) cum[k] += it[k];
+        if (RES.some((k) => cum[k] > have[k])) { top = it; break; }
+      }
+      const topMiss = Object.fromEntries(RES.map((k) => [k, top ? Math.max(0, cum[k] - have[k]) : 0]));
+      needs.push({ townId: id, miss, missInit: { ...miss }, topMiss, topPrio: top ? top.prio : 99, topLabel: top?.label || '',
+        label: itemsBy[id].map((i) => i.label).join(', '), items: itemsBy[id],
         waited: (now - tradeRuntime.waitingSince.get(id)) / 1000 });
     }
 
@@ -1875,17 +2031,18 @@
 
     const plan = [];
     const pending = needs.slice();
-    const agingWeight = Math.max(0, +cfg.agingWeight || 2);
+    const agingWeight = Number.isFinite(+cfg.agingWeight) ? Math.max(0, +cfg.agingWeight) : 2;
     while (pending.length) {
-      // Recalcular prioridad (VAM + envejecimiento) tras cada asignación.
-      let best = null, bestScore = -Infinity;
+      // Turno: primero el módulo con más prioridad (ver 8a); a igualdad, VAM +
+      // envejecimiento (recalculado tras cada asignación).
+      let best = null, bestScore = -Infinity, bestPrio = Infinity;
       for (const n of pending) {
         const ds = donorsFor(n);
         if (!ds.length) { n.score = -Infinity; continue; }
         const t1 = travelSec(ds[0], n.townId);
         const regret = ds.length > 1 ? travelSec(ds[1], n.townId) - t1 : 24 * 3600; // un solo donante posible = urgente
         n.score = regret + n.waited * agingWeight;
-        if (n.score > bestScore) { bestScore = n.score; best = n; }
+        if (n.topPrio < bestPrio || (n.topPrio === bestPrio && n.score > bestScore)) { bestPrio = n.topPrio; bestScore = n.score; best = n; }
       }
       if (!best) break;
       pending.splice(pending.indexOf(best), 1);
@@ -1900,15 +2057,29 @@
         let left = d.cap;
         // Lo que la ciudad producirá por sí misma mientras viaja el envío no hace
         // falta mandarlo (evita enviar de más a ciudades que producen mucho).
-        const need = Object.fromEntries(RES.map((k) => [k, Math.max(0, best.miss[k] - r.prod[k] * eta / 3600)]));
-        for (const k of [...RES].sort((a, b) => need[b] - need[a])) {
-          const v = Math.floor(Math.min(left, d.surplus[k], need[k]));
-          if (v > 0) { want[k] = v; left -= v; }
+        const prodT = (k) => r.prod[k] * eta / 3600;
+        const need = Object.fromEntries(RES.map((k) => [k, Math.max(0, best.miss[k] - prodT(k))]));
+        // 1º lo que falta para el encargo más prioritario; 2º el resto (si hay capacidad).
+        const needTop = Object.fromEntries(RES.map((k) => [k, Math.min(need[k], Math.max(0, best.topMiss[k] - prodT(k)))]));
+        for (const pass of [needTop, need]) {
+          for (const k of [...RES].sort((a, b) => pass[b] - pass[a])) {
+            const v = Math.floor(Math.min(left, d.surplus[k] - want[k], pass[k] - want[k]));
+            if (v > 0) { want[k] += v; left -= v; }
+          }
         }
         if (sumRes(want) <= 0) continue;
-        // Ajustar a lo que la simulación de almacén permite (por recurso).
-        const test = (ship) => simulateOk(r, best.items, [...r.arrivals, { t: eta, ...ship }], storageCap);
+        // Ajustar a lo que la simulación de almacén permite. Primero el tope de cada
+        // recurso por separado (que uno rebose no deja a cero los otros), luego la mezcla.
+        const base = simulateWaste(r, best.items, r.arrivals, storageCap);
+        const test = (ship) => simulateOk(r, best.items, [...r.arrivals, { t: eta, ...ship }], storageCap, base);
         if (!test(want)) {
+          const zero = { wood: 0, stone: 0, iron: 0 };
+          for (const k of RES) {
+            if (!want[k] || test({ ...zero, [k]: want[k] })) continue;
+            let lo = 0, hi = want[k];
+            while (hi - lo > 50) { const mid = Math.floor((lo + hi) / 2); if (test({ ...zero, [k]: mid })) lo = mid; else hi = mid; }
+            want[k] = lo;
+          }
           for (const k of RES) {
             if (!want[k] || test(want)) continue;
             let lo = 0, hi = want[k];
@@ -1919,9 +2090,9 @@
         const total = sumRes(want);
         const completes = RES.every((k) => want[k] >= need[k]);
         if (total <= 0 || (total < minShip && !completes)) continue;
-        plan.push({ from: donorId, to: best.townId, ship: want, eta, label: best.items[0]?.label || '' });
+        plan.push({ from: donorId, to: best.townId, ship: want, eta, label: best.topLabel || best.items[0]?.label || '' });
         d.cap -= total;
-        for (const k of RES) { d.surplus[k] -= want[k]; best.miss[k] -= want[k]; r.incoming[k] += want[k]; }
+        for (const k of RES) { d.surplus[k] -= want[k]; best.miss[k] -= want[k]; best.topMiss[k] = Math.max(0, best.topMiss[k] - want[k]); r.incoming[k] += want[k]; }
         r.arrivals.push({ t: eta, ...want });
       }
     }
@@ -1945,10 +2116,12 @@
       } catch (e) {
         tradeRuntime.pairCooldown.set(`${p.from}>${p.to}`, Date.now() + 5 * 60000);
         tradeLog(`${farmTownName(p.from)} → ${farmTownName(p.to)}: ${e.message}`, 'error');
+        // Si fue un corte/tiempo agotado el envío pudo salir igual: releer lo que va de camino.
+        setTimeout(refreshOverviews, 3000);
       }
       await sleep(700 + Math.random() * 900);
     }
-    if (plan.length && state.activeTab === 'comercio') renderBody();
+    if (plan.length) renderIfIdle('comercio');
   }
 
   function startTradeEngine() {
@@ -2007,7 +2180,7 @@
       planInfo.needs.length
         ? el('div', { class: 'nb-queue' }, planInfo.needs.map((n) => el('div', { class: 'nb-queue-item' }, [
             el('span', {}, [`${farmTownName(n.townId)} `, el('b', { class: 'nb-queue-level' }, n.label)]),
-            el('span', { class: 'nb-queue-time' }, fmtRes(n.miss) || 'cubierto')
+            el('span', { class: 'nb-queue-time' }, `falta ${fmtRes(n.missInit)}`)
           ])))
         : el('p', { class: 'nb-placeholder' }, 'Ninguna ciudad espera recursos.')
     ]));
@@ -2033,11 +2206,9 @@
      8d) RECLUTAMIENTO (tierra y mar) — lotes que llenan el almacén
      -----------------------------------------------------------------------------
      Por ciudad: lista de tropas con un total objetivo. El bot calcula el LOTE
-     más grande que cabe en el almacén (mezclando las tropas pedidas para
-     aprovechar los 3 recursos a la vez), espera a tener ese lote (el recurso
-     que más pide el lote llega a su tope) y entonces recluta todo de golpe.
-     Mientras espera, el lote se publica como demanda al Comercio, que manda
-     justo los recursos que faltan (en la proporción que pide la mezcla).
+     (una sola tropa, lo máximo que cabe en el almacén), espera a tenerlo y lo
+     recluta de golpe. Mientras espera, el lote se publica como demanda al
+     Comercio, que manda justo los recursos que faltan.
 
      Petición: POST building_barracks?action=build (tierra) / building_docks (mar)
                json: { unit_id, amount, town_id, nl_init:true }
@@ -2091,20 +2262,21 @@
         }
       } catch {}
     }
-    if (Object.keys(units).length) realCosts.set(+townId, { at: Date.now(), units });
+    if (Object.keys(units).length) realCosts.set(+townId, { at: Date.now(), units, heroes: heroesPresentKey(townId) });
   }
-  // Llegadas de héroes a la ciudad: al llegar cambia el coste (hay que releerlo).
-  function heroArrivalsIn(townId) {
+  // Héroes que están YA en la ciudad (llegados). Al llegar el juego pone
+  // town_arrival_at a null, así que se compara la lista, no la hora.
+  function heroesPresentKey(townId) {
     try {
       return [].concat(UW.MM.getCollections().PlayerHero || []).flatMap((c) => c?.models || []).map((m) => m.attributes)
-        .filter((h) => +h.home_town_id === +townId && +h.town_arrival_at > 0).map((h) => +h.town_arrival_at * 1000);
-    } catch { return []; }
+        .filter((h) => +h.home_town_id === +townId && !(+h.town_arrival_at * 1000 > Date.now())).map((h) => `${h.type}:${h.level}`).sort().join(',');
+    } catch { return ''; }
   }
   function realCostsStale(townId) {
     const c = realCosts.get(+townId);
     if (!c) return true;
     if (Date.now() - c.at > 5 * 60000) return true;
-    return heroArrivalsIn(townId).some((t) => t > c.at && t <= Date.now()); // un héroe llegó después de la última lectura
+    return c.heroes !== heroesPresentKey(townId); // llegó, se fue o subió de nivel un héroe
   }
 
   /* Héroes que abaratan tropas. El % sale de los datos del propio juego:
@@ -2147,10 +2319,8 @@
     return out;
   }
 
-  // Coste por tropa: tabla base del juego (GameData.units[id].resources).
-  // No se aplica el descuento de la Leva: en una orden real de 19. NOVA (con
-  // Leva) el reembolso por unidad es justo el 50% del coste BASE, así que no está
-  // claro que se aplique; usando la base el lote nunca se queda corto.
+  // Coste por tropa: el real del juego (investigaciones + héroes ya en la ciudad);
+  // si aún no se ha leído, la tabla base × factor de investigación de la vista general.
   // atMs: momento en que se va a reclutar. Si para entonces habrá llegado un héroe
   // que abarata esa tropa (y ahora aún no está), se aplica su descuento por adelantado.
   function unitCost(townId, id, atMs = null) {
@@ -2177,6 +2347,9 @@
 
   const isNavalUnit = (id) => !!UW.GameData?.units?.[id]?.is_naval;
   const isMythUnit = (id) => +UW.GameData?.units?.[id]?.favor > 0;
+  const unitTag = (id) => isMythUnit(id) ? el('span', { class: 'nb-tag nb-tag-myth' }, 'mítica')
+    : isNavalUnit(id) ? el('span', { class: 'nb-tag nb-tag-naval' }, 'naval')
+    : el('span', { class: 'nb-tag nb-tag-land' }, 'terrestre');
 
   function townGod(townId) {
     try { return UW.ITowns.getTown(townId)?.god?.() || null; } catch { return null; }
@@ -2223,11 +2396,18 @@
     return out.sort((a, b) => (grp(a) - grp(b)) || unitName(a).localeCompare(unitName(b), 'es'));
   }
 
+  // Tropas propias de la ciudad: en casa + fuera (atacando / apoyando). Las que
+  // están fuera también cuentan para el objetivo (si no, se volverían a reclutar).
+  // Comprobado: vista de reclutamiento total = count (en casa) + fuera.
   function townUnitsHave(townId) {
     const out = {};
-    try { Object.assign(out, UW.ITowns.getTown(townId)?.units?.() || {}); } catch {}
+    try {
+      const t = UW.ITowns.getTown(townId);
+      const home = t?.units?.() || {}, outer = t?.unitsOuter?.() || {};
+      for (const id of new Set([...Object.keys(home), ...Object.keys(outer)])) out[id] = (+home[id] || 0) + (+outer[id] || 0);
+    } catch {}
     const ov = overview.recruit.get(+townId)?.units;
-    if (ov) for (const [id, u] of Object.entries(ov)) out[id] = Math.max(+out[id] || 0, u.count);
+    if (ov) for (const [id, u] of Object.entries(ov)) out[id] = Math.max(+out[id] || 0, u.total || u.count);
     return out;
   }
   function townUnitOrders(townId) {
@@ -2383,7 +2563,7 @@
         }
         await sleep(700 + Math.random() * 800);
       }
-      if (state.activeTab === 'reclutamiento') renderBody();
+      renderIfIdle('reclutamiento');
     }
   }
 
@@ -2470,6 +2650,8 @@
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Cola Cuartel / Puerto'),
         el('span', { class: 'nb-row-value' }, ['ground', 'naval'].map((k) => `${buildQueueLimit() - unitQueueFree(townId, k)}/${buildQueueLimit()}`).join(' · '))])
     ]));
+    const prioWarn = anyRecruitOn() ? prioExcludedAlert('reclutamiento') : null;
+    if (prioWarn) bodyEl.appendChild(prioWarn);
 
     // Siguiente lote
     const b = recruitBatch(townId);
@@ -2493,6 +2675,11 @@
         el('div', { class: 'nb-goal-sub' }, `${b.pop} de población${b.favor ? ` · ${Math.ceil(b.favor)} favor (${Math.floor(godFavor(townGod(townId)))} disponible)` : ''}`),
         ...bars
       ]);
+      // Hay recursos pero parte está apartada para un módulo con más prioridad.
+      const fr = reserveAbove(townId, 'reclutamiento');
+      if (RES.every((k) => cur[k] >= b.cost[k]) && RES.some((k) => cur[k] - fr[k] < b.cost[k])) {
+        lotBox.appendChild(el('div', { class: 'nb-alert nb-alert-warn' }, `Esperando: parte de los recursos está reservada para ${reserveOwner(townId, 'reclutamiento') || 'otro módulo'} (prioridad).`));
+      }
     }
     const heroNotes = [];
     for (const h of heroCostBonuses(townId)) {
@@ -2527,7 +2714,7 @@
       input.addEventListener('change', () => setTarget(g.id, pos(input.value, g.target)));
       goalsBox.appendChild(el('div', { class: `nb-goal${h >= g.target ? ' nb-goal-done' : ''}` }, [
         el('div', { class: 'nb-goal-main' }, [
-          el('div', { class: 'nb-goal-name' }, [unitName(g.id), isMythUnit(g.id) ? el('span', { class: 'nb-tag nb-tag-myth' }, 'mítica') : isNavalUnit(g.id) ? el('span', { class: 'nb-tag' }, 'naval') : null]),
+          el('div', { class: 'nb-goal-name' }, [unitName(g.id), unitTag(g.id)]),
           el('div', { class: 'nb-goal-sub' }, `tienes ${+have[g.id] || 0}${queued[g.id] ? ` + ${queued[g.id]} en cola` : ''} · faltan ${Math.max(0, g.target - h)}`)
         ]),
         el('div', { class: 'nb-stepper' }, [
@@ -2546,16 +2733,26 @@
     // Añadir tropa
     const avail = landUnitsFor(townId).filter((id) => !tcfg.goals.some((g) => g.id === id));
     const addList = el('div', { class: 'nb-add-list' });
+    // Lo que vas escribiendo se guarda (por ciudad y tropa) para que no se borre
+    // al añadir otra tropa o al repintarse el panel. Sin número por defecto.
+    const drafts = (renderReclutamientoTab.drafts ||= {});
+    const draftKey = (id) => `${townId}:${id}`;
     for (const id of avail) {
       const c = unitCost(townId, id);
       const h = (+have[id] || 0) + (+queued[id] || 0);
-      const input = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '1', value: String(h + 100) });
-      const add = () => setTarget(id, Math.max(h + 1, pos(input.value, h + 100)));
+      const input = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '1', placeholder: 'total', value: drafts[draftKey(id)] || '' });
+      input.addEventListener('input', () => { if (input.value) drafts[draftKey(id)] = input.value; else delete drafts[draftKey(id)]; });
+      const add = () => {
+        const v = pos(input.value, 0);
+        if (!v || v <= h) { input.focus(); input.select?.(); return; }
+        delete drafts[draftKey(id)];
+        setTarget(id, v);
+      };
       input.addEventListener('keydown', (e) => { if (e.key === 'Enter') add(); });
       addList.appendChild(el('div', { class: 'nb-add-row' }, [
         el('div', { class: 'nb-add-name' }, [
           el('span', {}, unitName(id)),
-          isMythUnit(id) ? el('span', { class: 'nb-tag nb-tag-myth' }, 'mítica') : isNavalUnit(id) ? el('span', { class: 'nb-tag' }, 'naval') : null,
+          unitTag(id),
           el('span', { class: 'nb-add-level' }, `tienes ${h} · ${c.wood}/${c.stone}/${c.iron}${c.favor ? ` · ${c.favor} favor` : ''} · ${c.pop} pob`)
         ]),
         el('div', { class: 'nb-stepper' }, [input, el('span', { class: 'nb-mini nb-mini-add', title: 'Añadir (total objetivo)', onclick: add }, '✓')])
@@ -2912,7 +3109,8 @@
   // ---------- cola ----------
   function atkLoad() { try { atk.queue = JSON.parse(localStorage.getItem(ATK_KEY) || '[]'); } catch { atk.queue = []; } }
   function atkSave() {
-    try { localStorage.setItem(ATK_KEY, JSON.stringify(atk.queue.map(({ _pre, _armed, ...rest }) => rest))); } catch {}
+    // (los campos "_" son de esta sesión: precarga, armado… no se guardan)
+    try { localStorage.setItem(ATK_KEY, JSON.stringify(atk.queue.map((a) => Object.fromEntries(Object.entries(a).filter(([k]) => !k.startsWith('_')))))); } catch {}
   }
   const atkCorrection = () => clamp(+state.ataques?.correctionMs || 0, -1500, 1500);
 
@@ -2920,9 +3118,17 @@
     const p = { id: +a.target, type: a.type, nl_init: true };
     const used = {}, missing = [];
     let total = 0;
+    // Tren desde la misma ciudad: las tropas de los envíos anteriores aún sin salir
+    // no están disponibles para este (si no, se pediría de más y el juego lo rechaza).
+    const before = {};
+    for (const o of atk.queue) {
+      if (o === a || +o.source !== +a.source || !['pending', 'sending'].includes(o.status) || o.executeAt > a.executeAt) continue;
+      if (o.executeAt === a.executeAt && String(o.id) > String(a.id)) continue;
+      for (const [k, v] of Object.entries(o.units || {})) before[k] = (before[k] || 0) + Math.max(0, Math.floor(+v || 0));
+    }
     for (const [k, v] of Object.entries(a.units)) {
       const req = Math.max(0, Math.floor(+v || 0)); if (!req) continue;
-      const have = Math.max(0, Math.floor(+info?.units?.[k]?.count || 0));
+      const have = Math.max(0, Math.floor(+info?.units?.[k]?.count || 0) - (before[k] || 0));
       const n = Math.min(req, have);
       if (n > 0) { p[k] = n; used[k] = n; total += n; }
       if (n < req) missing.push(`${atkUnitName(k)} ${n}/${req}`);
@@ -2946,6 +3152,13 @@
 
   async function atkFire(a) {
     if (a.status !== 'pending') return;
+    // El temporizador puede dispararse tarde (PC en reposo, pestaña congelada): no se envía tarde.
+    const late = srvNow() - a.executeAt;
+    if (late > ATK_MISS_TOLERANCE_MS) {
+      a.status = 'missed'; a.error = `No se envió: la hora de salida pasó hace ${fmtDur(late)} (¿página cerrada o PC en reposo?).`;
+      atkLog(`${farmTownName(a.source)} → ${a.targetName}: perdido (no se envía tarde).`, 'error');
+      delete a._pre; delete a._armed; atkSave(); atkRefreshQueue(); return;
+    }
     a.status = 'sending'; atkRefreshQueue();
     try {
       let pre = a._pre;
@@ -3009,8 +3222,9 @@
       if (a.mode === 'arrival' && !a._rechecked && left < ATK_RECHECK_MS && left > ATK_PREFETCH_MS) {
         a._rechecked = true; atkRecheck(a);
       }
-      if (!a._pre && !a._prefetching && left < ATK_PREFETCH_MS && left > 400) {
-        a._prefetching = true;
+      // Precarga (como mucho un intento cada 2 s: si falla no se inunda al servidor).
+      if (!a._pre && !a._prefetching && left < ATK_PREFETCH_MS && left > 400 && Date.now() - (a._prefetchAt || 0) > 2000) {
+        a._prefetching = true; a._prefetchAt = Date.now();
         attackInfo(a.source, a.target, 0)
           .then((info) => { a._pre = { at: Date.now(), ...buildPayload(a, info) }; })
           .catch(() => {})
@@ -3066,10 +3280,10 @@
   function atkRefreshQueue() {
     if (!atkQueueEl || state.activeTab !== 'ataques') return;
     atkQueueEl.innerHTML = '';
-    const order = { sending: 0, pending: 1, error: 2, missed: 2, skipped: 3, sent: 4 };
+    const order = { sending: 0, pending: 1, editing: 1, error: 2, missed: 2, skipped: 3, sent: 4 };
     const list = atk.queue.slice().sort((a, b) => (order[a.status] - order[b.status]) || (a.status === 'sent' ? b.executeAt - a.executeAt : a.executeAt - b.executeAt));
     if (!list.length) { atkQueueEl.appendChild(el('p', { class: 'nb-placeholder' }, 'No hay nada programado.')); return; }
-    const label = { pending: 'programado', sending: 'enviando…', sent: 'enviado', error: 'error', missed: 'perdido', skipped: 'no enviado' };
+    const label = { pending: 'programado', editing: 'en edición', sending: 'enviando…', sent: 'enviado', error: 'error', missed: 'perdido', skipped: 'no enviado' };
     for (const a of list) {
       const units = Object.entries(a.units).map(([k, n]) => `${n} ${atkUnitName(k)}`).join(' · ');
       const actions = [];
@@ -3077,6 +3291,10 @@
         actions.push(el('span', { class: 'nb-mini', title: 'Duplicar llegando 1 s después (tren)', onclick: () => atkDuplicate(a) }, '+1s'));
         actions.push(el('span', { class: 'nb-mini', title: 'Editar', onclick: () => atkEdit(a) }, '✎'));
         actions.push(el('span', { class: 'nb-mini nb-mini-danger', title: 'Cancelar', onclick: () => { atkTimerClear(a.id); atk.queue = atk.queue.filter((x) => x !== a); atkSave(); atkRefreshQueue(); } }, '✕'));
+      } else if (a.status === 'editing') {
+        actions.push(el('span', { class: 'nb-mini', title: 'Reanudar sin cambios', onclick: () => { a.status = 'pending'; if (atk.form.replaceId === a.id) atk.form.replaceId = null; atkSave(); atkRefreshQueue(); } }, '▶'));
+        actions.push(el('span', { class: 'nb-mini', title: 'Editar', onclick: () => atkEdit(a) }, '✎'));
+        actions.push(el('span', { class: 'nb-mini nb-mini-danger', title: 'Cancelar', onclick: () => { atk.queue = atk.queue.filter((x) => x !== a); atkSave(); atkRefreshQueue(); } }, '✕'));
       } else {
         if (a.status === 'missed' || a.status === 'error') actions.push(el('span', { class: 'nb-mini', title: 'Volver a programar (editar)', onclick: () => atkEdit(a) }, '✎'));
         actions.push(el('span', { class: 'nb-mini', title: 'Quitar de la lista', onclick: () => { atk.queue = atk.queue.filter((x) => x !== a); atkSave(); atkRefreshQueue(); } }, '✕'));
@@ -3109,10 +3327,12 @@
     Object.assign(f, {
       source: a.source, target: atk.worldById.get(a.target) || { id: a.target, name: a.targetName, player: '', ally: '', points: 0 },
       units: { ...a.units }, hero: a.hero || '', spell: a.spell || '', type: a.type, strategy: a.strategy || '',
-      mode: a.mode, time: fmtClock(a.wantAt), onMissing: a.onMissing || 'partial', info: null
+      mode: a.mode, time: fmtClock(a.wantAt), onMissing: a.onMissing || 'partial', info: null, replaceId: a.id
     });
+    // No se borra: queda "en edición" (no sale) hasta que guardes el cambio; si
+    // sales del formulario sin guardar, se puede reanudar desde la lista.
     atkTimerClear(a.id);
-    atk.queue = atk.queue.filter((x) => x !== a);
+    if (a.status === 'pending') { a.status = 'editing'; delete a._pre; delete a._armed; }
     atkSave();
     atk.view = 'new';
     renderBody();
@@ -3210,8 +3430,13 @@
     };
     const danger = atkWarnings(item, info, plan.arrivalAt).filter((w) => w.lvl === 'danger');
     if (danger.length && !confirm(`Atención:\n· ${danger.map((w) => w.txt).join('\n· ')}\n\n¿Programar igualmente?`)) return;
+    if (f.replaceId) {
+      const old = atk.queue.find((x) => x.id === f.replaceId);
+      if (old && ['editing', 'missed', 'error', 'skipped'].includes(old.status)) { atkTimerClear(old.id); atk.queue = atk.queue.filter((x) => x !== old); }
+      f.replaceId = null;
+    }
     atk.queue.push(item); atkSave();
-    atk.recent = [f.target, ...atk.recent.filter((t) => t.id !== f.target.id)].slice(0, 6);
+    atk.recent =[f.target, ...atk.recent.filter((t) => t.id !== f.target.id)].slice(0, 6);
     atkLog(`Programado: ${farmTownName(item.source)} → ${item.targetName}, sale ${fmtWhen(item.executeAt)}, llega ${fmtWhen(item.arrivalAt)}.`, 'ok');
     // Tren: mantener objetivo y avanzar la hora para el siguiente.
     if (f.keep) { f.units = {}; if (/^\d{2}:\d{2}:\d{2}$/.test(normTime(f.time))) f.time = fmtClock(nextWallTime(normTime(f.time), srvNow()) + (+f.step || 1) * 1000); }
@@ -3382,7 +3607,14 @@
     });
 
     const section = (n, title, children) => el('div', { class: 'nb-step' }, [el('div', { class: 'nb-step-head' }, [el('span', { class: 'nb-step-n' }, String(n)), el('span', {}, title)]), ...[].concat(children)]);
+    const editing = f.replaceId ? atk.queue.find((x) => x.id === f.replaceId) : null;
+    if (f.replaceId && !editing) f.replaceId = null;
+    const editBanner = editing ? el('div', { class: 'nb-alert nb-alert-info' }, [
+      el('span', {}, `Editando: ${farmTownName(editing.source)} → ${editing.targetName}. Al programar se sustituye.`),
+      el('span', { class: 'nb-btn nb-btn-sm', onclick: () => { if (editing.status === 'editing') editing.status = 'pending'; f.replaceId = null; atkSave(); renderBody(); } }, 'Cancelar edición')
+    ]) : null;
     bodyEl.appendChild(el('div', { class: 'nb-card nb-form' }, [
+      editBanner,
       section(1, 'Origen', srcSel),
       section(2, 'Objetivo', targetBox),
       section(3, 'Tipo', [typeSeg, stratSel]),
@@ -3417,19 +3649,21 @@
        POST building_place?action=start_celebration  json: { celebration_type:"party", town_id }
      Festivales en curso: MM.getModels().Celebration → { town_id, celebration_type, finished_at }.
      Comercio: cada ciudad apta sin festival publica como demanda JUSTO lo que le falta
-     para el festival. Con "festival primero", construcción y reclutamiento no gastan
-     por debajo de ese coste en esas ciudades.
+     para el festival. Quién gasta primero en la ciudad lo decide la Prioridad (8a).
   --------------------------------------------------------------------------------- */
   const FESTIVAL_COST = { wood: 15000, stone: 18000, iron: 15000 };
   const FESTIVAL_ACADEMY = 30;
-  const festRuntime = { timer: null, running: false, log: [], cooldown: new Map() };
+  const festRuntime = { timer: null, running: false, log: [], cooldown: new Map(), startedUntil: new Map() };
   let festLogEl = null;
 
+  // Nivel REAL (terminado). building_data.level ya cuenta lo que está en cola,
+  // y con la Academia 30 aún en cola el festival no se puede hacer.
   function academyLevel(townId) {
-    const bd = buildDataFor(townId);
-    const l = +bd?.building_data?.academy?.level;
-    if (Number.isFinite(l) && l > 0) return l;
-    try { return +UW.ITowns.getTown(townId)?.getBuildings?.()?.attributes?.academy || 0; } catch { return 0; }
+    try {
+      const v = UW.ITowns.getTown(townId)?.getBuildings?.()?.attributes?.academy;
+      if (v !== undefined && v !== null && Number.isFinite(+v)) return +v;
+    } catch {}
+    return +buildDataFor(townId)?.building_data?.academy?.level || 0;
   }
   function festivalEnd(townId) {
     try {
@@ -3448,7 +3682,8 @@
     } catch { return 0; }
   }
   const canFestival = (townId) => academyLevel(townId) >= FESTIVAL_ACADEMY;
-  const festivalPending = (townId) => state.festivales.enabled && canFestival(townId) && !festivalEnd(townId);
+  // (tras iniciarlo, hasta que el juego actualice sus datos, se da por en marcha)
+  const festivalPending = (townId) => state.festivales.enabled && canFestival(townId) && !festivalEnd(townId) && !((festRuntime.startedUntil.get(+townId) || 0) > Date.now());
 
   tradeDemandProviders.push(function festivalDemands() {
     if (!state.festivales.enabled || !state.comercio.forFestival) return [];
@@ -3473,13 +3708,14 @@
         await gpPostAs(townId, 'building_place', 'start_celebration', { celebration_type: 'party', nl_init: true });
         festLog(`${farmTownName(townId)}: festival iniciado.`, 'ok');
         festRuntime.cooldown.set(townId, Date.now() + 60000);
+        festRuntime.startedUntil.set(+townId, Date.now() + 6 * 3600000); // dura 6 h
       } catch (e) {
         festLog(`${farmTownName(townId)}: ${e.message}`, 'error');
         festRuntime.cooldown.set(townId, Date.now() + 5 * 60000);
       }
       await sleep(600 + Math.random() * 700);
     }
-    if (state.activeTab === 'festivales') renderBody();
+    renderIfIdle('festivales');
   }
 
   function startFestivalEngine() {
@@ -3520,7 +3756,9 @@
       else {
         const miss = Object.fromEntries(RES.map((k) => [k, Math.max(0, FESTIVAL_COST[k] - cur[k])]));
         const missAfter = Object.fromEntries(RES.map((k) => [k, Math.max(0, miss[k] - inc[k])]));
-        if (!sumRes(miss)) { sub = 'Listo: se inicia en el próximo ciclo'; cls = ' nb-goal-next'; }
+        const fr = reserveAbove(r.id, 'festivales');
+        if (!sumRes(miss) && RES.some((k) => cur[k] - fr[k] < FESTIVAL_COST[k])) sub = `Esperando: recursos reservados para ${reserveOwner(r.id, 'festivales') || 'otro módulo'} (prioridad)`;
+        else if (!sumRes(miss)) { sub = 'Listo: se inicia en el próximo ciclo'; cls = ' nb-goal-next'; }
         else sub = `Faltan ${fmtRes(miss)}${sumRes(inc) ? ` · en camino ${fmtRes(inc)}${sumRes(missAfter) ? '' : ' (cubre)'}` : ''}`;
       }
       const pct = Math.min(100, Math.round(RES.reduce((s, k) => s + Math.min(cur[k], FESTIVAL_COST[k]), 0) / sumRes(FESTIVAL_COST) * 100));
