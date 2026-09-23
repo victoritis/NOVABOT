@@ -7,7 +7,7 @@
    ===================================================================================== */
 
 :root{
-  --nb-css-version:   "1.5.9";
+  --nb-css-version:   "1.6.1";
 
   /* superficies */
   --nb-bg:            #111419;
@@ -297,7 +297,12 @@
 #novabot-panel .nb-goal-actions{ display: flex; gap: 3px; flex: none; padding-left: 6px; border-left: 1px solid var(--nb-border-soft); }
 
 /* ---------- añadir (edificio / tropa) ---------- */
-#novabot-panel .nb-add-list{ display: flex; flex-direction: column; gap: 4px; margin-top: 8px; max-height: 280px; overflow-y: auto; padding-right: 2px; }
+/* fichas en rejilla: 1 columna en panel estrecho, 2-3 en ancho */
+#novabot-panel .nb-add-list{
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(270px, 1fr)); gap: 6px;
+  margin-top: 8px; max-height: 420px; overflow-y: auto; padding-right: 2px; align-content: start;
+}
+#novabot-panel .nb-add-list > .nb-placeholder{ grid-column: 1 / -1; }
 #novabot-panel .nb-add-row{
   display: flex; align-items: center; justify-content: space-between; gap: 10px;
   padding: 7px 9px; border-radius: var(--nb-radius-sm);
@@ -496,3 +501,15 @@
 #novabot-panel .nb-goal > .nb-icon, #novabot-panel .nb-add-row > .nb-icon{ margin-right: 10px; }
 #novabot-panel .nb-add-row > .nb-add-name{ flex: 1 1 auto; min-width: 0; }
 #novabot-panel .nb-unit-cell > .nb-icon{ margin-right: 6px; }
+
+/* iconos pequeños: edificios 40x40 reducidos a 20, recursos, héroes */
+#novabot-panel .nb-icon-20{ width: 40px; height: 40px; zoom: .5; border-radius: 12px; }
+#novabot-panel .nb-card-title{ display: flex; align-items: center; gap: 7px; }
+#novabot-panel .nb-card-title > .nb-icon{ box-shadow: 0 0 0 2px var(--nb-border); }
+#novabot-panel .nb-tile-title{ display: inline-flex; align-items: center; gap: 7px; }
+#novabot-panel .nb-res-icon{ display: inline-block; flex: 0 0 auto; width: 22px; height: 16px; vertical-align: middle; background-repeat: no-repeat; }
+#novabot-panel .nb-res-list{ display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
+#novabot-panel .nb-res{ display: inline-flex; align-items: center; gap: 3px; font-variant-numeric: tabular-nums; }
+#novabot-panel .nb-bar-label{ display: inline-flex; align-items: center; gap: 4px; }
+#novabot-panel .nb-with-icon{ display: flex; align-items: center; gap: 8px; }
+#novabot-panel .nb-power-25, #novabot-panel .power_icon30x30.nb-icon-25{ zoom: .84; width: 30px; height: 30px; }

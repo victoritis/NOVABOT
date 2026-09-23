@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.5.9
+// @version      1.6.1
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -50,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.5.9';
+  const VERSION = '1.6.1';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -168,6 +168,8 @@
   }
 
   let state = loadState();
+  // v1.6.1: panel más grande por defecto → se olvida una vez el tamaño guardado.
+  if (state.layoutV !== 2) { state.size = null; state.pos = null; state.layoutV = 2; try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch {} }
 
   /* ---------------------------------------------------------------------------------
      4) ESTILOS — carga novabot.css declarado en @resource y lo inyecta.
@@ -259,7 +261,29 @@
   // Iconos del propio juego: sus clases CSS (sprites) ya están cargadas en la
   // página, así que basta con ponerlas (p. ej. "unit_icon40x40 big_transporter").
   const unitIcon = (id, size = 40) => el('span', { class: `nb-icon nb-icon-${size} unit_icon${size}x${size} ${id}` });
-  const buildingIcon = (id) => el('span', { class: `nb-icon nb-icon-40 building_icon40x40 ${id}` });
+  const buildingIcon = (id, small = false) => el('span', { class: `nb-icon ${small ? 'nb-icon-20' : 'nb-icon-40'} building_icon40x40 ${id}` });
+  const resIcon = (k) => el('span', { class: `nb-res-icon resources_small ${k}`, title: ({ wood: 'Madera', stone: 'Piedra', iron: 'Plata', favor: 'Favor', population: 'Población' })[k] || k });
+  const heroIcon = (type) => el('span', { class: `nb-icon nb-icon-25 hero_icon hero25x25 ${type}` });
+  // Recursos con sus iconos del juego: [icono 1200] [icono 300]…
+  const fmtResEl = (r) => el('span', { class: 'nb-res-list' }, RES.filter((k) => (+r?.[k] || 0) > 0)
+    .map((k) => el('span', { class: 'nb-res' }, [resIcon(k), String(Math.round(r[k]))])));
+  // Icono de cada módulo (edificio del juego que lo representa).
+  const MODULE_ICON = { granjas: 'farm', construccion: 'main', reclutamiento: 'barracks', comercio: 'market', festivales: 'place', ataques: 'wall', inicio: 'main', prioridad: 'storage' };
+  // Títulos de tarjeta: icono pequeño del edificio correspondiente (adorno).
+  const TITLE_ICON = [
+    [/prioridad/i, 'storage'], [/en camino|necesidades/i, 'market'], [/lote|tropa/i, 'barracks'],
+    [/aptas|festival/i, 'place'], [/cola del juego|edificio|objetivos del bot/i, 'main'],
+    [/recolec|aldea|almacén llega/i, 'farm'], [/programados|nuevo|objetivo|origen/i, 'wall'], [/actividad/i, 'hide']
+  ];
+  function decorateTitles(root) {
+    for (const t of root.querySelectorAll('.nb-card-title')) {
+      if (t.querySelector('.nb-icon')) continue;
+      const txt = t.textContent || '';
+      const hit = TITLE_ICON.find(([re]) => re.test(txt));
+      const id = hit ? hit[1] : MODULE_ICON[state.activeTab];
+      if (id) t.prepend(buildingIcon(id, true));
+    }
+  }
 
   function optionRow(label, hint, on, onToggle) {
     return el('div', { class: 'nb-row nb-option' }, [
@@ -298,6 +322,7 @@
 
   function renderBody() {
     bodyEl.innerHTML = '';
+    queueMicrotask(() => { try { decorateTitles(bodyEl); } catch {} });
 
     if (!stylesLoaded) {
       bodyEl.appendChild(el('div', { class: 'nb-card' }, [
@@ -356,7 +381,7 @@
     const mod = (tab, title, cfgObj, hint) => {
       const tile = el('div', { class: `nb-tile${cfgObj.enabled ? ' on' : ''}` }, [
         el('div', { class: 'nb-tile-head' }, [
-          el('span', { class: 'nb-tile-title' }, title),
+          el('span', { class: 'nb-tile-title' }, [buildingIcon(MODULE_ICON[tab], true), title]),
           switchEl(!!cfgObj.enabled, (v) => { if (tab === 'construccion' || tab === 'reclutamiento') setModuleGlobal(tab, v); else { cfgObj.enabled = v; saveState(); } renderBody(); })
         ]),
         el('div', { class: 'nb-tile-metric' }, [metrics[tab] || '']),
@@ -379,7 +404,7 @@
         const nx = nextPending();
         const n = atk.queue.filter((a) => a.status === 'pending').length;
         const tile = el('div', { class: `nb-tile${n ? ' on' : ''}` }, [
-          el('div', { class: 'nb-tile-head' }, [el('span', { class: 'nb-tile-title' }, 'Ataques'), el('span', { class: 'nb-pill' + (n ? '' : ' nb-pill-off') }, `${n} programados`)]),
+          el('div', { class: 'nb-tile-head' }, [el('span', { class: 'nb-tile-title' }, [buildingIcon('wall', true), 'Ataques']), el('span', { class: 'nb-pill' + (n ? '' : ' nb-pill-off') }, `${n} programados`)]),
           el('div', { class: 'nb-tile-metric' }, nx ? [el('span', { 'data-atk-at': nx.executeAt }, ''), ` · ${nx.targetName}`] : ['—']),
           el('div', { class: 'nb-tile-hint' }, 'Ataques y apoyos al segundo')
         ]);
@@ -485,10 +510,12 @@
       panel.style.right = 'auto';
       panel.style.bottom = 'auto';
     } else {
-      panel.style.right = `${defaultRight}px`;
-      panel.style.bottom = `${defaultBottom}px`;
-      panel.style.left = 'auto';
-      panel.style.top = 'auto';
+      // Sin posición guardada: centrado en la pantalla.
+      const sz = state.size || defaultPanelSize();
+      panel.style.left = `${Math.max(4, Math.round((window.innerWidth - Math.min(sz.w, window.innerWidth - 8)) / 2))}px`;
+      panel.style.top = `${Math.max(4, Math.round((window.innerHeight - Math.min(sz.h, window.innerHeight - 8)) / 2))}px`;
+      panel.style.right = 'auto';
+      panel.style.bottom = 'auto';
     }
   }
 
@@ -508,12 +535,13 @@
     }
   }
 
+  // Tamaño por defecto: ancho para 3 columnas de fichas (≈ 960 px) y 85 % del alto.
+  const defaultPanelSize = () => ({ w: Math.min(960, window.innerWidth - 40), h: Math.min(Math.round(window.innerHeight * 0.85), 920) });
   function applyPanelSize() {
-    if (state.size) {
-      panel.style.width = `${Math.min(state.size.w, window.innerWidth - 8)}px`;
-      panel.style.height = `${Math.min(state.size.h, window.innerHeight - 8)}px`;
-      panel.style.maxHeight = 'none';
-    }
+    const sz = state.size || defaultPanelSize();
+    panel.style.width = `${Math.min(sz.w, window.innerWidth - 8)}px`;
+    panel.style.height = `${Math.min(sz.h, window.innerHeight - 8)}px`;
+    panel.style.maxHeight = 'none';
   }
 
   /**
@@ -2187,7 +2215,7 @@
       planInfo.needs.length
         ? el('div', { class: 'nb-queue' }, planInfo.needs.map((n) => el('div', { class: 'nb-queue-item' }, [
             el('span', {}, [`${farmTownName(n.townId)} `, el('b', { class: 'nb-queue-level' }, n.label)]),
-            el('span', { class: 'nb-queue-time' }, `falta ${fmtRes(n.missInit)}`)
+            el('span', { class: 'nb-queue-time' }, ['falta ', fmtResEl(n.missInit)])
           ])))
         : el('p', { class: 'nb-placeholder' }, 'Ninguna ciudad espera recursos.')
     ]));
@@ -2197,7 +2225,7 @@
       el('div', { class: 'nb-card-title' }, `En camino (${rows.length})`),
       rows.length
         ? el('div', { class: 'nb-queue' }, rows.map((r) => el('div', { class: 'nb-queue-item' }, [
-            el('span', {}, `${farmTownName(r.from)} → ${farmTownName(r.to)} · ${fmtRes(r)}`),
+            el('span', {}, [`${farmTownName(r.from)} → ${farmTownName(r.to)} `, fmtResEl(r)]),
             el('span', { class: 'nb-queue-time', 'data-nb-until': Math.round(r.arrival / 1000) }, formatLeft(Math.round(r.arrival / 1000)))
           ])))
         : el('p', { class: 'nb-placeholder' }, 'Nada en camino.')
@@ -2671,7 +2699,7 @@
       const bars = RES.filter((k) => b.cost[k] > 0).map((k) => {
         const pct = Math.min(100, Math.round(cur[k] / b.cost[k] * 100));
         return el('div', { class: 'nb-bar-row' }, [
-          el('span', { class: 'nb-bar-label' }, ({ wood: 'Madera', stone: 'Piedra', iron: 'Plata' })[k]),
+          el('span', { class: 'nb-bar-label' }, [resIcon(k), ({ wood: 'Madera', stone: 'Piedra', iron: 'Plata' })[k]]),
           el('div', { class: 'nb-bar' }, [el('div', { class: 'nb-bar-fill', style: `width:${pct}%` })]),
           el('span', { class: 'nb-bar-num' }, `${Math.floor(cur[k])}/${Math.ceil(b.cost[k])}`)
         ]);
@@ -2679,7 +2707,7 @@
       lotBox = el('div', {}, [
         el('div', { class: 'nb-goal-name' }, Object.entries(b.units).map(([u, n]) => `${n} ${unitName(u)}`).join(' + ')),
         el('div', { class: 'nb-goal-sub' }, b.tail ? 'Resto final (ya no llena un lote completo)' : b.full ? 'Lote completo: lo máximo que cabe en el almacén' : 'Lote recortado por la población libre'),
-        el('div', { class: 'nb-goal-sub' }, `${b.pop} de población${b.favor ? ` · ${Math.ceil(b.favor)} favor (${Math.floor(godFavor(townGod(townId)))} disponible)` : ''}`),
+        el('div', { class: 'nb-goal-sub nb-res-list' }, [el('span', { class: 'nb-res' }, [resIcon('population'), `${b.pop} de población`]), b.favor ? el('span', { class: 'nb-res' }, [resIcon('favor'), `${Math.ceil(b.favor)} favor (${Math.floor(godFavor(townGod(townId)))} disponible)`]) : null]),
         ...bars
       ]);
       // Hay recursos pero parte está apartada para un módulo con más prioridad.
@@ -2692,9 +2720,9 @@
     for (const h of heroCostBonuses(townId)) {
       const units = h.units.map((u) => unitName(u)).join(', ');
       const pctTxt = `−${Math.round(h.pct * 100)} %${h.favorOnly ? ' de favor' : ''} en ${h.units.length > 4 ? (h.favorOnly ? 'unidades míticas' : 'todas las naves') : units}`;
-      if (h.arrival <= Date.now()) heroNotes.push(el('div', { class: 'nb-alert nb-alert-info' }, `${h.name} está en la ciudad: ${pctTxt} (ya incluido en el coste del juego).`));
-      else if (scheduled && h.arrival <= tcfg.startAt) heroNotes.push(el('div', { class: 'nb-alert nb-alert-info' }, [`${h.name} llega en `, el('b', { 'data-nb-until': Math.round(h.arrival / 1000) }, formatLeft(Math.round(h.arrival / 1000))), `, antes de empezar: el lote ya cuenta con su descuento (${pctTxt}).`]));
-      else heroNotes.push(el('div', { class: 'nb-alert nb-alert-warn' }, [`${h.name} (${pctTxt}) llega en `, el('b', { 'data-nb-until': Math.round(h.arrival / 1000) }, formatLeft(Math.round(h.arrival / 1000))), scheduled ? ', DESPUÉS de empezar: retrasa el inicio para aprovecharlo.' : '. Programa "Empezar más tarde" para esperarlo.']));
+      if (h.arrival <= Date.now()) heroNotes.push(el('div', { class: 'nb-alert nb-alert-info nb-with-icon' }, [heroIcon(h.type), `${h.name} está en la ciudad: ${pctTxt} (ya incluido en el coste del juego).`]));
+      else if (scheduled && h.arrival <= tcfg.startAt) heroNotes.push(el('div', { class: 'nb-alert nb-alert-info nb-with-icon' }, [heroIcon(h.type), `${h.name} llega en `, el('b', { 'data-nb-until': Math.round(h.arrival / 1000) }, formatLeft(Math.round(h.arrival / 1000))), `, antes de empezar: el lote ya cuenta con su descuento (${pctTxt}).`]));
+      else heroNotes.push(el('div', { class: 'nb-alert nb-alert-warn nb-with-icon' }, [heroIcon(h.type), `${h.name} (${pctTxt}) llega en `, el('b', { 'data-nb-until': Math.round(h.arrival / 1000) }, formatLeft(Math.round(h.arrival / 1000))), scheduled ? ', DESPUÉS de empezar: retrasa el inicio para aprovecharlo.' : '. Programa "Empezar más tarde" para esperarlo.']));
     }
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
       el('div', { class: 'nb-card-title' }, 'Siguiente lote'),
@@ -3323,7 +3351,11 @@
               ? el('div', {}, [el('span', {}, 'Precisión'), el('b', { class: a.arrivalErr ? 'nb-warn-txt' : 'nb-ok' }, a.arrivalErr ? `${a.arrivalErr > 0 ? '+' : ''}${a.arrivalErr} s` : 'exacta')])
               : null
         ]),
-        el('div', { class: 'nb-goal-sub' }, `${units}${a.hero ? ` · héroe ${heroName(a.hero)}` : ''}${a.spell ? ' · hechizo' : ''}`),
+        el('div', { class: 'nb-goal-sub nb-res-list', title: units }, [
+          ...Object.entries(a.units).map(([k, n]) => el('span', { class: 'nb-res' }, [unitIcon(k, 25), String(n)])),
+          a.hero ? el('span', { class: 'nb-res', title: heroName(a.hero) }, [heroIcon(a.hero), heroName(a.hero)]) : null,
+          a.spell ? el('span', { class: 'nb-res' }, [el('span', { class: `nb-icon nb-icon-25 power_icon30x30 ${a.spell}` }), 'hechizo']) : null
+        ]),
         a.error ? el('div', { class: 'nb-goal-sub nb-err' }, a.error) : a.note ? el('div', { class: 'nb-goal-sub' }, a.note) : null,
         el('div', { class: 'nb-atk-actions' }, actions)
       ]));
@@ -3769,7 +3801,7 @@
         const fr = reserveAbove(r.id, 'festivales');
         if (!sumRes(miss) && RES.some((k) => cur[k] - fr[k] < FESTIVAL_COST[k])) sub = `Esperando: recursos reservados para ${reserveOwner(r.id, 'festivales') || 'otro módulo'} (prioridad)`;
         else if (!sumRes(miss)) { sub = 'Listo: se inicia en el próximo ciclo'; cls = ' nb-goal-next'; }
-        else sub = `Faltan ${fmtRes(miss)}${sumRes(inc) ? ` · en camino ${fmtRes(inc)}${sumRes(missAfter) ? '' : ' (cubre)'}` : ''}`;
+        else sub = el('span', {}, ['Faltan ', fmtResEl(miss), ...(sumRes(inc) ? [' · en camino ', fmtResEl(inc), sumRes(missAfter) ? '' : ' (cubre)'] : [])]);
       }
       const pct = Math.min(100, Math.round(RES.reduce((s, k) => s + Math.min(cur[k], FESTIVAL_COST[k]), 0) / sumRes(FESTIVAL_COST) * 100));
       list.appendChild(el('div', { class: `nb-goal${cls}` }, [
