@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.8.5
+// @version      1.8.7
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.8.5';
+  const VERSION = '1.8.7';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -147,6 +147,11 @@
         lotsAhead: 2,         // lotes que se piden al comercio por adelantado
         towns: {}             // townId -> { goals: [{id, target}] }
       },
+      aldeas: {
+        enabled: false,       // intercambio de recursos con las aldeas de la isla
+        minRatio: 0.85,       // solo si por cada 1 que doy me dan al menos esto
+        excessPct: 80         // "sobra" lo que pasa de este % del almacén
+      },
       comercio: {
         enabled: true,        // general, no por ciudad
         forBuild: true,       // abastecer la construcción
@@ -169,7 +174,7 @@
       if (raw && typeof raw === 'object') {
         const def = defaultState();
         const out = { ...def, ...raw };
-        for (const k of ['granjas', 'construccion', 'comercio', 'reclutamiento', 'ataques', 'festivales', 'prioridad', 'investigacion']) out[k] = { ...def[k], ...(raw[k] || {}) };
+        for (const k of ['granjas', 'aldeas', 'construccion', 'comercio', 'reclutamiento', 'ataques', 'festivales', 'prioridad', 'investigacion']) out[k] = { ...def[k], ...(raw[k] || {}) };
         // Prioridad guardada con el formato antiguo (preset): que prioMode() la convierta.
         if (raw.prioridad && !raw.prioridad.mode) delete out.prioridad.mode;
         return out;
@@ -1287,6 +1292,8 @@
       el('p', { class: 'nb-placeholder' }, 'Se comprueba madera, piedra y plata; si a alguna le falta para llegar, se sigue recolectando igual.')
     ]));
 
+    bodyEl.appendChild(renderExchangeCard());
+
     const logBox = el('div', { class: 'nb-log' });
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
       el('div', { class: 'nb-card-title' }, 'Actividad'),
@@ -1294,6 +1301,205 @@
     ]));
     farmLogEl = logBox;
     renderFarmLog();
+  }
+
+  /* ---------------------------------------------------------------------------------
+     8a-bis) INTERCAMBIO CON ALDEAS — si una ciudad tiene mucho de un recurso, lo cambia
+     con las aldeas de su isla por el que le falta, solo si la tasa es buena.
+     -----------------------------------------------------------------------------
+     Leído del código del juego (23/09/2026):
+       FarmTownPlayerRelation.trade(amount) →
+       POST frontend_bridge?action=execute
+         { model_url:'FarmTownPlayerRelation/<relId>', action_name:'trade', captcha:null,
+           arguments:{ farm_town_id, amount } }
+       Doy <amount> de resource_demand y recibo round(amount × tasa) de resource_offer.
+     Datos: MM.getCollections().FarmTown (isla, offer/demand) y FarmTownPlayerRelation
+     (relation_status 1 = mía, trade_ratio, ratio_updated_at, max_trade_capacity…).
+     La tasa se recupera sola 0,02 × velocidad por hora hasta 1,25.
+     No toca lo que el comercio necesita: solo cambia lo que sobra en TODO el imperio
+     (excedente de la ciudad por encima del % elegido, menos lo que otras ciudades
+     esperan de ese recurso) y nunca llena el almacén con lo que recibe.
+  --------------------------------------------------------------------------------- */
+  const exRuntime = { timer: null, running: false, pending: [], cooldown: new Map(), capGuess: new Map(), last: null };
+
+  function exCollection(name) {
+    try { return [].concat(UW.MM.getCollections()?.[name] || []).flatMap((c) => c?.models || []).map((m) => m.attributes); } catch { return []; }
+  }
+  // Tasa actual (lo que me dan por cada 1). Si el juego ya la tiene calculada, la
+  // mayor de las dos (la suya incluye bonificaciones).
+  function exRatio(rel, now = Date.now()) {
+    const def = +UW.Game?.constants?.farm_towns?.trade_ratio_default || 1.25;
+    const speed = +UW.Game?.game_speed || 1;
+    const base = +rel.trade_ratio || 0;
+    const upd = +rel.ratio_updated_at || 0;
+    const rec = upd ? Math.round(Math.max(0, now / 1000 - upd) / 3600 * 0.02 * speed * 100) / 100 : 0;
+    const mine = Math.min(def, base + rec);
+    return Math.max(mine, +rel.current_trade_ratio || 0);
+  }
+  // Máximo por intercambio: 3000 (límite del juego). Además lo limitan los
+  // comerciantes libres y lo que sobre (se aplica en exPlanTown). Si el juego
+  // rechaza, se reduce solo para esa aldea.
+  const EX_MAX = 3000;
+  function exMaxAmount(rel) {
+    let m = EX_MAX;
+    if (+rel.max_trade_capacity > 0) m = Math.min(m, +rel.max_trade_capacity);
+    if (exRuntime.capGuess.has(rel.id)) m = Math.min(m, exRuntime.capGuess.get(rel.id));
+    return m;
+  }
+  function exVillagesFor(townId) {
+    const xy = townXY(townId);
+    const farms = new Map(exCollection('FarmTown').map((f) => [+f.id, f]));
+    const out = [];
+    for (const rel of exCollection('FarmTownPlayerRelation')) {
+      if (+rel.relation_status !== 1) continue;
+      const f = farms.get(+rel.farm_town_id);
+      if (!f || +f.island_x !== xy.x || +f.island_y !== xy.y) continue;
+      if (!RES.includes(f.resource_demand) || !RES.includes(f.resource_offer) || f.resource_demand === f.resource_offer) continue;
+      out.push({ rel, farm: f, give: f.resource_demand, get: f.resource_offer, ratio: exRatio(rel) });
+    }
+    return out;
+  }
+  function exPendingTo(townId) {
+    const now = Date.now();
+    exRuntime.pending = exRuntime.pending.filter((p) => p.arrival > now);
+    const out = { wood: 0, stone: 0, iron: 0 };
+    for (const p of exRuntime.pending) if (p.townId === +townId) out[p.res] += p.amount;
+    return out;
+  }
+
+  // Estado del imperio para decidir qué sobra de verdad.
+  function exContext() {
+    const towns = allTownIds();
+    let demands = [];
+    try { demands = collectDemands(); } catch {}
+    let transit = [];
+    try { transit = transitRows(); } catch {}
+    const ctx = {};
+    const globalMiss = { wood: 0, stone: 0, iron: 0 };
+    for (const id of towns) {
+      const total = { wood: 0, stone: 0, iron: 0 }, reserve = { wood: 0, stone: 0, iron: 0 };
+      for (const d of demands) if (+d.townId === id) for (const k of RES) (d.reserveOnly ? reserve : total)[k] += +d[k] || 0;
+      const cur = townResources(id), inc = incomingTo(id, transit), pend = exPendingTo(id);
+      const miss = Object.fromEntries(RES.map((k) => [k, Math.max(0, total[k] - cur[k] - inc[k] - pend[k])]));
+      for (const k of RES) globalMiss[k] += miss[k];
+      ctx[id] = { cur, total, reserve, inc, pend, miss, storage: townStorage(id) || 0 };
+    }
+    return { towns, ctx, globalMiss };
+  }
+
+  // Plan de UNA ciudad: el mejor intercambio posible ahora (o null + motivo).
+  function exPlanTown(townId, E, cfg = state.aldeas) {
+    const c = E.ctx[townId];
+    if (!c || !c.storage) return { why: 'almacén desconocido' };
+    const pct = clamp(+cfg.excessPct || 80, 10, 100) / 100;
+    const minRatio = Math.max(0.1, +cfg.minRatio || 0.85);
+    const line = c.storage * pct;
+    const room = { wood: 0, stone: 0, iron: 0 }, excess = { wood: 0, stone: 0, iron: 0 };
+    for (const k of RES) {
+      const keep = Math.max(line, c.total[k], c.reserve[k]);
+      // Lo que otras ciudades esperan de este recurso lo pone antes el comercio (1:1).
+      const others = E.globalMiss[k] - c.miss[k];
+      excess[k] = Math.max(0, Math.floor(c.cur[k] - keep - Math.max(0, others)));
+      room[k] = Math.max(0, Math.floor(c.storage * 0.95 - c.cur[k] - c.inc[k] - c.pend[k]));
+    }
+    if (!RES.some((k) => excess[k] > 0)) return { why: 'nada sobra' };
+    let cap = tradeCapacityOf(townId);
+    if (cap <= 0) return { why: 'sin comerciantes libres' };
+    const now = Date.now();
+    let best = null;
+    for (const v of exVillagesFor(townId)) {
+      if ((exRuntime.cooldown.get(v.rel.id) || 0) > now) continue;
+      if (v.ratio + 1e-9 < minRatio || excess[v.give] <= 0) continue;
+      // No recibir un recurso que ya está en exceso (se cambiaría en círculo).
+      if (c.cur[v.get] + c.inc[v.get] + c.pend[v.get] >= line) continue;
+      const maxRecv = Math.min(room[v.get], Math.max(0, line - c.cur[v.get] - c.inc[v.get] - c.pend[v.get]) + c.miss[v.get]);
+      const amount = Math.floor(Math.min(excess[v.give], cap, exMaxAmount(v.rel), maxRecv / v.ratio));
+      if (amount < 100) continue;
+      // Mejor: lo que más falta al imperio, luego mejor tasa, luego más cantidad.
+      const score = (E.globalMiss[v.get] > 0 ? 1e9 : 0) + v.ratio * 1e6 + amount;
+      if (!best || score > best.score) best = { ...v, amount, receive: Math.round(amount * v.ratio), score };
+    }
+    return best ? { trade: best } : { why: `ninguna aldea con tasa ≥ ${minRatio}` };
+  }
+
+  async function exchangeTick() {
+    const cfg = state.aldeas;
+    if (!cfg.enabled) return;
+    const E = exContext();
+    let done = 0;
+    for (const townId of E.towns) {
+      if (done >= 3) break;
+      const p = exPlanTown(townId, E, cfg);
+      if (!p.trade) continue;
+      const t = p.trade;
+      try {
+        await gpPostAs(townId, 'frontend_bridge', 'execute', {
+          model_url: `FarmTownPlayerRelation/${t.rel.id}`, action_name: 'trade', captcha: null,
+          arguments: { farm_town_id: +t.farm.id, amount: t.amount }, nl_init: true
+        });
+        const dur = Math.max(30, +t.rel.trade_duration || 120);
+        exRuntime.pending.push({ townId, res: t.get, amount: t.receive, arrival: Date.now() + dur * 1000 + 15000 });
+        exRuntime.cooldown.set(t.rel.id, Date.now() + 3 * 60000);
+        // Descontar ya de la ciudad (hasta que el juego actualice sus datos).
+        E.ctx[townId].cur[t.give] -= t.amount;
+        E.ctx[townId].pend[t.get] += t.receive;
+        if (E.globalMiss[t.get] > 0) E.globalMiss[t.get] = Math.max(0, E.globalMiss[t.get] - t.receive);
+        done += 1;
+        farmLog(`${farmTownName(townId)}: ${t.amount} ${RES_ES[t.give]} → ${t.receive} ${RES_ES[t.get]} con ${t.farm.name} (tasa ${t.ratio.toFixed(2)}).`, 'ok');
+      } catch (e) {
+        exRuntime.cooldown.set(t.rel.id, Date.now() + 5 * 60000);
+        exRuntime.capGuess.set(t.rel.id, Math.max(500, Math.floor(t.amount / 2)));
+        farmLog(`${farmTownName(townId)}: intercambio con ${t.farm.name} rechazado (${e.message}).`, 'error');
+      }
+    }
+    exRuntime.last = Date.now();
+  }
+  const RES_ES = { wood: 'madera', stone: 'piedra', iron: 'plata' };
+
+  function startExchangeEngine() {
+    if (exRuntime.timer) return;
+    exRuntime.timer = setInterval(() => {
+      if (!state.aldeas.enabled || exRuntime.running) return;
+      exRuntime.running = true;
+      exchangeTick().catch((e) => farmLog(`Intercambio: ${e.message}`, 'error')).finally(() => { exRuntime.running = false; });
+    }, 60000);
+  }
+
+  function renderExchangeCard() {
+    const cfg = state.aldeas;
+    const ratioIn = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '0.5', max: '1.35', step: '0.05', value: cfg.minRatio });
+    ratioIn.addEventListener('change', () => { cfg.minRatio = clamp(+ratioIn.value || 0.85, 0.5, 1.35); saveState(); renderBody(); });
+    const pctIn = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '10', max: '100', step: '5', value: cfg.excessPct });
+    pctIn.addEventListener('change', () => { cfg.excessPct = clamp(pos(pctIn.value, 80), 10, 100); saveState(); renderBody(); });
+    // Vista previa de la ciudad abierta.
+    let preview = null;
+    const tid = +UW.Game?.townId;
+    if (tid) {
+      try {
+        const vs = exVillagesFor(tid);
+        const p = exPlanTown(tid, exContext(), cfg);
+        preview = el('div', { class: 'nb-mt' }, [
+          el('div', { class: 'nb-ex-list' }, vs.map((v) => el('div', { class: `nb-ex-item${v.ratio + 1e-9 >= cfg.minRatio ? '' : ' nb-ex-off'}` }, [
+            el('span', { class: 'nb-ex-name' }, v.farm.name),
+            el('span', { class: 'nb-ex-trade' }, [resIcon(v.give), '→', resIcon(v.get)]),
+            el('b', {}, v.ratio.toFixed(2))
+          ]))),
+          el('div', { class: 'nb-alert nb-alert-info nb-mt' }, p.trade
+            ? [`${farmTownName(tid)}: cambiaría ${p.trade.amount} `, resIcon(p.trade.give), ` por ${p.trade.receive} `, resIcon(p.trade.get), ` con ${p.trade.farm.name}.`]
+            : `${farmTownName(tid)}: ${vs.length ? p.why : 'sin aldeas propias en su isla'}.`)
+        ]);
+      } catch {}
+    }
+    return el('div', { class: 'nb-card' }, [
+      el('div', { class: 'nb-row' }, [
+        el('span', { class: 'nb-row-label' }, [el('b', {}, 'Intercambio con aldeas')]),
+        switchEl(!!cfg.enabled, (v) => { cfg.enabled = v; saveState(); farmLog(v ? 'Intercambio con aldeas activado.' : 'Intercambio con aldeas desactivado.', 'info'); if (v && !exRuntime.running) { exRuntime.running = true; exchangeTick().catch((e) => farmLog(`Intercambio: ${e.message}`, 'error')).finally(() => { exRuntime.running = false; }); } }, false)
+      ]),
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Tasa mínima (me dan por cada 1)'), ratioIn]),
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Sobra a partir de (% del almacén)'), el('span', {}, [pctIn, ' %'])]),
+      el('p', { class: 'nb-placeholder' }, 'Cada minuto, en todas las ciudades: lo que pasa de ese % (y no necesita ninguna otra ciudad ni ningún módulo) se cambia con las aldeas de la isla por el recurso que falta, sin llenar el almacén.'),
+      preview
+    ]);
   }
 
   /* ---------------------------------------------------------------------------------
@@ -4975,6 +5181,7 @@
     startBuildEngine();
     startResearchEngine();
     startTradeEngine();
+    startExchangeEngine();
     startRecruitEngine();
     startAttackEngine();
     startFestivalEngine();

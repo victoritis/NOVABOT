@@ -7,7 +7,7 @@
    ===================================================================================== */
 
 :root{
-  --nb-css-version:   "1.7.5";
+  --nb-css-version:   "1.7.6";
 
   /* superficies */
   --nb-bg:            #111419;
@@ -655,3 +655,12 @@
 /* selector de nivel de prioridad */
 #novabot-panel .nb-lvl-seg{ flex: none; }
 #novabot-panel .nb-lvl-seg .nb-seg-btn{ padding: 3px 8px; min-width: 30px; }
+
+/* ---------- intercambio con aldeas ---------- */
+#novabot-panel .nb-ex-list{ display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 6px; }
+#novabot-panel .nb-ex-item{ display: flex; align-items: center; gap: 8px; padding: 6px 9px; border-radius: var(--nb-radius-sm); background: var(--nb-surface-2); border: 1px solid var(--nb-border-soft); }
+#novabot-panel .nb-ex-item b{ margin-left: auto; color: var(--nb-gold); font-size: 12px; }
+#novabot-panel .nb-ex-off{ opacity: .45; }
+#novabot-panel .nb-ex-off b{ color: var(--nb-text-faint); }
+#novabot-panel .nb-ex-name{ flex: 1; min-width: 0; font-size: 11.5px; color: var(--nb-text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#novabot-panel .nb-ex-trade{ display: inline-flex; align-items: center; gap: 3px; color: var(--nb-text-faint); font-size: 11px; }
