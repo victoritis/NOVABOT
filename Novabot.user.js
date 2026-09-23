@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.8.0
+// @version      1.8.2
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -50,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.8.0';
+  const VERSION = '1.8.2';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -131,7 +131,8 @@
       prioridad: {
         mode: 'equilibrado',   // equilibrado | orden | paralelo
         order: ['construccion', 'investigacion', 'reclutamiento', 'festivales'],
-        include: { construccion: true, investigacion: true, reclutamiento: true, festivales: true }
+        include: { construccion: true, investigacion: true, reclutamiento: true, festivales: true },
+        levels: { construccion: 1, investigacion: 1, reclutamiento: 1, festivales: 1 } // "por niveles"
       },
       ataques: {
         correctionMs: 0       // corrección automática del disparo (se ajusta sola con la llegada real)
@@ -1773,7 +1774,7 @@
   const PRIO_MODES = {
     equilibrado: { label: 'Equilibrado', hint: 'El de siempre. Todos reciben a la vez; en cada ciudad gasta primero Construcción, luego Investigación, Reclutamiento y Festivales.' },
     orden: { label: 'Personalizado · por orden', hint: 'Uno cada vez, en tu orden. Si el de arriba tiene la cola llena o nada que hacer, pasa al siguiente; cuando vuelve a tener hueco recupera el turno.' },
-    paralelo: { label: 'Personalizado · en paralelo', hint: 'Los elegidos reciben recursos a la vez (varias acciones a la vez) y ninguno reserva para otro.' }
+    paralelo: { label: 'Personalizado · por niveles', hint: 'Pon a cada uno un nivel. Los del mismo nivel reciben recursos a la vez (en paralelo). Cuando todos los de un nivel tienen la cola llena o nada que hacer, pasa al nivel siguiente; en cuanto vuelven a tener hueco recuperan el turno.' }
   };
   // Presets antiguos → modos nuevos (una sola vez).
   const PRIO_OLD = {
@@ -1804,7 +1805,14 @@
     return { mode, ranked, inc };
   }
   // En paralelo todos los incluidos tienen la misma prioridad.
-  const prioRank = (mod) => { const c = priorityConfig(); return c.mode === 'paralelo' ? (c.inc.has(mod) ? 0 : 9) : c.ranked.indexOf(mod); };
+  // Nivel de cada módulo: "por orden" = su puesto (1, 2, 3…); "por niveles" = el que
+  // elijas (mismo nivel = en paralelo). Menor número = más prioridad.
+  function prioLevel(mod, cfg = priorityConfig()) {
+    if (!cfg.inc.has(mod)) return 99;
+    if (cfg.mode === 'paralelo') return clamp(+state.prioridad?.levels?.[mod] || 1, 1, 4);
+    return cfg.ranked.indexOf(mod) + 1;
+  }
+  const prioRank = (mod) => { const c = priorityConfig(); return c.mode === 'equilibrado' ? c.ranked.indexOf(mod) : prioLevel(mod, c); };
   const prioIncluded = (mod) => priorityConfig().inc.has(mod);
 
   // Lo que cada módulo necesita YA en una ciudad (su siguiente gasto).
@@ -1853,27 +1861,40 @@
     for (const k of RES) out[k] = Math.min(out[k], cap);
     return out;
   }
-  // "Por orden": el módulo que tiene el turno en esa ciudad = el primero de la lista
-  // (incluido) que puede hacer algo ahora (cola con hueco y algo pendiente).
-  // upTo: mirar solo los que están por encima de ese módulo.
-  function activeModule(townId, upTo = null) {
-    const { ranked, inc } = priorityConfig();
-    for (const m of ranked) {
-      if (m === upTo) return null;
-      if (!inc.has(m)) continue;
-      if (sumRes(moduleClaim(townId, m)) > 0) return m;
+  // "Por orden" / "por niveles": el NIVEL que tiene el turno en esa ciudad = el de menor
+  // número con algún módulo (incluido) que puede hacer algo ahora (cola con hueco y
+  // algo pendiente). below: mirar solo niveles por encima (número menor) de ese.
+  function activeLevel(townId, below = Infinity) {
+    const cfg = priorityConfig();
+    let best = null;
+    for (const m of cfg.ranked) {
+      if (!cfg.inc.has(m)) continue;
+      const L = prioLevel(m, cfg);
+      if (L >= below || (best !== null && L >= best)) continue;
+      if (sumRes(moduleClaim(townId, m)) > 0) best = L;
     }
-    return null;
+    return best;
   }
+  // Módulos con el turno (los del nivel activo que tienen algo que hacer).
+  function activeModules(townId, below = Infinity) {
+    const L = activeLevel(townId, below);
+    if (L === null) return [];
+    const cfg = priorityConfig();
+    return cfg.ranked.filter((m) => cfg.inc.has(m) && prioLevel(m, cfg) === L && sumRes(moduleClaim(townId, m)) > 0);
+  }
+  const activeModule = (townId) => activeModules(townId)[0] || null;
 
   // Reserva que un módulo debe respetar en una ciudad (lo que no puede gastar).
   function reserveAbove(townId, mod) {
     const { mode, ranked, inc } = priorityConfig();
     const out = { wood: 0, stone: 0, iron: 0 };
-    if (mode === 'paralelo' && inc.has(mod)) return out;          // nadie reserva para nadie
-    if (mode === 'orden' && inc.has(mod)) {                        // el que tiene el turno reserva TODO lo suyo
-      const act = activeModule(townId, mod);
-      return act ? moduleFullDemand(townId, act) : out;
+    if (mode !== 'equilibrado' && inc.has(mod)) {
+      // Los de un nivel superior con el turno reservan TODO lo suyo; los del mismo nivel
+      // no se reservan nada entre sí (van en paralelo).
+      for (const m of activeModules(townId, prioLevel(mod))) { const d = moduleFullDemand(townId, m); for (const k of RES) out[k] += d[k]; }
+      const cap = townStorage(townId) || Infinity;
+      for (const k of RES) out[k] = Math.min(out[k], cap);
+      return out;
     }
     const my = ranked.indexOf(mod);
     for (let i = 0; i < ranked.length; i++) {
@@ -1887,7 +1908,7 @@
   }
   function reserveOwner(townId, mod) {
     const { mode, ranked, inc } = priorityConfig();
-    if (mode === 'orden' && inc.has(mod)) { const a = activeModule(townId, mod); return a ? PRIO_MODULES[a].toLowerCase() : ''; }
+    if (mode !== 'equilibrado' && inc.has(mod)) return activeModules(townId, prioLevel(mod)).map((m) => PRIO_MODULES[m].toLowerCase()).join(' y ');
     const my = ranked.indexOf(mod);
     const names = ranked.filter((m, i) => m !== mod && inc.has(m) && (!inc.has(mod) || i < my) && sumRes(moduleClaim(townId, m)) > 0);
     return names.map((m) => PRIO_MODULES[m].toLowerCase()).join(' y ');
@@ -1915,33 +1936,38 @@
       } }, v.label)));
     const custom = cfg.mode !== 'equilibrado';
     const list = el('div', { class: 'nb-goals' });
-    cfg.ranked.forEach((m, i) => {
+    const shown = cfg.mode === 'paralelo' ? cfg.ranked.slice().sort((a, b) => prioLevel(a, cfg) - prioLevel(b, cfg)) : cfg.ranked;
+    shown.forEach((m, i) => {
       const included = cfg.inc.has(m);
       const move = (dir) => {
         const o = cfg.ranked.slice(); const j = i + dir;
         if (j < 0 || j >= o.length) return;
         [o[i], o[j]] = [o[j], o[i]]; p.order = o; saveState(); renderBody();
       };
+      const lvl = prioLevel(m, cfg);
+      const mates = cfg.ranked.filter((x) => x !== m && cfg.inc.has(x) && prioLevel(x, cfg) === lvl).map((x) => PRIO_MODULES[x]);
       const sub = !included ? 'No incluido: solo usa lo que sobre · no pide recursos'
-        : cfg.mode === 'paralelo' ? 'Recibe a la vez que los demás'
+        : cfg.mode === 'paralelo' ? (mates.length ? `Nivel ${lvl}: a la vez que ${mates.join(' y ')}` : `Nivel ${lvl}: solo`)
         : cfg.mode === 'orden' ? (i === 0 ? 'Tiene el turno mientras tenga hueco en su cola' : 'Recibe cuando los de arriba tienen la cola llena o nada que hacer')
         : (i === 0 ? 'Primero en recibir y en gastar' : 'Recibe y gasta después de los de arriba');
       list.appendChild(el('div', { class: `nb-goal${included ? '' : ' nb-goal-done'}` }, [
-        el('span', { class: 'nb-goal-idx' }, included ? (cfg.mode === 'paralelo' ? '=' : String(i + 1)) : '–'),
+        el('span', { class: 'nb-goal-idx' }, included ? String(cfg.mode === 'paralelo' ? lvl : i + 1) : '–'),
         el('div', { class: 'nb-goal-main' }, [el('div', { class: 'nb-goal-name' }, PRIO_MODULES[m]), el('div', { class: 'nb-goal-sub' }, sub)]),
         custom ? el('div', { class: 'nb-goal-actions' }, [
           cfg.mode === 'orden' ? el('span', { class: `nb-mini${i === 0 ? ' nb-mini-off' : ''}`, onclick: () => move(-1) }, '▲') : null,
           cfg.mode === 'orden' ? el('span', { class: `nb-mini${i === cfg.ranked.length - 1 ? ' nb-mini-off' : ''}`, onclick: () => move(1) }, '▼') : null,
+          cfg.mode === 'paralelo' && included ? el('div', { class: 'nb-seg nb-seg-sm nb-lvl-seg' }, [1, 2, 3, 4].map((L) =>
+            el('span', { class: `nb-seg-btn${lvl === L ? ' active' : ''}`, title: `Nivel ${L}`, onclick: () => { p.levels = { ...(p.levels || {}), [m]: L }; saveState(); renderBody(); } }, `N${L}`))) : null,
           switchEl(included, (v) => { p.include = { ...(p.include || {}), [m]: v }; saveState(); renderBody(); })
         ]) : null
       ]));
     });
-    // En "por orden": qué módulo tiene ahora el turno en la ciudad abierta.
+    // Qué módulo(s) tienen ahora el turno en la ciudad abierta.
     let now = null;
-    if (cfg.mode === 'orden') {
+    if (custom) {
       const tid = +UW.Game?.townId;
-      const a = tid ? activeModule(tid) : null;
-      now = el('div', { class: 'nb-alert nb-alert-info nb-mt' }, `Ahora en ${farmTownName(tid)}: ${a ? `tiene el turno ${PRIO_MODULES[a]}` : 'ningún módulo tiene nada que hacer'}.`);
+      const a = tid ? activeModules(tid) : [];
+      now = el('div', { class: 'nb-alert nb-alert-info nb-mt' }, `Ahora en ${farmTownName(tid)}: ${a.length ? `tiene${a.length > 1 ? 'n' : ''} el turno ${a.map((x) => PRIO_MODULES[x]).join(' y ')}` : 'ningún módulo tiene nada que hacer'}.`);
     }
     return el('div', { class: 'nb-card' }, [
       el('div', { class: 'nb-card-title' }, 'Prioridad de recursos'),
@@ -2135,11 +2161,12 @@
     // resto recibe su rango como prioridad.
     const cfg = priorityConfig();
     let list = all.filter((d) => !d.module || cfg.inc.has(d.module));
-    if (cfg.mode === 'orden') {
-      // Por orden: en cada ciudad solo pide (y reserva) el módulo que tiene el turno.
+    if (cfg.mode !== 'equilibrado') {
+      // Por orden / por niveles: en cada ciudad solo piden (y reservan) los módulos del
+      // nivel que tiene el turno (varios a la vez si comparten nivel).
       const act = new Map();
-      const turn = (t) => { if (!act.has(t)) act.set(t, activeModule(t)); return act.get(t); };
-      list = list.filter((d) => !d.module || d.module === turn(d.townId));
+      const turn = (t) => { if (!act.has(t)) act.set(t, activeLevel(t)); return act.get(t); };
+      list = list.filter((d) => !d.module || prioLevel(d.module, cfg) === turn(d.townId));
     }
     return list.map((d) => ({ ...d, prio: d.module ? prioRank(d.module) : (d.prio ?? 9) }));
   }
@@ -2996,12 +3023,25 @@
     return null;
   }
 
+  // Objetivos cumplidos (ya tienes esas tropas, en casa o fuera): se quitan del bot.
+  function pruneRecruitGoals(townId) {
+    const cfg = townRecruitCfg(townId);
+    if (!cfg.goals.length) return;
+    const have = townUnitsHave(townId);
+    const done = cfg.goals.filter((g) => (+have[g.id] || 0) >= g.target);
+    if (!done.length) return;
+    cfg.goals = cfg.goals.filter((g) => !done.includes(g));
+    saveState();
+    recruitLog(`${farmTownName(townId)}: completado ${done.map((g) => `${g.target} ${unitName(g.id)}`).join(', ')} (se quita del bot).`, 'ok');
+  }
+
   async function recruitTick() {
     if (!anyRecruitOn()) return;
     if (!overviewReady()) return; // sin conocer TODAS las colas se podrían pasar de 7 órdenes
     // Coste real (héroes, investigaciones…): refrescar las ciudades con tropas pedidas.
     const stale = allTownIds().filter((id) => recruitOnFor(id) && townRecruitCfg(id).goals.length && realCostsStale(id));
     for (const id of stale.slice(0, 3)) await refreshRealCosts(id);
+    for (const id of allTownIds()) pruneRecruitGoals(id);
     const anySpells = allTownIds().some((id) => recruitEnabledFor(id) && Object.values(townRecruitCfg(id).spells || {}).some(Boolean));
     if (anySpells && Date.now() - spellInfo.at > 60000) await refreshCastedPowers();
     for (const townId of allTownIds()) {

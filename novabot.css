@@ -7,7 +7,7 @@
    ===================================================================================== */
 
 :root{
-  --nb-css-version:   "1.7.4";
+  --nb-css-version:   "1.7.5";
 
   /* superficies */
   --nb-bg:            #111419;
@@ -651,3 +651,7 @@
 #novabot-panel .nb-rc-spell{ opacity: .35; filter: grayscale(1); }
 #novabot-panel .nb-rc-spell.on{ opacity: 1; filter: none; }
 #novabot-panel .nb-rc-spell .nb-icon-25{ width: 22px; height: 22px; overflow: hidden; }
+
+/* selector de nivel de prioridad */
+#novabot-panel .nb-lvl-seg{ flex: none; }
+#novabot-panel .nb-lvl-seg .nb-seg-btn{ padding: 3px 8px; min-width: 30px; }
