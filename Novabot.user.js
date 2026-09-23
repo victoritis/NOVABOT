@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.7.1
+// @version      1.7.2
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -50,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.7.1';
+  const VERSION = '1.7.2';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -711,7 +711,9 @@
     const id = +UW.Game?.townId || null;
     if (id === lastTownId) return;
     lastTownId = id;
-    if ((state.activeTab === 'construccion' || state.activeTab === 'reclutamiento') && bodyEl) renderBody();
+    // Ataques: el origen sigue a la ciudad que tienes abierta (salvo si estás editando uno).
+    if (id && !atk.form.replaceId && +atk.form.source !== id) Object.assign(atk.form, { source: id, units: {}, hero: '', spell: '', info: null, infoError: '' });
+    if (['construccion', 'reclutamiento', 'ataques', 'resumen'].includes(state.activeTab) && bodyEl) renderIfIdle();
   }
 
   function updateCityLabel() {
@@ -3135,18 +3137,35 @@
     for (const k of ['home_town_id', 'origin_town_id', 'town_id']) { const v = +mval(m, k); if (v > 0) return v; }
     return null;
   }
-  function heroesIn(townId) { return heroModels().map((m) => ({ id: heroIdOf(m), town: heroTownOf(m), level: +mval(m, 'level') || null })).filter((h) => h.id && h.town === +townId); }
+  // Héroes asignados a la ciudad. available = está YA en la ciudad (no viajando hacia
+  // ella, no herido y no fuera con tropas): solo esos pueden salir con un ataque.
+  function heroesIn(townId, all = false) {
+    const now = Date.now();
+    const list = heroModels().map((m) => {
+      const arrival = +mval(m, 'town_arrival_at') * 1000 || 0, cured = +mval(m, 'cured_at') * 1000 || 0;
+      const assign = mval(m, 'assignment_type'), away = mval(m, 'current_units_id') == null && assign === 'town' && !(arrival > now);
+      const why = arrival > now ? `llega en ${fmtDur(arrival - now)}` : cured > now ? `herido ${fmtDur(cured - now)}` : away ? 'fuera con tropas' : '';
+      return { id: heroIdOf(m), town: heroTownOf(m), level: +mval(m, 'level') || null, assign, available: !why, why };
+    }).filter((h) => h.id && h.town === +townId && (!h.assign || h.assign === 'town'));
+    return all ? list : list.filter((h) => h.available);
+  }
   const heroName = (id) => UW.GameData?.heroes?.[id]?.name || String(id).replace(/_/g, ' ');
-  // Hechizos que se pueden lanzar al enviar: poderes de dios que se aplican a una
-  // orden propia (targets: target_command / target_support_command), no negativos,
-  // y solo del dios de la ciudad de origen (es el favor que se gasta).
-  function attackSpells(sourceId, type) {
-    const god = townGod(sourceId);
+  // Hechizos para lanzar sobre TU orden al enviarla (como en la ventana de ataque):
+  // poderes de dios con objetivo "orden" que no son negativos (los negativos se lanzan
+  // sobre órdenes enemigas), menos Sabiduría (espía una tropa enemiga) y Purificación.
+  // De todos los dioses que tienes (el favor es por dios, no por ciudad).
+  const ATK_SPELL_EXCLUDE = new Set(['wisdom', 'cleanse']);
+  function playerGods() {
+    try { return Object.keys(Object.values(UW.MM.getModels().PlayerGods || {})[0]?.attributes?.production_overview || {}); } catch { return []; }
+  }
+  function attackSpells(type) {
     const need = type === 'support' ? 'target_support_command' : 'target_command';
+    const gods = new Set(playerGods());
+    const order = Object.keys(UW.GameData?.gods || {});
     return Object.entries(UW.GameData?.powers || {})
-      .filter(([, d]) => d && typeof d.name === 'string' && d.god_id && d.god_id === god && !d.negative && !d.is_fake_power && [].concat(d.targets || []).includes(need))
-      .map(([k, d]) => ({ id: k, name: d.name, cost: +d.favor || 0, god: d.god_id }))
-      .sort((a, b) => a.cost - b.cost);
+      .filter(([k, d]) => d && typeof d.name === 'string' && gods.has(d.god_id) && !d.negative && !d.is_fake_power && !ATK_SPELL_EXCLUDE.has(k) && [].concat(d.targets || []).includes(need))
+      .map(([k, d]) => ({ id: k, name: d.name, cost: +d.favor || 0, god: d.god_id, effect: String(d.short_effect || d.effect || '') }))
+      .sort((a, b) => (order.indexOf(a.god) - order.indexOf(b.god)) || a.cost - b.cost);
   }
   function powerList() {
     const out = new Map();
@@ -3753,7 +3772,7 @@
     // 4) Tropas (disponibles según el juego, con su duración)
     const counts = {};
     if (info) for (const [k, u] of Object.entries(info.units || {})) counts[k] = +u.count || 0;
-    else Object.assign(counts, townUnitsHave(f.source));
+    else { try { Object.assign(counts, UW.ITowns.getTown(f.source)?.units?.() || {}); } catch {} } // solo las que están en la ciudad
     const rows = Object.entries(counts).filter(([k, n]) => n > 0 && k !== 'militia' && UW.GameData?.units?.[k])
       .sort(([a], [b]) => ((U(a).is_naval ? 1 : 0) - (U(b).is_naval ? 1 : 0)) || atkUnitName(a).localeCompare(atkUnitName(b), 'es'));
     const plan = info ? atkComputePlan() : null;
@@ -3776,23 +3795,31 @@
     }
 
     // 5) Héroe / hechizo
-    // Selectores con imagen (fichas): héroes de la ciudad de origen y hechizos de su dios.
-    const chip = (active, icon, title, sub, onclick) => el('div', { class: `nb-chip${active ? ' active' : ''}`, onclick }, [icon, el('div', { class: 'nb-chip-text' }, [el('b', {}, title), sub ? el('small', {}, sub) : null])]);
+    // Selectores con imagen: héroes de la ciudad de origen y hechizos (uno solo).
+    const chip = (active, icon, title, sub, onclick, disabled = false, tip = '') => el('div', { class: `nb-chip${active ? ' active' : ''}${disabled ? ' nb-chip-off' : ''}`, title: tip || null, onclick: disabled ? null : onclick }, [icon, el('div', { class: 'nb-chip-text' }, [el('b', {}, title), sub ? el('small', {}, sub) : null])]);
     const noneIcon = () => el('span', { class: 'nb-chip-none' }, '∅');
-    const heroes = heroesIn(f.source);
-    if (f.hero && !heroes.some((h) => h.id === f.hero)) f.hero = '';
+    const heroesAll = heroesIn(f.source, true);
+    if (f.hero && !heroesAll.some((h) => h.id === f.hero && h.available)) f.hero = '';
     const heroSel = el('div', { class: 'nb-chips' }, [
       chip(!f.hero, noneIcon(), 'Sin héroe', null, () => { f.hero = ''; renderBody(); }),
-      ...heroes.map((h) => chip(f.hero === h.id, el('span', { class: `nb-icon nb-icon-25 hero_icon hero25x25 ${h.id}` }), heroName(h.id), h.level ? `nivel ${h.level}` : null, () => { f.hero = h.id; renderBody(); }))
+      ...heroesAll.map((h) => chip(f.hero === h.id, el('span', { class: `nb-icon nb-icon-25 hero_icon hero25x25 ${h.id}` }), heroName(h.id),
+        h.available ? (h.level ? `nivel ${h.level}` : null) : h.why, () => { f.hero = h.id; renderBody(); }, !h.available))
     ]);
-    const spells = attackSpells(f.source, f.type);
+    if (!heroesAll.length) heroSel.appendChild(el('span', { class: 'nb-placeholder' }, 'Ningún héroe en esta ciudad.'));
+    const spells = attackSpells(f.type);
     if (f.spell && !spells.some((p) => p.id === f.spell)) f.spell = '';
-    const favorNow = Math.floor(godFavor(townGod(f.source)));
-    const spellSel = el('div', { class: 'nb-chips' }, [
-      chip(!f.spell, noneIcon(), 'Sin hechizo', null, () => { f.spell = ''; renderBody(); }),
-      ...spells.map((p) => chip(f.spell === p.id, el('span', { class: `nb-icon nb-icon-30 power_icon30x30 ${p.id}` }), p.name, `${p.cost} favor${p.cost > favorNow ? ' · falta favor' : ''}`, () => { f.spell = p.id; renderBody(); }))
-    ]);
-    if (!spells.length) spellSel.appendChild(el('span', { class: 'nb-placeholder' }, townGod(f.source) ? 'Tu dios no tiene hechizos para esta orden.' : 'La ciudad no tiene dios.'));
+    const spellSel = el('div', { class: 'nb-spells' }, [chip(!f.spell, noneIcon(), 'Sin hechizo', null, () => { f.spell = ''; renderBody(); })]);
+    for (const god of [...new Set(spells.map((p) => p.god))]) {
+      const fav = Math.floor(godFavor(god));
+      spellSel.appendChild(el('div', { class: 'nb-spell-god' }, [
+        el('div', { class: 'nb-spell-god-head' }, [el('span', { class: 'nb-icon-sm nb-icon-sm-30' }, [el('span', { class: `god_micro ${god}` })]),
+          el('b', {}, UW.GameData?.gods?.[god]?.name || god), el('small', {}, `${fav} favor`)]),
+        el('div', { class: 'nb-chips' }, spells.filter((p) => p.god === god).map((p) => chip(f.spell === p.id,
+          el('span', { class: `nb-icon nb-icon-30 power_icon30x30 ${p.id}` }), p.name, `${p.cost} favor${p.cost > fav ? ' · falta favor' : ''}`,
+          () => { f.spell = f.spell === p.id ? '' : p.id; renderBody(); }, false, p.effect)))
+      ]));
+    }
+    if (!spells.length) spellSel.appendChild(el('span', { class: 'nb-placeholder' }, 'No hay hechizos que se puedan lanzar sobre esta orden.'));
 
     // 6) Hora
     const modeSeg = el('div', { class: 'nb-seg' }, [['arrival', 'Llegar a las'], ['departure', 'Salir a las']].map(([m, l]) =>
@@ -3867,7 +3894,7 @@
         ]),
         grid,
         el('div', { class: 'nb-mt nb-chip-label' }, 'Héroe'), heroSel,
-        el('div', { class: 'nb-mt nb-chip-label' }, `Hechizo${townGod(f.source) ? ` (${UW.GameData?.gods?.[townGod(f.source)]?.name || townGod(f.source)} · ${favorNow} favor)` : ''}`), spellSel
+        el('div', { class: 'nb-mt nb-chip-label' }, 'Hechizo (solo uno)'), spellSel
       ] : el('p', { class: 'nb-placeholder' }, 'No hay tropas en esta ciudad.')),
       section(5, 'Hora del servidor', [modeSeg, el('div', { class: 'nb-time-row' }, [timeIn, quick]), rangeBox]),
       atkPlanEl,

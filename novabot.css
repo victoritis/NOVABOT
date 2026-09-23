@@ -7,7 +7,7 @@
    ===================================================================================== */
 
 :root{
-  --nb-css-version:   "1.6.8";
+  --nb-css-version:   "1.6.9";
 
   /* superficies */
   --nb-bg:            #111419;
@@ -582,3 +582,15 @@
 /* rango de llegada */
 #novabot-panel .nb-range{ display: flex; flex-direction: column; gap: 8px; margin-top: 8px; padding: 8px; border-radius: var(--nb-radius-sm); background: var(--nb-surface-2); }
 #novabot-panel .nb-range .nb-input-time{ max-width: 160px; font-size: 15px; height: 34px; }
+
+/* héroe no disponible / hechizos por dios */
+#novabot-panel .nb-chip-off{ opacity: .45; cursor: default; }
+#novabot-panel .nb-chip-off:hover{ background: var(--nb-surface-2); border-color: transparent; }
+#novabot-panel .nb-spells{ display: flex; flex-direction: column; gap: 8px; }
+#novabot-panel .nb-spells > .nb-chip{ max-width: 200px; }
+#novabot-panel .nb-spell-god{ padding: 6px; border-radius: var(--nb-radius-sm); background: rgba(255,255,255,.02); border: 1px solid var(--nb-border-soft); }
+#novabot-panel .nb-spell-god-head{ display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+#novabot-panel .nb-spell-god-head b{ color: var(--nb-text); font-size: 11.5px; }
+#novabot-panel .nb-spell-god-head small{ color: var(--nb-text-faint); font-size: 10.5px; margin-left: auto; }
+#novabot-panel .nb-spell-god-head .nb-icon-sm{ margin-right: 0; }
+#novabot-panel .nb-icon-sm-30 > span{ width: 30px; height: 30px; transform: scale(.733); }
