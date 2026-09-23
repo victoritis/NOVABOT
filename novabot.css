@@ -7,7 +7,7 @@
    ===================================================================================== */
 
 :root{
-  --nb-css-version:   "1.7.0";
+  --nb-css-version:   "1.7.2";
 
   /* superficies */
   --nb-bg:            #111419;
@@ -594,3 +594,14 @@
 #novabot-panel .nb-spell-god-head b{ color: var(--nb-text); font-size: 12px; }
 #novabot-panel .nb-spell-god-head small{ color: var(--nb-text-faint); font-size: 10.5px; margin-left: auto; }
 #novabot-panel .nb-god-ico{ display: inline-block; flex: none; width: 22px; height: 22px; overflow: hidden; border-radius: 50%; box-shadow: 0 0 0 1px var(--nb-border); }
+
+/* derribo */
+#novabot-panel .nb-tag-demolish{ background: var(--nb-danger-soft); color: var(--nb-danger); }
+#novabot-panel .nb-mini-add.nb-mini-danger{ background: var(--nb-danger-soft); color: var(--nb-danger); border-color: rgba(227,110,99,.4); }
+
+/* hechizos de reclutamiento */
+#novabot-panel .nb-spell-row{ display: flex; align-items: center; gap: 10px; padding: 7px 0; }
+#novabot-panel .nb-spell-row + .nb-spell-row{ border-top: 1px solid var(--nb-border-soft); }
+#novabot-panel .nb-spell-row > .nb-icon{ flex: none; }
+#novabot-panel .nb-spell-row > .nb-seg{ flex: none; min-width: 260px; }
+#novabot-panel .nb-ok{ color: var(--nb-ok); }

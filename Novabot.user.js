@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.7.3
+// @version      1.7.6
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -50,7 +50,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.7.3';
+  const VERSION = '1.7.6';
   const STORAGE_KEY = 'novabot_ui_state_v1';
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
@@ -62,6 +62,7 @@
     { id: 'resumen',     label: 'Vista general', icon: 'grid',   disabled: false },
     { id: 'granjas',     label: 'Granjas',       icon: 'farm',   disabled: false },
     { id: 'construccion', label: 'Construcción', icon: 'build',  disabled: false },
+    { id: 'investigacion', label: 'Investigación', icon: 'flask', disabled: false },
     { id: 'reclutamiento', label: 'Reclutamiento', icon: 'shield', disabled: false },
     { id: 'comercio',    label: 'Comercio',       icon: 'trade',  disabled: false },
     { id: 'festivales',  label: 'Festivales',     icon: 'star',   disabled: false },
@@ -123,6 +124,10 @@
       festivales: {
         enabled: true
       },
+      investigacion: {
+        enabled: true,
+        towns: {}             // townId -> { queue: ['archer', …], enabled? } (orden = orden de investigación)
+      },
       prioridad: {
         preset: 'equilibrado', // equilibrado | reclutamiento | recl_constr | construccion | festivales | custom
         order: ['construccion', 'reclutamiento', 'festivales'],
@@ -145,6 +150,7 @@
         maxPerTick: 5,
         forRecruit: true,     // abastecer los lotes de reclutamiento
         forFestival: true,    // abastecer festivales (Academia 30+)
+        forResearch: true,    // abastecer investigaciones
         agingWeight: 2,       // cuánto sube la prioridad por cada segundo esperando (anti-olvido de lejanas)
         secPerUnit: 0         // se calibra solo con los envíos reales
       }
@@ -157,7 +163,7 @@
       if (raw && typeof raw === 'object') {
         const def = defaultState();
         const out = { ...def, ...raw };
-        for (const k of ['granjas', 'construccion', 'comercio', 'reclutamiento', 'ataques', 'festivales', 'prioridad']) out[k] = { ...def[k], ...(raw[k] || {}) };
+        for (const k of ['granjas', 'construccion', 'comercio', 'reclutamiento', 'ataques', 'festivales', 'prioridad', 'investigacion']) out[k] = { ...def[k], ...(raw[k] || {}) };
         return out;
       }
     } catch {}
@@ -241,6 +247,7 @@
     minus: '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/></svg>',
     close: '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><path d="m18 6-12 12M6 6l12 12"/></svg>',
     resize: '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><line x1="21" y1="9" x2="9" y2="21"/><line x1="21" y1="15" x2="15" y2="21"/></svg>',
+    flask: '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6"/><path d="M10 3v6L4.5 18.5A1.7 1.7 0 0 0 6 21h12a1.7 1.7 0 0 0 1.5-2.5L14 9V3"/><path d="M7 15h10"/></svg>',
     star: '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3 2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1-4.4-4.3 6.1-.9Z"/></svg>',
     sword: '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 17.5 3 6V3h3l11.5 11.5"/><path d="m13 19 6-6"/><path d="m16 16 4 4"/><path d="m19 21 2-2"/></svg>',
     farm: '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21V9"/><path d="M12 9c0-4 3-7 7-7 0 4-3 7-7 7Z"/><path d="M12 13c0-4-3-7-7-7 0 4 3 7 7 7Z"/></svg>'
@@ -275,7 +282,7 @@
   const fmtResEl = (r) => el('span', { class: 'nb-res-list' }, RES.filter((k) => (+r?.[k] || 0) > 0)
     .map((k) => el('span', { class: 'nb-res' }, [resIcon(k), String(Math.round(r[k]))])));
   // Icono de cada módulo (edificio del juego que lo representa).
-  const MODULE_ICON = { granjas: 'farm', construccion: 'main', reclutamiento: 'barracks', comercio: 'market', festivales: 'place', ataques: 'wall', inicio: 'main', prioridad: 'storage' };
+  const MODULE_ICON = { granjas: 'farm', construccion: 'main', investigacion: 'academy', reclutamiento: 'barracks', comercio: 'market', festivales: 'place', ataques: 'wall', inicio: 'main', prioridad: 'storage' };
   // Títulos de tarjeta: icono pequeño del edificio correspondiente (adorno).
   const TITLE_ICON = [
     [/prioridad/i, 'storage'], [/en camino|necesidades/i, 'market'], [/lote|tropa/i, 'barracks'],
@@ -287,7 +294,7 @@
       if (t.querySelector('.nb-icon, .nb-icon-sm')) continue;
       const txt = t.textContent || '';
       // Sin icono: Construcción (ya lleva uno por edificio) y "Actividad".
-      if (state.activeTab === 'construccion' || /actividad|aviso|siguiente lote/i.test(txt)) continue; // (el lote puede ser de Cuartel o de Puerto)
+      if (state.activeTab === 'construccion' || state.activeTab === 'investigacion' || /actividad|aviso|siguiente lote/i.test(txt)) continue; // (el lote puede ser de Cuartel o de Puerto)
       if (state.activeTab === 'granjas') { t.prepend(villageIcon()); continue; }
       const hit = TITLE_ICON.find(([re]) => re.test(txt));
       const id = hit ? hit[1] : MODULE_ICON[state.activeTab];
@@ -348,6 +355,8 @@
       renderResumenTab();
     } else if (state.activeTab === 'festivales') {
       renderFestivalesTab();
+    } else if (state.activeTab === 'investigacion') {
+      renderInvestigacionTab();
     } else if (state.activeTab === 'ataques') {
       renderAtaquesTab();
     } else if (state.activeTab === 'reclutamiento') {
@@ -1058,7 +1067,7 @@
     // Algo terminó (envío llegado, edificio acabado, festival terminado): repintar
     // para que desaparezca en vez de quedarse en 0 (el juego tarda un momento en
     // actualizar sus datos, por eso se reintenta cada 2 s mientras siga en 0).
-    if (expired && ['comercio', 'construccion', 'festivales', 'reclutamiento'].includes(state.activeTab) && Date.now() - (updateCountdown.lastRepaint || 0) > 2000
+    if (expired && ['comercio', 'construccion', 'festivales', 'reclutamiento', 'investigacion', 'resumen'].includes(state.activeTab) && Date.now() - (updateCountdown.lastRepaint || 0) > 2000
         && !(document.activeElement && document.activeElement.closest && document.activeElement.closest('#novabot-panel input, #novabot-panel select'))) {
       updateCountdown.lastRepaint = Date.now();
       renderBody();
@@ -1286,7 +1295,19 @@
     return (h ? `${h}:${String(m).padStart(2, '0')}` : `${m}`) + `:${String(sec).padStart(2, '0')}`;
   }
 
-  /* Plan de construcción = lista ordenada de NIVELES sueltos { id, level, gi }.
+  // Nivel del edificio contando la cola del juego (subidas +1, derribos −1).
+  // Sin derribos en cola vale committedLevel; con derribos se calcula desde el nivel real.
+  function queuedLevel(townId, id, info) {
+    const orders = townBuildOrders(townId).filter((o) => o.building_type === id);
+    if (!orders.some((o) => o.tear_down)) return committedLevel(info);
+    let real = NaN;
+    try { real = +UW.ITowns.getTown(townId)?.getBuildings?.()?.attributes?.[id]; } catch {}
+    if (!Number.isFinite(real)) return committedLevel(info);
+    return real + orders.reduce((n, o) => n + (o.tear_down ? -1 : 1), 0);
+  }
+
+  /* Plan de construcción = lista ordenada de NIVELES sueltos { id, level, gi, down }.
+     · Un objetivo con demolish:true DERRIBA hasta ese nivel (un nivel cada vez).
      · Normal: objetivo a objetivo, en el orden en que los añadiste. Un edificio puede
        estar varias veces (p. ej. Senado 20, Muralla 11, Senado 22) para intercalar a mano.
      · Intercalar: un nivel de cada edificio por turnos, empezando por el siguiente al
@@ -1296,35 +1317,29 @@
     if (!bd) return [];
     const tcfg = townBuildCfg(townId);
     const maxOf = (id) => +UW.GameData?.buildings?.[id]?.max_level || 99;
-    if (!state.construccion.interleave) {
-      const sim = {}, out = [];
-      tcfg.goals.forEach((g, gi) => {
-        const info = bd.building_data?.[g.id];
-        if (!info) return;
-        let lvl = sim[g.id] ?? committedLevel(info);
-        while (lvl < Math.min(g.target, maxOf(g.id))) { lvl += 1; out.push({ id: g.id, level: lvl, gi }); }
-        sim[g.id] = Math.max(sim[g.id] ?? 0, lvl);
-      });
-      return out;
-    }
-    // Intercalado: por edificio (orden de primera aparición), hasta su objetivo más alto.
-    const ids = [], top = {}, firstGi = {};
+    // Pasos de cada edificio, en el orden de sus objetivos (subir y/o derribar).
+    const seq = new Map(), sim = {};
     tcfg.goals.forEach((g, gi) => {
-      if (!(g.id in top)) { ids.push(g.id); firstGi[g.id] = gi; }
-      top[g.id] = Math.max(top[g.id] || 0, g.target);
+      const info = bd.building_data?.[g.id];
+      if (!info) return;
+      if (!seq.has(g.id)) seq.set(g.id, []);
+      let lvl = sim[g.id] ?? queuedLevel(townId, g.id, info);
+      if (g.demolish) { while (lvl > Math.max(0, g.target)) { lvl -= 1; seq.get(g.id).push({ id: g.id, level: lvl, gi, down: true }); } }
+      else { while (lvl < Math.min(g.target, maxOf(g.id))) { lvl += 1; seq.get(g.id).push({ id: g.id, level: lvl, gi }); } }
+      sim[g.id] = lvl;
     });
+    if (!state.construccion.interleave) {
+      // Normal: objetivo a objetivo, en el orden de la lista.
+      return [...seq.values()].flat().sort((a, b) => a.gi - b.gi || 0);
+    }
+    // Intercalado: un paso de cada edificio por turnos, empezando tras el último hecho.
+    const ids = [...seq.keys()];
     const k = ids.indexOf(tcfg.lastId);
     const order = k >= 0 ? [...ids.slice(k + 1), ...ids.slice(0, k + 1)] : ids;
-    const lvl = {};
-    for (const id of order) lvl[id] = committedLevel(bd.building_data?.[id]);
-    const out = [];
+    const out = [], pos = Object.fromEntries(order.map((id) => [id, 0]));
     for (let more = true; more;) {
       more = false;
-      for (const id of order) {
-        if (!bd.building_data?.[id] || lvl[id] >= Math.min(top[id], maxOf(id))) continue;
-        lvl[id] += 1; more = true;
-        out.push({ id, level: lvl[id], gi: tcfg.goals.findIndex((g) => g.id === id && g.target >= lvl[id]) });
-      }
+      for (const id of order) { const st = seq.get(id)[pos[id]]; if (st) { out.push(st); pos[id] += 1; more = true; } }
     }
     return out;
   }
@@ -1333,14 +1348,16 @@
     const bd = buildDataFor(townId);
     if (!bd) return { reason: 'sin datos' };
     if (bd.is_building_order_queue_full) return { reason: 'cola llena' };
-    const skip = new Set(); // edificio bloqueado → sus niveles siguientes tampoco
+    const skip = new Set(); // edificio bloqueado → sus pasos siguientes tampoco
     for (const s of buildPlan(townId)) {
       if (skip.has(s.id)) continue;
       const info = bd.building_data?.[s.id];
-      if (s.level !== committedLevel(info) + 1) { skip.add(s.id); continue; }
+      const cur = queuedLevel(townId, s.id, info);
+      if (s.level !== cur + (s.down ? -1 : 1)) { skip.add(s.id); continue; }
       if ((buildRuntime.cooldown.get(`${townId}:${s.id}`) || 0) > Date.now()) { skip.add(s.id); continue; }
-      const reason = buildBlockReason(townId, info);
-      if (!reason) return { id: s.id, level: s.level, gi: s.gi };
+      // Derribar no cuesta recursos: solo hace falta hueco en la cola y nivel > 0.
+      const reason = s.down ? (cur <= 0 ? 'ya está a 0' : null) : buildBlockReason(townId, info);
+      if (!reason) return { id: s.id, level: s.level, gi: s.gi, down: !!s.down };
       if (state.construccion.strictOrder) return { reason: `${buildingName(s.id)}: ${reason}`, blockedGi: s.gi };
       skip.add(s.id);
     }
@@ -1356,7 +1373,10 @@
     if (!bd) return;
     const cfg = townBuildCfg(townId);
     const before = cfg.goals.length;
-    cfg.goals = cfg.goals.filter((g) => committedLevel(bd.building_data?.[g.id]) < g.target);
+    cfg.goals = cfg.goals.filter((g) => {
+      const lvl = queuedLevel(townId, g.id, bd.building_data?.[g.id]);
+      return g.demolish ? lvl > g.target : lvl < g.target;
+    });
     if (cfg.goals.length !== before) saveState();
   }
 
@@ -1367,12 +1387,17 @@
       const next = nextBuildFor(townId);
       if (!next.id) continue;
       try {
+        // Misma petición que el juego: BuildingOrder.buildUp / BuildingOrder.tearDown
+        // (leído en game.min.js: execute("tearDown", {building_id, town_id})).
         await gpPostAs(townId, 'frontend_bridge', 'execute', {
-          model_url: 'BuildingOrder', action_name: 'buildUp', captcha: null,
+          model_url: 'BuildingOrder', action_name: next.down ? 'tearDown' : 'buildUp', captcha: null,
           arguments: { building_id: next.id }, nl_init: true
         });
         townBuildCfg(townId).lastId = next.id; saveState(); // para el turno del intercalado
-        buildLog(`${farmTownName(townId)}: ${buildingName(next.id)} → nivel ${next.level} (a la cola del juego).`, 'ok');
+        // Unos segundos sin volver a tocar ese edificio: da tiempo a que el juego
+        // actualice su cola y no se encargue dos veces el mismo nivel.
+        buildRuntime.cooldown.set(`${townId}:${next.id}`, Date.now() + 20000);
+        buildLog(`${farmTownName(townId)}: ${buildingName(next.id)} → ${next.down ? 'derribo a' : 'nivel'} ${next.level} (a la cola del juego).`, 'ok');
         await sleep(300); // pequeño margen para que el modelo Backbone se actualice antes de leerlo
         pruneCompletedGoals(townId);
         renderIfIdle('construccion');
@@ -1495,21 +1520,30 @@
       const maxOf = (id) => +UW.GameData?.buildings?.[id]?.max_level || 99;
       // Nivel desde el que parte el objetivo i: el actual (con cola) o el objetivo
       // anterior del mismo edificio (un edificio puede estar varias veces).
+      const lvlOf = (id) => queuedLevel(townId, id, bd.building_data?.[id]);
       const fromOf = (i, list = tcfg.goals) => {
         const id = list[i].id;
-        let f = committedLevel(bd.building_data?.[id]);
-        for (let j = 0; j < i; j++) if (list[j].id === id) f = Math.max(f, list[j].target);
+        let f = lvlOf(id);
+        for (let j = 0; j < i; j++) if (list[j].id === id) f = list[j].target;
         return f;
       };
-      const lastLevelOf = (id) => tcfg.goals.reduce((m, g) => (g.id === id ? Math.max(m, g.target) : m), committedLevel(bd.building_data?.[id]));
+      const lastLevelOf = (id) => { let f = lvlOf(id); for (const g of tcfg.goals) if (g.id === id) f = g.target; return f; };
       const setTarget = (i, v) => {
         const g = tcfg.goals[i];
         v = clamp(v, 0, maxOf(g.id));
-        if (v <= fromOf(i)) tcfg.goals.splice(i, 1);                 // no sube nada → se quita
+        const from = fromOf(i);
+        if (g.demolish ? v >= from : v <= from) tcfg.goals.splice(i, 1); // ya no cambia nada → se quita
         else g.target = v;
         saveState(); renderBody();
       };
-      const addGoal = (id, v) => { tcfg.goals.push({ id, target: clamp(v, 0, maxOf(id)) }); saveState(); renderBody(); };
+      const addGoal = (id, v) => {
+        const from = lastLevelOf(id);
+        v = clamp(v, 0, maxOf(id));
+        if (v === from) return;
+        if (v < from && !confirm(`¿Derribar ${buildingName(id)} de ${from} a ${v}? (${from - v} nivel${from - v > 1 ? 'es' : ''})`)) return;
+        tcfg.goals.push(v < from ? { id, target: v, demolish: true } : { id, target: v });
+        saveState(); renderBody();
+      };
       const move = (i, dir) => {
         const j = i + dir;
         if (j < 0 || j >= tcfg.goals.length) return;
@@ -1521,17 +1555,17 @@
       const goalsBox = el('div', { class: 'nb-goals' });
       tcfg.goals.forEach((g, i) => {
         const info = bd.building_data?.[g.id];
-        const cur = fromOf(i);
-        const done = committedLevel(info) >= g.target;
-        const waitingPrev = !done && committedLevel(info) < cur; // espera al objetivo anterior del mismo edificio
-        const reason = done ? null : waitingPrev ? `tras llegar a ${cur}` : buildBlockReason(townId, info);
+        const cur = fromOf(i), now = lvlOf(g.id);
+        const done = g.demolish ? now <= g.target : now >= g.target;
+        const waitingPrev = !done && now !== cur; // espera al objetivo anterior del mismo edificio
+        const reason = done ? null : waitingPrev ? `tras llegar a ${cur}` : g.demolish ? 'derribo pendiente' : buildBlockReason(townId, info);
         const isNext = next.id === g.id && next.gi === i;
         goalsBox.appendChild(el('div', { class: `nb-goal${isNext ? ' nb-goal-next' : ''}${done ? ' nb-goal-done' : ''}` }, [
           el('span', { class: 'nb-goal-idx' }, String(i + 1)),
           buildingIcon(g.id),
           el('div', { class: 'nb-goal-main' }, [
-            el('div', { class: 'nb-goal-name' }, buildingName(g.id)),
-            el('div', { class: 'nb-goal-sub' }, done ? 'completado' : isNext ? 'siguiente' : (reason || 'en espera'))
+            el('div', { class: 'nb-goal-name' }, [buildingName(g.id), g.demolish ? el('span', { class: 'nb-tag nb-tag-demolish' }, 'derribar') : null]),
+            el('div', { class: 'nb-goal-sub' }, done ? 'completado' : isNext ? (g.demolish ? 'siguiente (derribo)' : 'siguiente') : (reason || 'en espera'))
           ]),
           el('div', { class: 'nb-stepper' }, [
             el('span', { class: 'nb-goal-cur' }, `${cur} →`),
@@ -1566,26 +1600,26 @@
         const info = bd.building_data?.[id];
         const cur = lastLevelOf(id);
         const max = maxOf(id);
-        const atMax = cur >= max || (info?.has_max_level && cur <= committedLevel(info));
-        const input = el('input', {
-          class: 'nb-input nb-input-inline', type: 'number', min: String(cur + 1), max: String(max), value: String(Math.min(cur + 1, max))
-        });
-        const add = () => {
-          if (atMax) return;
-          addGoal(id, clamp(pos(input.value, cur + 1), cur + 1, max));
-        };
-        input.addEventListener('keydown', (e) => { if (e.key === 'Enter') add(); });
+        const canUp = cur < max && !(info?.has_max_level && cur <= lvlOf(id));
+        const canDown = cur > 0;
+        const def = canUp ? cur + 1 : Math.max(0, cur - 1);
+        const input = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '0', max: String(max), value: String(def) });
+        // Por debajo del nivel actual = derribar (el ✓ se pone en rojo).
+        const addBtn = el('span', { class: 'nb-mini nb-mini-add', onclick: () => addGoal(id, clamp(pos(input.value, def), 0, max)) }, '✓');
+        const paint = () => { const v = pos(input.value, def); const down = v < cur; addBtn.classList.toggle('nb-mini-danger', down); addBtn.title = down ? `Derribar hasta ${v}` : 'Añadir a objetivos'; };
+        input.addEventListener('input', paint);
+        input.addEventListener('keydown', (e) => { if (e.key === 'Enter') addGoal(id, clamp(pos(input.value, def), 0, max)); });
+        paint();
         const inList = tcfg.goals.some((g) => g.id === id);
-        return el('div', { class: `nb-add-row${atMax ? ' nb-add-row-off' : ''}` }, [
+        return el('div', { class: `nb-add-row${!canUp && !canDown ? ' nb-add-row-off' : ''}` }, [
           buildingIcon(id),
-          el('div', { class: 'nb-add-name' }, [buildingName(id), el('span', { class: 'nb-add-level' }, inList ? `nivel ${committedLevel(info)} · en la lista hasta ${cur}` : `nivel ${cur}`)]),
-          atMax
-            ? el('span', { class: 'nb-pill nb-pill-off' }, 'máximo')
+          el('div', { class: 'nb-add-name' }, [buildingName(id), el('span', { class: 'nb-add-level' }, `${inList ? `nivel ${lvlOf(id)} · en la lista hasta ${cur}` : `nivel ${cur}`}${canUp ? '' : ' · máximo'}`)]),
+          (!canUp && !canDown) ? el('span', { class: 'nb-pill nb-pill-off' }, '—')
             : el('div', { class: 'nb-stepper' }, [
-                el('span', { class: 'nb-mini', title: '−1', onclick: () => { input.value = clamp(pos(input.value, cur + 1) - 1, cur + 1, max); } }, '−'),
+                el('span', { class: 'nb-mini', title: '−1 (por debajo del actual = derribar)', onclick: () => { input.value = clamp(pos(input.value, def) - 1, 0, max); paint(); } }, '−'),
                 input,
-                el('span', { class: 'nb-mini', title: '+1', onclick: () => { input.value = clamp(pos(input.value, cur + 1) + 1, cur + 1, max); } }, '+'),
-                el('span', { class: 'nb-mini nb-mini-add', title: 'Añadir a objetivos', onclick: add }, '✓')
+                el('span', { class: 'nb-mini', title: '+1', onclick: () => { input.value = clamp(pos(input.value, def) + 1, 0, max); paint(); } }, '+'),
+                addBtn
               ])
         ]);
       }
@@ -1601,7 +1635,7 @@
       renderAddList('');
 
       bodyEl.appendChild(el('div', { class: 'nb-card' }, [
-        el('div', { class: 'nb-card-title' }, 'Añadir edificio (se pone al final)'),
+        el('div', { class: 'nb-card-title' }, 'Añadir edificio (se pone al final · por debajo del nivel actual = derribar)'),
         el('div', {}, [addSearch, addList])
       ]));
     }
@@ -1623,13 +1657,14 @@
        · Los módulos NO incluidos siguen funcionando, pero solo con lo que sobre y
          sin pedir nada al comercio.
   --------------------------------------------------------------------------------- */
-  const PRIO_MODULES = { construccion: 'Construcción', reclutamiento: 'Reclutamiento', festivales: 'Festivales' };
+  const PRIO_MODULES = { construccion: 'Construcción', investigacion: 'Investigación', reclutamiento: 'Reclutamiento', festivales: 'Festivales' };
   const PRIO_PRESETS = {
-    equilibrado: { label: 'Equilibrado', order: ['construccion', 'reclutamiento', 'festivales'], inc: ['construccion', 'reclutamiento', 'festivales'] },
-    reclutamiento: { label: 'Solo reclutamiento', order: ['reclutamiento', 'construccion', 'festivales'], inc: ['reclutamiento'] },
-    recl_constr: { label: 'Reclutamiento + construcción', order: ['reclutamiento', 'construccion', 'festivales'], inc: ['reclutamiento', 'construccion'] },
-    construccion: { label: 'Solo construcción', order: ['construccion', 'reclutamiento', 'festivales'], inc: ['construccion'] },
-    festivales: { label: 'Solo festivales', order: ['festivales', 'construccion', 'reclutamiento'], inc: ['festivales'] },
+    // (la investigación va con la construcción: son mejoras de la ciudad)
+    equilibrado: { label: 'Equilibrado', order: ['construccion', 'investigacion', 'reclutamiento', 'festivales'], inc: ['construccion', 'investigacion', 'reclutamiento', 'festivales'] },
+    reclutamiento: { label: 'Solo reclutamiento', order: ['reclutamiento', 'construccion', 'investigacion', 'festivales'], inc: ['reclutamiento'] },
+    recl_constr: { label: 'Reclutamiento + construcción', order: ['reclutamiento', 'construccion', 'investigacion', 'festivales'], inc: ['reclutamiento', 'construccion', 'investigacion'] },
+    construccion: { label: 'Solo construcción', order: ['construccion', 'investigacion', 'reclutamiento', 'festivales'], inc: ['construccion', 'investigacion'] },
+    festivales: { label: 'Solo festivales', order: ['festivales', 'construccion', 'investigacion', 'reclutamiento'], inc: ['festivales'] },
     custom: { label: 'Personalizado' }
   };
 
@@ -1659,7 +1694,8 @@
         for (const s of buildPlan(townId)) {
           if (skip.has(s.id)) continue;
           const info = bd.building_data?.[s.id];
-          if (!info || s.level !== committedLevel(info) + 1) { skip.add(s.id); continue; }
+          if (s.down) continue; // derribar no reserva recursos
+          if (!info || s.level !== queuedLevel(townId, s.id, info) + 1) { skip.add(s.id); continue; }
           if ((buildRuntime.cooldown.get(`${townId}:${s.id}`) || 0) > Date.now()) { skip.add(s.id); continue; }
           if (buildHardBlock(info, townId)) { if (state.construccion.strictOrder) return zero; skip.add(s.id); continue; }
           const c = info.resources_for || {};
@@ -1673,6 +1709,7 @@
         return b && !b.reason ? { ...b.cost } : zero;
       }
       if (mod === 'festivales') return festivalPending(townId) ? { ...FESTIVAL_COST } : zero;
+      if (mod === 'investigacion') { const n = researchPlan(townId).find((x) => !x.block); return n ? { ...n.cost } : zero; }
     } catch {}
     return zero;
   }
@@ -1917,6 +1954,7 @@
           if (!free) break;
           if (skip.has(s.id)) continue;
           const info = bd.building_data?.[s.id];
+          if (s.down) { free -= 1; continue; } // derribar ocupa hueco pero no cuesta recursos
           if (buildHardBlock(info, townId)) { if (state.construccion.strictOrder) break; skip.add(s.id); continue; }
           const cost = levelCost(s.id, s.level, info);
           if (!cost) { skip.add(s.id); continue; }
@@ -2282,6 +2320,7 @@
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, [el('b', {}, 'Comercio automático')]), sw]),
       optionRow('Abastecer construcción', 'Envía lo que falta para los edificios en cola', !!cfg.forBuild, (v) => { cfg.forBuild = v; saveState(); renderBody(); }),
       optionRow('Abastecer reclutamiento', 'Envía lo que falta para completar los lotes de tropas', !!cfg.forRecruit, (v) => { cfg.forRecruit = v; saveState(); renderBody(); }),
+      optionRow('Abastecer investigación', 'Solo cuando la ciudad tiene puntos de investigación para esa investigación', cfg.forResearch !== false, (v) => { cfg.forResearch = v; saveState(); renderBody(); }),
       el('p', { class: 'nb-placeholder' }, 'Revisa cada 10 s. Abastece todos los encargos que caben en la cola de cada ciudad. Nunca dona lo que la donante va a gastar y nunca hace que se pierda recurso al llegar.')
     ]));
 
@@ -2341,7 +2380,7 @@
      Petición: POST building_barracks?action=build (tierra) / building_docks (mar)
                json: { unit_id, amount, town_id, nl_init:true }
   --------------------------------------------------------------------------------- */
-  const recruitRuntime = { timer: null, running: false, log: [], cooldown: new Map() };
+  const recruitRuntime = { timer: null, running: false, log: [], cooldown: new Map(), wait: new Map() };
   let recruitLogEl = null;
 
   const recruitOnFor = (townId) => { const v = state.reclutamiento.towns[townId]?.enabled; return typeof v === 'boolean' ? v : !!state.reclutamiento.enabled; };
@@ -2513,8 +2552,10 @@
     for (const [id, u] of Object.entries(units)) {
       if (!u || typeof u !== 'object' || u.is_npc_unit_only || id === 'militia') continue;
       if (+u.favor > 0 && (!u.god_id || u.god_id !== townGod(townId))) continue;
+      // Tropas sin investigar: se pueden pedir si su investigación está en la cola del
+      // juego o en la del bot (se reclutan en cuanto quede investigada).
       const needR = [].concat(u.research_dependencies || []);
-      if (needR.some((r) => !rs?.get?.(r))) continue;
+      if (needR.some((r) => !rs?.get?.(r) && !researchPending(townId, r))) continue;
       const needB = u.building_dependencies || {};
       if (Object.entries(needB).some(([b, l]) => (+bd?.building_data?.[b]?.level || 0) < +l)) continue;
       out.push(id);
@@ -2594,8 +2635,13 @@
       for (const k of [...RES, 'favor']) if (c[k] > 0) fit = Math.min(fit, Math.floor(cap[k] / c[k]));
       return { id: g.id, c, rem, fit: Number.isFinite(fit) ? fit : 0 };
     });
-    const pending = rows.filter((r) => r.rem > 0);
-    if (!pending.length) return null;
+    // Las tropas aún sin investigar esperan; las siguientes de la lista se adelantan.
+    const waitingR = rows.filter((r) => r.rem > 0 && !unitResearched(townId, r.id));
+    const pending = rows.filter((r) => r.rem > 0 && unitResearched(townId, r.id));
+    if (!pending.length) {
+      if (!waitingR.length) return null;
+      return { rows: waitingR, units: {}, cost: { wood: 0, stone: 0, iron: 0 }, reason: `Esperando a que se investigue: ${waitingR.map((r) => unitName(r.id)).join(', ')}.` };
+    }
     // Solo tropas cuya cola (Cuartel / Puerto) tendrá hueco: si está llena no se
     // recluta ni se piden recursos para ella.
     const open = pending.filter((r) => unitQueueFree(townId, isNavalUnit(r.id) ? 'naval' : 'ground', atMs) > 0);
@@ -2632,7 +2678,7 @@
     const out = { wood: 0, stone: 0, iron: 0 };
     for (const g of cfg.goals) {
       const rem = Math.max(0, g.target - (+have[g.id] || 0) - (+queued[g.id] || 0));
-      if (!rem) continue;
+      if (!rem || !unitResearched(townId, g.id)) continue; // sin investigar: no se reserva aún
       const c = unitCost(townId, g.id);
       for (const k of RES) out[k] += rem * c[k];
     }
@@ -2662,16 +2708,93 @@
     return out;
   });
 
+  /* ---- Hechizos de reclutamiento (por ciudad) ----
+     Cuartel: Entrenamiento espartano (Ares), Crecimiento de la población (Hera).
+     Puerto:  La llamada del mar (Poseidón).
+     Cada uno: desactivado / opcional (se lanza si hay favor) / obligatorio (no se
+     recluta sin él: se espera al favor y se lanza solo).
+     · Activos en TODAS las ciudades: GET frontend_bridge?action=refetch
+       {collections:{CastedPowers:[]}} (solo lectura, devuelve los de todas).
+     · Lanzar: POST frontend_bridge?action=execute {model_url:"CastedPowers",
+       action_name:"cast", arguments:{power_id, target_id}} (el mismo que usa el juego). */
+  const RECRUIT_SPELLS = [
+    { id: 'spartan_training', kind: 'ground' },
+    { id: 'fertility_improvement', kind: 'ground' },
+    { id: 'call_of_the_ocean', kind: 'naval' }
+  ];
+  const spellInfo = { at: 0, busy: false, active: new Map() }; // townId -> { power_id: endMs }
+  async function refreshCastedPowers() {
+    if (spellInfo.busy) return;
+    spellInfo.busy = true;
+    try {
+      const d = await gpGet('frontend_bridge', 'refetch', { collections: { CastedPowers: [] }, nl_init: true });
+      const raw = d?.collections?.CastedPowers;
+      const list = Array.isArray(raw) ? raw : Array.isArray(raw?.data) ? raw.data : [];
+      const map = new Map();
+      for (const x of list) {
+        const a = x?.d || x?.attributes || x; if (!a?.power_id) continue;
+        const t = +a.town_id; if (!map.has(t)) map.set(t, {});
+        map.get(t)[a.power_id] = Math.max(map.get(t)[a.power_id] || 0, +a.end_at * 1000 || 0);
+      }
+      // Los recién lanzados por el bot que el juego aún no devuelve se mantienen.
+      for (const [t, o] of spellInfo.active) for (const [k, end] of Object.entries(o)) if (end > Date.now() && !(map.get(t)?.[k] > 0)) { if (!map.has(t)) map.set(t, {}); map.get(t)[k] = end; }
+      spellInfo.active = map; spellInfo.at = Date.now();
+    } catch {} finally { spellInfo.busy = false; }
+  }
+  function spellEnd(townId, id) {
+    let end = spellInfo.active.get(+townId)?.[id] || 0;
+    try { // lo que tenga cargado el juego (ciudad actual)
+      for (const c of [].concat(UW.MM.getCollections().CastedPowers || [])) for (const m of c?.models || []) {
+        const a = m.attributes; if (+a.town_id === +townId && a.power_id === id) end = Math.max(end, +a.end_at * 1000 || 0);
+      }
+    } catch {}
+    return end;
+  }
+  const spellActive = (townId, id) => spellEnd(townId, id) > Date.now() + 30000;
+  // Lanza los hechizos configurados para ese tipo de cola (tierra/mar) que no estén
+  // activos. Devuelve el motivo de espera si falta uno OBLIGATORIO.
+  async function ensureRecruitSpells(townId, kind) {
+    const cfg = townRecruitCfg(townId).spells || {};
+    for (const sd of RECRUIT_SPELLS.filter((x) => x.kind === kind)) {
+      const mode = cfg[sd.id];
+      if (!mode || spellActive(townId, sd.id)) continue;
+      const p = UW.GameData?.powers?.[sd.id]; if (!p) continue;
+      const cost = +p.favor || 0, fav = godFavor(p.god_id);
+      const key = `${townId}:${sd.id}`;
+      if ((recruitRuntime.cooldown.get(key) || 0) > Date.now()) { if (mode === 'required') return `${p.name}: reintentando en unos minutos`; continue; }
+      if (fav < cost) { if (mode === 'required') return `Esperando favor de ${UW.GameData?.gods?.[p.god_id]?.name || p.god_id} para ${p.name} (${Math.floor(fav)}/${cost})`; continue; }
+      try {
+        await gpPostAs(townId, 'frontend_bridge', 'execute', { model_url: 'CastedPowers', action_name: 'cast', captcha: null, arguments: { power_id: sd.id, target_id: +townId }, nl_init: true });
+        if (!spellInfo.active.has(+townId)) spellInfo.active.set(+townId, {});
+        spellInfo.active.get(+townId)[sd.id] = Date.now() + (+p.lifetime || 3600) * 1000;
+        recruitLog(`${farmTownName(townId)}: hechizo ${p.name} lanzado (${cost} favor).`, 'ok');
+        setTimeout(refreshCastedPowers, 3000);
+        await sleep(600 + Math.random() * 600);
+      } catch (e) {
+        recruitRuntime.cooldown.set(key, Date.now() + 5 * 60000);
+        recruitLog(`${farmTownName(townId)}: ${p.name} — ${e.message}`, 'error');
+        if (mode === 'required') return `${p.name}: ${e.message}`;
+      }
+    }
+    return null;
+  }
+
   async function recruitTick() {
     if (!anyRecruitOn()) return;
     if (!overviewReady()) return; // sin conocer TODAS las colas se podrían pasar de 7 órdenes
     // Coste real (héroes, investigaciones…): refrescar las ciudades con tropas pedidas.
     const stale = allTownIds().filter((id) => recruitOnFor(id) && townRecruitCfg(id).goals.length && realCostsStale(id));
     for (const id of stale.slice(0, 3)) await refreshRealCosts(id);
+    const anySpells = allTownIds().some((id) => recruitEnabledFor(id) && Object.values(townRecruitCfg(id).spells || {}).some(Boolean));
+    if (anySpells && Date.now() - spellInfo.at > 60000) await refreshCastedPowers();
     for (const townId of allTownIds()) {
       if (!recruitEnabledFor(townId)) continue;
       const tc = townRecruitCfg(townId);
       if (tc.startAt && tc.startAt <= Date.now()) { delete tc.startAt; saveState(); recruitLog(`${farmTownName(townId)}: empieza el reclutamiento programado.`, 'ok'); }
+      // Con órdenes ya en cola, mantener sus hechizos activos (aceleran lo que hay en cola).
+      if (tc.spells) for (const kind of ['ground', 'naval']) {
+        if (townUnitOrders(townId).some((o) => (o.kind === 'naval') === (kind === 'naval'))) await ensureRecruitSpells(townId, kind);
+      }
       if (!townRecruitCfg(townId).goals.length || !unitQueueFree(townId)) continue;
       if ((recruitRuntime.cooldown.get(townId) || 0) > Date.now()) continue;
       // (recruitBatch sin atMs = huecos de ahora mismo)
@@ -2682,6 +2805,11 @@
       const fr = reserveAbove(townId, 'reclutamiento');
       if (RES.some((k) => cur[k] - fr[k] < b.cost[k])) continue;
       if (b.favor && godFavor(townGod(townId)) < b.favor) continue;
+      // Hechizos del cuartel / puerto: los obligatorios deben estar activos antes de reclutar.
+      const lotKind = isNavalUnit(Object.keys(b.units)[0]) ? 'naval' : 'ground';
+      const waitSpell = await ensureRecruitSpells(townId, lotKind);
+      if (waitSpell) { if (recruitRuntime.wait.get(townId) !== waitSpell) { recruitRuntime.wait.set(townId, waitSpell); renderIfIdle('reclutamiento'); } continue; }
+      recruitRuntime.wait.delete(townId);
       for (const [unitId, amount] of Object.entries(b.units)) {
         if (!(amount > 0)) continue;
         try {
@@ -2785,6 +2913,33 @@
     const prioWarn = anyRecruitOn() ? prioExcludedAlert('reclutamiento') : null;
     if (prioWarn) bodyEl.appendChild(prioWarn);
 
+    // Hechizos de reclutamiento de esta ciudad
+    if (Date.now() - spellInfo.at > 60000 && !spellInfo.busy) refreshCastedPowers().then(() => renderIfIdle('reclutamiento'));
+    const spellRows = RECRUIT_SPELLS.map((sd) => {
+      const p = UW.GameData?.powers?.[sd.id]; if (!p) return null;
+      const mode = tcfg.spells?.[sd.id] || '';
+      const fav = Math.floor(godFavor(p.god_id)), end = spellEnd(townId, sd.id);
+      const setMode = (m) => { tcfg.spells = { ...(tcfg.spells || {}) }; if (m) tcfg.spells[sd.id] = m; else delete tcfg.spells[sd.id]; if (!Object.keys(tcfg.spells).length) delete tcfg.spells; saveState(); renderBody(); };
+      const seg = el('div', { class: 'nb-seg nb-seg-sm' }, [['', 'No'], ['optional', 'Opcional'], ['required', 'Obligatorio']].map(([v, l]) =>
+        el('span', { class: `nb-seg-btn${mode === v ? ' active' : ''}`, onclick: () => setMode(v) }, l)));
+      return el('div', { class: 'nb-spell-row' }, [
+        el('span', { class: `nb-icon nb-icon-30 power_icon30x30 ${sd.id}`, title: String(p.short_effect || p.effect || '') }),
+        el('div', { class: 'nb-goal-main' }, [
+          el('div', { class: 'nb-goal-name' }, `${p.name} · ${sd.kind === 'naval' ? 'Puerto' : 'Cuartel'}`),
+          el('div', { class: 'nb-goal-sub' }, [
+            `${UW.GameData?.gods?.[p.god_id]?.name || p.god_id} · ${p.favor} favor (tienes ${fav}) · `,
+            end > Date.now() ? el('span', { class: 'nb-ok' }, ['activo ', el('b', { 'data-nb-until': Math.round(end / 1000) }, formatLeft(Math.round(end / 1000)))]) : 'inactivo'
+          ])
+        ]),
+        seg
+      ]);
+    });
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+      el('div', { class: 'nb-card-title' }, `Hechizos de reclutamiento · ${farmTownName(townId)}`),
+      ...spellRows,
+      el('p', { class: 'nb-placeholder nb-mt' }, 'Opcional: se lanza si hay favor. Obligatorio: no recluta hasta tenerlo activo (espera al favor y lo lanza solo). Mientras haya órdenes en cola se mantiene activo.')
+    ]));
+
     // Siguiente lote
     const b = recruitBatch(townId);
     const cur = townResources(townId);
@@ -2827,6 +2982,7 @@
     }
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
       el('div', { class: 'nb-card-title' }, 'Siguiente lote'),
+      recruitRuntime.wait.get(townId) ? el('div', { class: 'nb-alert nb-alert-warn' }, recruitRuntime.wait.get(townId)) : null,
       scheduled ? el('div', { class: 'nb-countdown' }, [el('span', {}, 'Empieza a reclutar en'), el('b', { 'data-nb-until': Math.round(tcfg.startAt / 1000) }, formatLeft(Math.round(tcfg.startAt / 1000))), el('small', {}, new Date(tcfg.startAt).toLocaleTimeString('es-ES'))])
         : tcfg.hold ? el('div', { class: 'nb-alert nb-alert-warn' }, 'En espera: no pide recursos. Pon los minutos y pulsa Programar.') : null,
       ...heroNotes,
@@ -2853,7 +3009,7 @@
         unitIcon(g.id),
         el('div', { class: 'nb-goal-main' }, [
           el('div', { class: 'nb-goal-name' }, unitName(g.id)),
-          el('div', { class: 'nb-goal-sub' }, `tienes ${+have[g.id] || 0}${queued[g.id] ? ` + ${queued[g.id]} en cola` : ''} · faltan ${Math.max(0, g.target - h)}`)
+          el('div', { class: 'nb-goal-sub' }, `tienes ${+have[g.id] || 0}${queued[g.id] ? ` + ${queued[g.id]} en cola` : ''} · faltan ${Math.max(0, g.target - h)}${unitResearched(townId, g.id) ? '' : ' · esperando a que se investigue'}`)
         ]),
         el('div', { class: 'nb-stepper' }, [
           el('span', { class: 'nb-mini', onclick: () => setTarget(g.id, g.target - 50) }, '−50'),
@@ -2896,7 +3052,7 @@
         unitIcon(id),
         el('div', { class: 'nb-add-name' }, [
           el('span', {}, unitName(id)),
-          el('span', { class: 'nb-add-level' }, `tienes ${h} · ${Math.round(c.wood)}/${Math.round(c.stone)}/${Math.round(c.iron)}${c.favor ? ` · ${Math.round(c.favor)} favor` : ''} · ${c.pop} pob`)
+          el('span', { class: 'nb-add-level' }, `tienes ${h} · ${Math.round(c.wood)}/${Math.round(c.stone)}/${Math.round(c.iron)}${c.favor ? ` · ${Math.round(c.favor)} favor` : ''} · ${c.pop} pob${unitResearched(townId, id) ? '' : ' · en investigación'}`)
         ]),
         el('div', { class: 'nb-stepper' }, [input, el('span', { class: 'nb-mini nb-mini-add', title: 'Añadir (total objetivo)', onclick: add }, '✓')])
       ]));
@@ -3909,6 +4065,253 @@
   }
 
   /* ---------------------------------------------------------------------------------
+     8g) INVESTIGACIÓN (Academia) — cola por ciudad, todo por API
+     -----------------------------------------------------------------------------
+     Peticiones (leídas en game.min.js, modelo ResearchOrder):
+       POST frontend_bridge?action=execute {model_url:"ResearchOrder", action_name:"research",
+            arguments:{id:<investigación>}}
+       GET  frontend_bridge?action=refetch {collections:{ResearchOrders:[]}} → las órdenes de
+            investigación en curso de TODAS las ciudades (solo lectura).
+     Puntos: Academia × 4 (+ Biblioteca × 12); se gastan los de lo investigado y lo que
+     está en cola. Coste: GameData.researches[x].resources × modificador de la ciudad.
+     El comercio solo manda recursos para una investigación si la ciudad YA tiene
+     puntos (y Academia / requisitos) para ella.
+  --------------------------------------------------------------------------------- */
+  const researchRuntime = { timer: null, running: false, log: [], cooldown: new Map(), orders: [], ordersAt: 0, busy: false };
+  let researchLogEl = null;
+  const RD = (r) => UW.GameData?.researches?.[r] || null;
+  const researchName = (r) => RD(r)?.name || r;
+  const researchIcon = (r) => { let c = r; try { c = UW.GameDataResearches?.getResearchCssClass?.(r) || r; } catch {} return el('span', { class: `nb-icon nb-icon-40 research_icon research40x40 ${c}` }); };
+  function townResearchCfg(townId) {
+    const all = state.investigacion.towns;
+    if (!all[townId]) all[townId] = { queue: [] };
+    if (!Array.isArray(all[townId].queue)) all[townId].queue = [];
+    return all[townId];
+  }
+  const researchEnabledFor = (townId) => { const v = state.investigacion.towns[townId]?.enabled; return typeof v === 'boolean' ? v : !!state.investigacion.enabled; };
+  const anyResearchOn = () => allTownIds().some(researchEnabledFor);
+
+  async function refreshResearchOrders() {
+    if (researchRuntime.busy) return;
+    researchRuntime.busy = true;
+    try {
+      const d = await gpGet('frontend_bridge', 'refetch', { collections: { ResearchOrders: [] }, nl_init: true });
+      const raw = d?.collections?.ResearchOrders;
+      const list = Array.isArray(raw) ? raw : Array.isArray(raw?.data) ? raw.data : [];
+      researchRuntime.orders = list.map((x) => x?.d || x).filter((o) => o?.research_type);
+      researchRuntime.ordersAt = Date.now();
+    } catch {} finally { researchRuntime.busy = false; }
+  }
+  function researchOrdersOf(townId) {
+    const byId = new Map();
+    try { for (const c of [].concat(UW.MM.getCollections().ResearchOrder || [])) for (const m of c?.models || []) byId.set(+m.attributes.id, m.attributes); } catch {}
+    for (const o of researchRuntime.orders) if (!byId.has(+o.id)) byId.set(+o.id, o);
+    const now = Date.now();
+    return [...byId.values()].filter((o) => +o.town_id === +townId && +o.to_be_completed_at * 1000 > now)
+      .sort((a, b) => +a.to_be_completed_at - +b.to_be_completed_at);
+  }
+  function researchesOf(townId) { try { return UW.ITowns.getTown(townId)?.getResearches?.()?.attributes || {}; } catch { return {}; } }
+  const isResearched = (townId, r) => researchesOf(townId)[r] === true;
+  const isResearchQueued = (townId, r) => researchOrdersOf(townId).some((o) => o.research_type === r);
+  // Investigada, en la cola del juego o en la del bot.
+  const researchPending = (townId, r) => isResearched(townId, r) || isResearchQueued(townId, r) || townResearchCfg(townId).queue.includes(r);
+  function unitResearched(townId, unitId) {
+    const deps = [].concat(UW.GameData?.units?.[unitId]?.research_dependencies || []);
+    if (!deps.length) return true;
+    const rs = researchesOf(townId);
+    if (!Object.keys(rs).length) return true; // sin datos: no bloquear
+    return deps.every((r) => rs[r] === true);
+  }
+  function realBuildingLevel(townId, b) { try { return +UW.ITowns.getTown(townId)?.getBuildings?.()?.attributes?.[b] || 0; } catch { return 0; } }
+  function researchPoints(townId) {
+    let perA = 4, perL = 12;
+    try { perA = +UW.GameDataResearches.getResearchPointsPerAcademyLevel() || 4; perL = +UW.GameDataResearches.getResearchPointsPerLibraryLevel() || 12; } catch {}
+    const total = realBuildingLevel(townId, 'academy') * perA + realBuildingLevel(townId, 'library') * perL;
+    const rs = researchesOf(townId);
+    let used = 0;
+    for (const [k, v] of Object.entries(rs)) if (v === true && RD(k)) used += +RD(k).research_points || 0;
+    for (const o of researchOrdersOf(townId)) used += +RD(o.research_type)?.research_points || 0;
+    return { total, used, free: Math.max(0, total - used) };
+  }
+  function researchCost(townId, r) {
+    const base = RD(r)?.resources || {};
+    let f = 1; try { f = +UW.GeneralModifications?.getResearchResourcesModification?.(+townId) || 1; } catch {}
+    return { wood: Math.ceil((+base.wood || 0) * f), stone: Math.ceil((+base.stone || 0) * f), iron: Math.ceil((+base.iron || 0) * f) };
+  }
+  // Estado de la cola del bot: cada investigación con su bloqueo (si lo tiene).
+  // Los puntos y los huecos se van "gastando" en orden, como pasaría al investigarlas.
+  function researchPlan(townId) {
+    const q = townResearchCfg(townId).queue;
+    if (!q.length) return [];
+    const pts = researchPoints(townId);
+    let free = pts.free, slots = buildQueueLimit() - researchOrdersOf(townId).length;
+    const acad = realBuildingLevel(townId, 'academy');
+    const ahead = new Set(); // lo que estará investigado/en cola antes que este
+    return q.map((r) => {
+      const d = RD(r);
+      let block = null;
+      if (!d) block = 'desconocida';
+      else if (isResearched(townId, r) || isResearchQueued(townId, r)) block = 'ya investigada';
+      else {
+        const needA = +d.building_dependencies?.academy || 0;
+        const other = Object.entries(d.building_dependencies || {}).find(([b, l]) => b !== 'academy' && realBuildingLevel(townId, b) < +l);
+        const dep = [].concat(d.research_dependencies || []).find((x) => !isResearched(townId, x));
+        if (acad < needA) block = `requiere Academia ${needA}`;
+        else if (other) block = `requiere ${buildingName(other[0])} ${other[1]}`;
+        else if (dep) block = isResearchQueued(townId, dep) ? `tras investigar ${researchName(dep)}` : ahead.has(dep) ? `tras ${researchName(dep)}` : `requiere ${researchName(dep)}`;
+        else if ((+d.research_points || 0) > free) block = `faltan puntos (${free}/${+d.research_points || 0})`;
+        else if (slots <= 0) block = 'cola de investigación llena';
+      }
+      if (!block) { free -= +d.research_points || 0; slots -= 1; }
+      ahead.add(r);
+      return { r, block, cost: researchCost(townId, r), points: +d?.research_points || 0 };
+    });
+  }
+  function nextResearchFor(townId) {
+    const plan = researchPlan(townId);
+    const n = plan.find((x) => !x.block && (researchRuntime.cooldown.get(`${townId}:${x.r}`) || 0) <= Date.now());
+    if (!n) return { reason: plan.length ? (plan.find((x) => x.block && x.block !== 'ya investigada')?.block || 'esperando') : 'nada pendiente' };
+    const cur = townResources(townId), fr = reserveAbove(townId, 'investigacion');
+    if (RES.some((k) => cur[k] < n.cost[k])) return { reason: `${researchName(n.r)}: faltan recursos` };
+    if (RES.some((k) => cur[k] - fr[k] < n.cost[k])) return { reason: `${researchName(n.r)}: reservado para ${reserveOwner(townId, 'investigacion') || 'otro módulo'}` };
+    return { r: n.r };
+  }
+  function pruneResearchQueue(townId) {
+    const cfg = townResearchCfg(townId);
+    const before = cfg.queue.length;
+    cfg.queue = cfg.queue.filter((r) => RD(r) && !isResearched(townId, r) && !isResearchQueued(townId, r));
+    if (cfg.queue.length !== before) saveState();
+  }
+
+  // Comercio: solo las investigaciones que ya se pueden hacer (puntos, Academia, requisitos).
+  tradeDemandProviders.push(function researchDemands() {
+    if (state.comercio.forResearch === false) return [];
+    const out = [];
+    for (const townId of allTownIds()) {
+      if (!researchEnabledFor(townId)) continue;
+      for (const x of researchPlan(townId)) if (!x.block) out.push({ townId, module: 'investigacion', label: researchName(x.r), ...x.cost });
+    }
+    return out;
+  });
+
+  async function researchTick() {
+    if (!anyResearchOn()) return;
+    if (Date.now() - researchRuntime.ordersAt > 60000) await refreshResearchOrders();
+    for (const townId of allTownIds()) {
+      if (!researchEnabledFor(townId) || !townResearchCfg(townId).queue.length) continue;
+      pruneResearchQueue(townId);
+      if ((researchRuntime.cooldown.get(townId) || 0) > Date.now()) continue;
+      const next = nextResearchFor(townId);
+      if (!next.r) continue;
+      try {
+        await gpPostAs(townId, 'frontend_bridge', 'execute', { model_url: 'ResearchOrder', action_name: 'research', captcha: null, arguments: { id: next.r }, nl_init: true });
+        researchLog(`${farmTownName(townId)}: investigando ${researchName(next.r)}.`, 'ok');
+        researchRuntime.cooldown.set(townId, Date.now() + 20000);
+        // Se da por encargada ya (sin esperar a releer la cola del juego).
+        researchRuntime.orders.push({ id: -Date.now(), town_id: +townId, research_type: next.r, to_be_completed_at: Date.now() / 1000 + 60 });
+        pruneResearchQueue(townId);
+        setTimeout(() => refreshResearchOrders().then(() => renderIfIdle('investigacion')), 3000);
+        renderIfIdle('investigacion');
+      } catch (e) {
+        researchLog(`${farmTownName(townId)}: ${researchName(next.r)} — ${e.message}`, 'error');
+        researchRuntime.cooldown.set(`${townId}:${next.r}`, Date.now() + 5 * 60000);
+      }
+      await sleep(800 + Math.random() * 1000);
+    }
+  }
+  function startResearchEngine() {
+    if (researchRuntime.timer) return;
+    researchRuntime.timer = setInterval(() => {
+      if (!anyResearchOn() || researchRuntime.running) return;
+      researchRuntime.running = true;
+      researchTick().catch((e) => researchLog(`Error: ${e.message}`, 'error')).finally(() => { researchRuntime.running = false; });
+    }, 15000);
+  }
+  function researchLog(text, kind = 'info') {
+    researchRuntime.log.unshift({ at: Date.now(), text, kind });
+    researchRuntime.log = researchRuntime.log.slice(0, 30);
+    if (researchLogEl) paintLog(researchLogEl, researchRuntime.log);
+  }
+
+  function renderInvestigacionTab() {
+    const cfg = state.investigacion;
+    const townId = +UW.Game?.townId || allTownIds()[0];
+    const tcfg = townResearchCfg(townId);
+    if (Date.now() - researchRuntime.ordersAt > 30000 && !researchRuntime.busy) refreshResearchOrders().then(() => renderIfIdle('investigacion'));
+    pruneResearchQueue(townId);
+
+    // Activación: general + excepción de esta ciudad
+    const sw = switchEl(!!cfg.enabled, (v) => { setModuleGlobal('investigacion', v); renderBody(); researchLog(v ? 'Investigación activada en todas las ciudades.' : 'Investigación desactivada en todas las ciudades.'); }, false);
+    const isExc = typeof tcfg.enabled === 'boolean' && tcfg.enabled !== !!cfg.enabled;
+    const townSw = switchEl(researchEnabledFor(townId), (v) => { if (v === !!cfg.enabled) delete tcfg.enabled; else tcfg.enabled = v; saveState(); renderBody(); });
+    const pts = researchPoints(townId);
+    const orders = researchOrdersOf(townId);
+    const next = nextResearchFor(townId);
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+      el('div', { class: 'nb-row' }, [el('div', { class: 'nb-option-text' }, [el('b', {}, 'Investigación automática'), el('span', { class: 'nb-option-hint' }, 'Todas las ciudades')]), sw]),
+      el('div', { class: 'nb-row nb-option' }, [el('div', { class: 'nb-option-text' }, [el('span', { class: 'nb-option-label' }, `Solo ${farmTownName(townId)}`),
+        el('span', { class: `nb-option-hint${isExc ? ' nb-warn-txt' : ''}` }, isExc ? `Excepción: ${tcfg.enabled ? 'activada' : 'desactivada'} aunque el general esté ${cfg.enabled ? 'activado' : 'desactivado'}` : 'Sigue al general')]), townSw]),
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Ciudad actual'), el('span', { class: 'nb-row-value' }, farmTownName(townId))]),
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Puntos de investigación'), el('span', { class: 'nb-row-value' }, `${pts.free} libres · ${pts.used}/${pts.total} usados (Academia ${realBuildingLevel(townId, 'academy')})`)]),
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Siguiente'), el('span', { class: 'nb-row-value' }, !researchEnabledFor(townId) ? 'desactivada en esta ciudad' : next.r ? researchName(next.r) : next.reason)])
+    ]));
+    const pw = anyResearchOn() ? prioExcludedAlert('investigacion') : null;
+    if (pw) bodyEl.appendChild(pw);
+
+    // Cola del juego
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+      el('div', { class: 'nb-card-title' }, `Cola del juego (${orders.length}/${buildQueueLimit()})`),
+      orders.length ? el('div', { class: 'nb-queue' }, orders.map((o) => el('div', { class: 'nb-queue-item' }, [
+        el('span', { class: 'nb-with-icon' }, [researchIcon(o.research_type), researchName(o.research_type)]),
+        o.to_be_completed_at > 0 ? el('span', { class: 'nb-queue-time', 'data-nb-until': Math.round(+o.to_be_completed_at) }, formatLeft(+o.to_be_completed_at)) : null
+      ]))) : el('p', { class: 'nb-placeholder' }, 'Nada investigándose.')
+    ]));
+
+    // Cola del bot (orden = orden de investigación); se puede quitar cualquiera.
+    const plan = researchPlan(townId);
+    const move = (i, d) => { const j = i + d; if (j < 0 || j >= tcfg.queue.length) return; [tcfg.queue[i], tcfg.queue[j]] = [tcfg.queue[j], tcfg.queue[i]]; saveState(); renderBody(); };
+    const qBox = el('div', { class: 'nb-goals' }, plan.map((x, i) => el('div', { class: `nb-goal${next.r === x.r ? ' nb-goal-next' : ''}` }, [
+      el('span', { class: 'nb-goal-idx' }, String(i + 1)),
+      researchIcon(x.r),
+      el('div', { class: 'nb-goal-main' }, [
+        el('div', { class: 'nb-goal-name' }, researchName(x.r)),
+        el('div', { class: 'nb-goal-sub nb-res-list' }, [el('span', {}, `${x.points} pts`), fmtResEl(x.cost), el('span', { class: x.block ? 'nb-warn-txt' : '' }, next.r === x.r ? '· siguiente' : x.block ? `· ${x.block}` : '· en espera de recursos')])
+      ]),
+      el('div', { class: 'nb-goal-actions' }, [
+        el('span', { class: `nb-mini${i === 0 ? ' nb-mini-off' : ''}`, title: 'Subir', onclick: () => move(i, -1) }, '▲'),
+        el('span', { class: `nb-mini${i === plan.length - 1 ? ' nb-mini-off' : ''}`, title: 'Bajar', onclick: () => move(i, 1) }, '▼'),
+        el('span', { class: 'nb-mini nb-mini-danger', title: 'Quitar solo esta', onclick: () => { tcfg.queue.splice(i, 1); saveState(); renderBody(); } }, '✕')
+      ])
+    ])));
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+      el('div', { class: 'nb-card-head' }, [el('div', { class: 'nb-card-title' }, `Cola del bot (${plan.length})`),
+        plan.length ? el('span', { class: 'nb-btn', onclick: () => { if (confirm('¿Vaciar la cola de investigación de esta ciudad?')) { tcfg.queue = []; saveState(); renderBody(); } } }, 'Vaciar') : null]),
+      plan.length ? qBox : el('p', { class: 'nb-placeholder' }, 'Sin investigaciones. Añádelas abajo; se investigan en este orden.')
+    ]));
+
+    // Añadir: lo que falta por investigar en esta ciudad
+    const avail = Object.keys(UW.GameData?.researches || {}).filter((r) => !isResearched(townId, r) && !isResearchQueued(townId, r) && !tcfg.queue.includes(r));
+    const acad = realBuildingLevel(townId, 'academy');
+    const list = el('div', { class: 'nb-add-list' }, avail.map((r) => {
+      const d = RD(r), c = researchCost(townId, r), needA = +d.building_dependencies?.academy || 0;
+      return el('div', { class: `nb-add-row${acad < needA ? ' nb-add-row-off' : ''}` }, [
+        researchIcon(r),
+        el('div', { class: 'nb-add-name' }, [researchName(r), el('span', { class: 'nb-add-level' }, `${+d.research_points || 0} pts · Academia ${needA} · ${c.wood}/${c.stone}/${c.iron}`)]),
+        el('div', { class: 'nb-stepper' }, [el('span', { class: 'nb-mini nb-mini-add', title: 'Añadir al final de la cola', onclick: () => { tcfg.queue.push(r); saveState(); renderBody(); } }, '✓')])
+      ]);
+    }));
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+      el('div', { class: 'nb-card-title' }, `Añadir investigación (${avail.length} sin investigar)`),
+      avail.length ? list : el('p', { class: 'nb-placeholder' }, 'Todo investigado.')
+    ]));
+
+    const logBox = el('div', { class: 'nb-log' });
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [el('div', { class: 'nb-card-title' }, 'Actividad'), logBox]));
+    researchLogEl = logBox; paintLog(logBox, researchRuntime.log);
+    updateCountdown();
+  }
+
+  /* ---------------------------------------------------------------------------------
      8f) FESTIVALES (cultura)
      -----------------------------------------------------------------------------
      Solo ciudades con Academia ≥ 30 y sin festival en curso.
@@ -4089,6 +4492,7 @@
     startFarmEngine();
     startOverviewSync();
     startBuildEngine();
+    startResearchEngine();
     startTradeEngine();
     startRecruitEngine();
     startAttackEngine();
