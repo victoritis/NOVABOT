@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.12.4
+// @version      1.12.5
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.12.4';
+  const VERSION = '1.12.5';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -144,8 +144,8 @@
       construccion: {
         enabled: false,
         strictOrder: false,   // true = no salta a otro edificio si el primero está bloqueado
-        interleave: true,     // true = un nivel de cada edificio por turnos (en el orden añadido)
-        towns: {}             // townId -> { goals: [{id, target}], lastId } (orden = prioridad; un edificio puede repetirse)
+        interleave: true,     // valor por defecto para las ciudades que aún no lo han elegido (ver townInterleave)
+        towns: {}             // townId -> { goals: [{id, target}], lastId, interleave } (orden = prioridad; un edificio puede repetirse)
       },
       festivales: {
         enabled: true,
@@ -2076,6 +2076,13 @@
     return all[townId];
   }
 
+  // Intercalar es POR CIUDAD. Las que aún no lo han tocado heredan el valor que
+  // tenía la antigua opción general (así nadie pierde lo que ya tenía puesto).
+  function townInterleave(townId) {
+    const v = state.construccion.towns[townId]?.interleave;
+    return typeof v === 'boolean' ? v : !!state.construccion.interleave;
+  }
+
   // Bloqueos que NO se arreglan mandando recursos (null = ninguno).
   // OJO: info.population_free NO es la población libre de la ciudad (es la que
   // se liberaría al derribar un nivel). La libre real es getAvailablePopulation().
@@ -2149,7 +2156,7 @@
       else { while (lvl < Math.min(g.target, maxOf(g.id))) { lvl += 1; seq.get(g.id).push({ id: g.id, level: lvl, gi }); } }
       sim[g.id] = lvl;
     });
-    if (!state.construccion.interleave) {
+    if (!townInterleave(townId)) {
       // Normal: objetivo a objetivo, en el orden de la lista.
       return [...seq.values()].flat().sort((a, b) => a.gi - b.gi || 0);
     }
@@ -2281,7 +2288,10 @@
       el('div', { class: 'nb-row' }, [el('div', { class: 'nb-option-text' }, [el('b', {}, 'Construcción automática'), el('span', { class: 'nb-option-hint' }, `Todas las ciudades${excCount ? ` · ${excCount} excepción(es)` : ''}`)]), sw]),
       el('div', { class: 'nb-row nb-option' }, [el('div', { class: 'nb-option-text' }, [el('span', { class: 'nb-option-label' }, `Solo ${farmTownName(townId)}`),
         el('span', { class: `nb-option-hint${isExc ? ' nb-warn-txt' : ''}` }, isExc ? `Excepción: ${tcfg.enabled ? 'activada' : 'desactivada'} aunque el general esté ${cfg.enabled ? 'activado' : 'desactivado'}` : 'Sigue al general')]), townSw]),
-      optionRow('Intercalar edificios', 'Un nivel de cada uno por turnos, en el orden en que los añades', !!cfg.interleave, (v) => { cfg.interleave = v; saveState(); renderBody(); }),
+      optionRow('Intercalar edificios', `Solo en ${farmTownName(townId)} · un nivel de cada uno por turnos, en el orden en que los añades`, townInterleave(townId), (v) => {
+        tcfg.interleave = v; saveState(); renderBody();
+        buildLog(`${farmTownName(townId)}: intercalar ${v ? 'activado' : 'desactivado'}.`);
+      }),
       optionRow('Orden estricto', 'Si el primero está bloqueado, no salta al siguiente', !!cfg.strictOrder, (v) => { cfg.strictOrder = v; saveState(); })
     ]));
     const prioWarn = anyBuildEnabled() ? prioExcludedAlert('construccion') : null;
@@ -2289,8 +2299,8 @@
 
     const copyBtn = el('div', { class: 'nb-btn', title: 'Copia estos objetivos al resto de ciudades' }, 'Copiar a todas');
     copyBtn.addEventListener('click', () => {
-      if (!confirm(`¿Copiar los objetivos de ${farmTownName(townId)} a TODAS las ciudades?`)) return;
-      for (const id of towns) if (id !== townId) cfg.towns[id] = { ...(cfg.towns[id] || {}), goals: tcfg.goals.map((g) => ({ ...g })) };
+      if (!confirm(`¿Copiar los objetivos de ${farmTownName(townId)} (y su «Intercalar») a TODAS las ciudades?`)) return;
+      for (const id of towns) if (id !== townId) cfg.towns[id] = { ...(cfg.towns[id] || {}), goals: tcfg.goals.map((g) => ({ ...g })), interleave: townInterleave(townId) };
       saveState(); buildLog(`Objetivos de ${farmTownName(townId)} copiados a todas.`, 'ok');
     });
     const next = nextBuildFor(townId);
@@ -6160,11 +6170,11 @@
         <li><b>Solo [ciudad]</b>: una <b>excepción</b> para la ciudad actual (apagada aunque el general esté encendido, o al revés). Arriba ves cuántas excepciones hay.</li></ul>
         <p>Este patrón general + excepción es igual en Investigación y Reclutamiento.</p>` },
       { t: 'Intercalar y orden estricto', find: inCard(/^Construcción automática/, /^Intercalar/), h: `
-        <ul><li><b>Intercalar edificios</b>: sube un nivel de cada edificio por turnos, en el orden de la lista (el turno rota de verdad). Apagado: termina un objetivo antes de empezar el siguiente.</li>
+        <ul><li><b>Intercalar edificios</b> (<b>por ciudad</b>): sube un nivel de cada edificio por turnos, en el orden de la lista (el turno rota de verdad). Apagado: termina un objetivo antes de empezar el siguiente. Cada ciudad tiene el suyo.</li>
         <li><b>Orden estricto</b>: si el primero está bloqueado (faltan requisitos, almacén pequeño, población…), <b>espera</b> en vez de saltar al siguiente.</li></ul>` },
       { t: 'Siguiente y copiar', find: () => TQ.card(/^Ciudad actual/), h: `
         <p><b>Siguiente</b>: lo próximo que va a encargar en esta ciudad, o por qué no puede (faltan recursos, cola llena, reservado para otro módulo…).</p>
-        <p><b>Copiar a todas</b>: copia la lista de objetivos de esta ciudad a todas las demás (pide confirmación).</p>` },
+        <p><b>Copiar a todas</b>: copia la lista de objetivos de esta ciudad (y si intercala o no) a todas las demás (pide confirmación).</p>` },
       { t: 'Cola del juego', find: () => TQ.card(/^Cola del juego/), h: `<p>Lo que ya está construyéndose en el juego, con el nivel que deja cada orden y cuánto le queda. Solo lectura.</p>` },
       { t: 'Objetivos del bot', find: () => TQ.card(/^Objetivos del bot/), wide: true, h: `
         <p>La lista de lo que quieres, <b>en orden de prioridad</b>:</p>
@@ -6368,6 +6378,9 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.12.5', items: [
+      { t: 'Intercalar, por ciudad', tab: 'construccion', find: inCard(/^Construcción automática/, /^Intercalar/), h: `<p><b>Intercalar edificios</b> ya no es general: cada ciudad tiene el suyo. Las ciudades que no toques siguen como estaban. <b>Copiar a todas</b> también copia esta opción.</p>` }
+    ] },
     { v: '1.12.4', items: [
       { t: 'Festivales: vuelven los normales', tab: 'festivales', find: () => TQ.card(/^Festivales automáticos/), h: `<p>La «Temporada de festivales» terminó: se quita la opción <b>Festival evento</b> y, si la tenías puesta, se vuelve a los <b>festivales normales</b> (Academia 30+, 15 000 / 18 000 / 15 000).</p>` }
     ] },
