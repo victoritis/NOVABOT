@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.9.2
+// @version      1.9.3
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.9.2';
+  const VERSION = '1.9.3';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -103,6 +103,21 @@
       node.appendChild(typeof c === 'string' || typeof c === 'number' ? document.createTextNode(String(c)) : c);
     }
     return node;
+  }
+
+  // Lleva a una tarjeta de otra pestaña y la resalta unos segundos (para ver qué
+  // opción está relacionada con cuál).
+  function gotoCard(tab, key) {
+    state.activeTab = tab; saveState();
+    try { buildTabs(); } catch {}
+    renderBody();
+    setTimeout(() => {
+      const card = bodyEl?.querySelector(`[data-nb-card="${key}"]`);
+      if (!card) return;
+      card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      card.classList.remove('nb-flash'); void card.offsetWidth; card.classList.add('nb-flash');
+      setTimeout(() => card.classList.remove('nb-flash'), 3200);
+    }, 60);
   }
 
   /* ---------------------------------------------------------------------------------
@@ -1639,14 +1654,24 @@
       i.addEventListener('change', () => { cfg[key] = clamp(pos(i.value, def), min, max); saveState(); caveRuntime.planAt = 0; renderBody(); });
       return i;
     };
-    bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+    bodyEl.appendChild(el('div', { class: 'nb-card', 'data-nb-card': 'cueva' }, [
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, [el('b', {}, 'Meter plata en las cuevas')]),
         switchEl(!!cfg.enabled, (v) => { cfg.enabled = v; saveState(); caveRuntime.planAt = 0; caveLog(v ? 'Cueva activada.' : 'Cueva desactivada.'); renderBody(); if (v) { caveRuntime.infoAt = 0; runNow(); } }, false)]),
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Plata que se deja siempre en el imperio (% de la suma de almacenes)'), el('span', {}, [num('keepPct', 0, 100, 5, 25), ' %'])]),
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Tope por cueva (0 = sin tope)'), num('cap', 0, 100000000, 1000, 0)]),
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Mínimo por ingreso'), num('minDeposit', 100, 100000, 100, 500)]),
-      el('p', { class: 'nb-placeholder' }, 'Cada 2 min. Se mira la plata de TODAS las ciudades: siempre queda ese % para lo que venga, y lo que sobra se mete (aunque sea todo en una ciudad), sin tocar lo que esa ciudad necesita según la Prioridad de recursos. Cueva 10 = sin límite; si no, 1000 por nivel. Con la Cueva activa, el Intercambio con aldeas (Granjas) solo cambia por plata.')
+      el('p', { class: 'nb-placeholder' }, 'Cada 2 min. Se mira la plata de TODAS las ciudades: siempre queda ese % para lo que venga, y lo que sobra se mete (aunque sea todo en una ciudad), sin tocar lo que esa ciudad necesita según la Prioridad de recursos. Cueva 10 = sin límite; si no, 1000 por nivel.')
     ]));
+    // Relación con el Intercambio con aldeas (Granjas)
+    const exOn = !!state.aldeas?.enabled;
+    bodyEl.appendChild(el('div', { class: `nb-alert ${cfg.enabled && exOn ? 'nb-alert-info' : 'nb-alert-warn'}` }, [
+      el('span', {}, cfg.enabled
+        ? (exOn ? [el('b', {}, 'Intercambio con aldeas: activo · solo por plata. '), `Lo que sobre de madera o piedra (más del ${state.aldeas.excessPct}% del almacén) se cambia por plata con tasa ≥ ${state.aldeas.minRatio}, y la Cueva la guarda.`]
+                : [el('b', {}, 'Intercambio con aldeas: desactivado. '), 'Actívalo en Granjas para cambiar lo que sobre de madera o piedra por plata y meterla en las cuevas.'])
+        : [el('b', {}, 'Con la Cueva activa, '), 'el Intercambio con aldeas (Granjas) solo cambia por plata.']),
+      el('span', { class: 'nb-btn nb-btn-sm', onclick: () => gotoCard('granjas', 'aldeas') }, 'Ir al intercambio con aldeas')
+    ]));
+
     // Estado
     const plan = cfg.enabled ? (caveRuntime.planAt = 0, cavePlanAll()) : null;
     const list = el('div', { class: 'nb-goals' });
@@ -1721,15 +1746,18 @@
         ]);
       } catch {}
     }
-    return el('div', { class: 'nb-card' }, [
+    return el('div', { class: `nb-card${caveOn() ? ' nb-card-accent' : ''}`, 'data-nb-card': 'aldeas' }, [
       el('div', { class: 'nb-row' }, [
-        el('span', { class: 'nb-row-label' }, [el('b', {}, 'Intercambio con aldeas')]),
+        el('span', { class: 'nb-row-label' }, [el('b', {}, 'Intercambio con aldeas'), caveOn() ? el('span', { class: 'nb-pill nb-ml' }, 'solo plata') : null]),
         switchEl(!!cfg.enabled, (v) => { cfg.enabled = v; saveState(); farmLog(v ? 'Intercambio con aldeas activado.' : 'Intercambio con aldeas desactivado.', 'info'); if (v && !exRuntime.running) { exRuntime.running = true; exchangeTick().catch((e) => farmLog(`Intercambio: ${e.message}`, 'error')).finally(() => { exRuntime.running = false; }); } }, false)
       ]),
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Tasa mínima (me dan por cada 1)'), ratioIn]),
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Sobra a partir de (% del almacén)'), el('span', {}, [pctIn, ' %'])]),
       el('p', { class: 'nb-placeholder' }, 'Cada minuto, en todas las ciudades: lo que pasa de ese % (y no necesita ninguna otra ciudad ni ningún módulo) se cambia con las aldeas de la isla por el recurso que falta, sin llenar el almacén.'),
-      caveOn() ? el('div', { class: 'nb-alert nb-alert-info nb-mt' }, 'Cueva activa: solo se cambia por plata (para meterla en las cuevas).') : null,
+      caveOn() ? el('div', { class: 'nb-alert nb-alert-info nb-mt' }, [
+        el('span', {}, [el('b', {}, 'Cueva activa: '), 'solo se cambia POR PLATA (para meterla en las cuevas). El resto de aldeas no se usan mientras la Cueva esté activa.']),
+        el('span', { class: 'nb-btn nb-btn-sm', onclick: () => gotoCard('cueva', 'cueva') }, 'Ver Cueva')
+      ]) : null,
       preview
     ]);
   }
