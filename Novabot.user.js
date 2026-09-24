@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.8.9
+// @version      1.9.2
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.8.9';
+  const VERSION = '1.9.2';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -74,6 +74,7 @@
     { id: 'reclutamiento', label: 'Reclutamiento', icon: 'shield', disabled: false },
     { id: 'comercio',    label: 'Comercio',       icon: 'trade',  disabled: false },
     { id: 'festivales',  label: 'Festivales',     icon: 'star',   disabled: false },
+    { id: 'cueva',       label: 'Cueva',          icon: 'cave',   disabled: false },
     { id: 'ataques',     label: 'Ataques',        icon: 'sword',  disabled: false }
   ];
 
@@ -141,7 +142,7 @@
         mode: 'equilibrado',   // equilibrado | orden | paralelo
         order: ['construccion', 'investigacion', 'reclutamiento', 'festivales'],
         include: { construccion: true, investigacion: true, reclutamiento: true, festivales: true },
-        levels: { construccion: 1, investigacion: 1, reclutamiento: 1, festivales: 1 } // "por niveles"
+        levels: { construccion: 1, investigacion: 1, reclutamiento: 1, festivales: 1, cueva: 4 } // "por niveles"
       },
       ataques: {
         correctionMs: 0       // corrección automática del disparo (se ajusta sola con la llegada real)
@@ -151,6 +152,12 @@
         fillPct: 95,          // tamaño del lote = % del almacén
         lotsAhead: 2,         // lotes que se piden al comercio por adelantado
         towns: {}             // townId -> { goals: [{id, target}] }
+      },
+      cueva: {
+        enabled: false,       // meter plata en las cuevas
+        keepPct: 25,          // plata que se deja SIEMPRE en el imperio (% de la suma de almacenes)
+        cap: 0,               // tope de plata por cueva (0 = sin tope)
+        minDeposit: 500       // no mover menos de esto de una vez
       },
       aldeas: {
         enabled: false,       // intercambio de recursos con las aldeas de la isla
@@ -179,7 +186,7 @@
       if (raw && typeof raw === 'object') {
         const def = defaultState();
         const out = { ...def, ...raw };
-        for (const k of ['granjas', 'aldeas', 'construccion', 'comercio', 'reclutamiento', 'ataques', 'festivales', 'prioridad', 'investigacion']) out[k] = { ...def[k], ...(raw[k] || {}) };
+        for (const k of ['granjas', 'aldeas', 'cueva', 'construccion', 'comercio', 'reclutamiento', 'ataques', 'festivales', 'prioridad', 'investigacion']) out[k] = { ...def[k], ...(raw[k] || {}) };
         // Prioridad guardada con el formato antiguo (preset): que prioMode() la convierta.
         if (raw.prioridad && !raw.prioridad.mode) delete out.prioridad.mode;
         return out;
@@ -287,6 +294,7 @@
     close: '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><path d="m18 6-12 12M6 6l12 12"/></svg>',
     resize: '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><line x1="21" y1="9" x2="9" y2="21"/><line x1="21" y1="15" x2="15" y2="21"/></svg>',
     flask: '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6"/><path d="M10 3v6L4.5 18.5A1.7 1.7 0 0 0 6 21h12a1.7 1.7 0 0 0 1.5-2.5L14 9V3"/><path d="M7 15h10"/></svg>',
+    cave: '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 20c0-6 3.5-12 9-12s9 6 9 12"/><path d="M8 20c0-3 1.8-6 4-6s4 3 4 6"/><path d="M2 20h20"/></svg>',
     star: '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3 2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1-4.4-4.3 6.1-.9Z"/></svg>',
     sword: '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 17.5 3 6V3h3l11.5 11.5"/><path d="m13 19 6-6"/><path d="m16 16 4 4"/><path d="m19 21 2-2"/></svg>',
     farm: '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21V9"/><path d="M12 9c0-4 3-7 7-7 0 4-3 7-7 7Z"/><path d="M12 13c0-4-3-7-7-7 0 4 3 7 7 7Z"/></svg>'
@@ -321,7 +329,7 @@
   const fmtResEl = (r) => el('span', { class: 'nb-res-list' }, RES.filter((k) => (+r?.[k] || 0) > 0)
     .map((k) => el('span', { class: 'nb-res' }, [resIcon(k), String(Math.round(r[k]))])));
   // Icono de cada módulo (edificio del juego que lo representa).
-  const MODULE_ICON = { granjas: 'farm', construccion: 'main', investigacion: 'academy', reclutamiento: 'barracks', comercio: 'market', festivales: 'place', ataques: 'wall', inicio: 'main', prioridad: 'storage' };
+  const MODULE_ICON = { granjas: 'farm', construccion: 'main', investigacion: 'academy', reclutamiento: 'barracks', comercio: 'market', festivales: 'place', cueva: 'hide', ataques: 'wall', inicio: 'main', prioridad: 'storage' };
   // Títulos de tarjeta: icono pequeño del edificio correspondiente (adorno).
   const TITLE_ICON = [
     [/prioridad/i, 'storage'], [/en camino|necesidades/i, 'market'], [/lote|tropa/i, 'barracks'],
@@ -394,6 +402,8 @@
       renderResumenTab();
     } else if (state.activeTab === 'festivales') {
       renderFestivalesTab();
+    } else if (state.activeTab === 'cueva') {
+      renderCuevaTab();
     } else if (state.activeTab === 'investigacion') {
       renderInvestigacionTab();
     } else if (state.activeTab === 'ataques') {
@@ -860,7 +870,17 @@
     lastTownId = id;
     // Ataques: el origen sigue a la ciudad que tienes abierta (salvo si estás editando uno).
     if (id && !atk.form.replaceId && +atk.form.source !== id) Object.assign(atk.form, { source: id, units: {}, hero: '', spell: '', info: null, infoError: '' });
-    if (['construccion', 'reclutamiento', 'ataques', 'resumen'].includes(state.activeTab) && bodyEl) renderIfIdle();
+    // Todas las pestañas siguen a la ciudad activa (las que muestran "esta ciudad" y las
+    // que la resaltan). Si estás escribiendo en el panel, se repinta en cuanto termines.
+    townRenderPending = true;
+    flushTownRender();
+  }
+  let townRenderPending = false;
+  function flushTownRender() {
+    if (!townRenderPending || !bodyEl) return;
+    if (document.activeElement?.closest?.('#novabot-panel input, #novabot-panel select, #novabot-panel textarea')) return;
+    townRenderPending = false;
+    renderBody();
   }
 
   function updateCityLabel() {
@@ -1435,16 +1455,20 @@
     for (const v of exVillagesFor(townId)) {
       if ((exRuntime.cooldown.get(v.rel.id) || 0) > now) continue;
       if (v.ratio + 1e-9 < minRatio || excess[v.give] <= 0) continue;
+      // Con la Cueva activa: solo se cambia POR PLATA (y la plata puede llegar hasta el
+      // 95 % del almacén: la Cueva la irá guardando).
+      const forCave = caveOn();
+      if (forCave && v.get !== 'iron') continue;
       // No recibir un recurso que ya está en exceso (se cambiaría en círculo).
-      if (c.cur[v.get] + c.inc[v.get] + c.pend[v.get] >= line) continue;
-      const maxRecv = Math.min(room[v.get], Math.max(0, line - c.cur[v.get] - c.inc[v.get] - c.pend[v.get]) + c.miss[v.get]);
+      if (!forCave && c.cur[v.get] + c.inc[v.get] + c.pend[v.get] >= line) continue;
+      const maxRecv = forCave ? room.iron : Math.min(room[v.get], Math.max(0, line - c.cur[v.get] - c.inc[v.get] - c.pend[v.get]) + c.miss[v.get]);
       const amount = Math.floor(Math.min(excess[v.give], cap, exMaxAmount(v.rel), maxRecv / v.ratio));
       if (amount < 100) continue;
       // Mejor: lo que más falta al imperio, luego mejor tasa, luego más cantidad.
       const score = (E.globalMiss[v.get] > 0 ? 1e9 : 0) + v.ratio * 1e6 + amount;
       if (!best || score > best.score) best = { ...v, amount, receive: Math.round(amount * v.ratio), score };
     }
-    return best ? { trade: best } : { why: `ninguna aldea con tasa ≥ ${minRatio}` };
+    return best ? { trade: best } : { why: caveOn() ? `ninguna aldea que dé plata con tasa ≥ ${minRatio}` : `ninguna aldea con tasa ≥ ${minRatio}` };
   }
 
   async function exchangeTick() {
@@ -1480,6 +1504,188 @@
     exRuntime.last = Date.now();
   }
   const RES_ES = { wood: 'madera', stone: 'piedra', iron: 'plata' };
+
+  /* ---------------------------------------------------------------------------------
+     8a-ter) CUEVA — meter plata en las cuevas
+     -----------------------------------------------------------------------------
+     Leído del juego (vista general de cuevas, 24/09/2026):
+       · Estado: GET town_overviews?action=hides_overview → html con, por ciudad,
+         id="ov_town_<id>" data-iron-stored="<guardada>" y "(guardada/máximo)"
+         (máximo "∞" con Cueva 10; si no, 1000 por nivel).
+       · Guardar: POST town_overviews?action=store_iron
+         { town_id, active_town_id, iron_to_keep:0, iron_to_store } → { iron, iron_stored }
+     Cuánto se mete: por TOTAL del imperio. Se deja siempre un % de la suma de almacenes
+     en plata (para lo que venga); lo que pasa de ahí se puede meter, aunque sea todo
+     en una sola ciudad, sin tocar lo que necesita esa ciudad (según la Prioridad).
+  --------------------------------------------------------------------------------- */
+  const caveRuntime = { timer: null, running: false, log: [], info: new Map(), infoAt: 0, plan: null, planAt: 0, planning: false, cooldown: new Map() };
+  let caveLogEl = null;
+  const caveOn = () => !!state.cueva?.enabled;
+  const hideLevel = (townId) => { try { return +UW.ITowns.getTown(townId)?.getBuildings?.()?.attributes?.hide || 0; } catch { return 0; } };
+  // Capacidad y lo guardado: el nivel manda (Cueva 10 = sin límite; si no, 1000/nivel).
+  function caveInfo(townId) {
+    const lvl = hideLevel(townId);
+    const i = caveRuntime.info.get(+townId);
+    const max = lvl >= 10 ? Infinity : lvl * 1000;
+    return { lvl, max, stored: i ? i.stored : null };
+  }
+  async function refreshCaveInfo() {
+    const d = await gpGet('town_overviews', 'hides_overview', { nl_init: true });
+    const html = String(d?.html || '');
+    const map = new Map();
+    for (const m of html.matchAll(/id="ov_town_(\d+)"[^>]*?data-iron-stored="(\d+)"/g)) map.set(+m[1], { stored: +m[2] });
+    // (por si el orden de atributos cambia)
+    for (const m of html.matchAll(/data-iron-stored="(\d+)"[^>]*?id="ov_town_(\d+)"/g)) if (!map.has(+m[2])) map.set(+m[2], { stored: +m[1] });
+    if (map.size) { caveRuntime.info = map; caveRuntime.infoAt = Date.now(); caveRuntime.planAt = 0; }
+    return map.size;
+  }
+
+  // Plan de TODAS las ciudades (cacheado unos segundos: la Prioridad lo consulta mucho).
+  function cavePlanAll() {
+    if (caveRuntime.plan && Date.now() - caveRuntime.planAt < 4000) return caveRuntime.plan;
+    if (caveRuntime.planning) return caveRuntime.plan || { by: new Map(), budget: 0, keep: 0, total: 0 };
+    caveRuntime.planning = true;
+    try {
+      const cfg = state.cueva;
+      const by = new Map();
+      const towns = allTownIds();
+      let total = 0, storTotal = 0;
+      const rows = [];
+      for (const id of towns) {
+        const cur = townResources(id).iron, stor = townStorage(id) || 0;
+        total += cur; storTotal += stor;
+        const ci = caveInfo(id);
+        let room = ci.lvl ? (ci.max === Infinity ? Infinity : (ci.stored === null ? 0 : Math.max(0, ci.max - ci.stored))) : 0;
+        if (+cfg.cap > 0) room = ci.stored === null ? 0 : Math.min(room, Math.max(0, +cfg.cap - ci.stored));
+        // Lo que esta ciudad necesita de plata según la Prioridad (módulos por encima de la Cueva).
+        let need = 0;
+        try { need = reserveAbove(id, 'cueva').iron || 0; } catch {}
+        rows.push({ id, cur, room, avail: Math.max(0, Math.floor(cur - need)) });
+      }
+      const keep = Math.round(storTotal * clamp(+cfg.keepPct || 0, 0, 100) / 100);
+      // Lo que otras ciudades esperan de plata (se lo mandará el comercio) tampoco se toca.
+      let missIron = 0;
+      try { missIron = exContext().globalMiss.iron || 0; } catch {}
+      let budget = Math.max(0, Math.floor(total - keep - missIron));
+      const budget0 = budget;
+      // Primero las ciudades con más plata libre (así se vacía donde más sobra).
+      rows.sort((a, b) => b.avail - a.avail);
+      for (const r of rows) {
+        const a = Math.floor(Math.min(r.avail, r.room, budget));
+        if (a > 0) { by.set(r.id, a); budget -= a; }
+      }
+      caveRuntime.plan = { by, keep, total, rows, missIron, budget: budget0 };
+      caveRuntime.planAt = Date.now();
+      return caveRuntime.plan;
+    } finally { caveRuntime.planning = false; }
+  }
+  function cavePlanFor(townId) {
+    if (!caveOn()) return 0;
+    const a = cavePlanAll().by.get(+townId) || 0;
+    return a >= Math.max(1, +state.cueva.minDeposit || 0) ? a : 0;
+  }
+
+  async function caveTick() {
+    if (!caveOn()) return;
+    if (Date.now() - caveRuntime.infoAt > 10 * 60000) { try { await refreshCaveInfo(); } catch (e) { caveLog(`No se pudo leer las cuevas: ${e.message}`, 'error'); return; } }
+    caveRuntime.planAt = 0;
+    const plan = cavePlanAll();
+    let done = 0;
+    for (const [townId] of [...plan.by.entries()].sort((a, b) => b[1] - a[1])) {
+      if (!caveOn() || done >= 5) break;
+      if ((caveRuntime.cooldown.get(townId) || 0) > Date.now()) continue;
+      const amount = cavePlanFor(townId);
+      if (!amount) continue;
+      // Justo antes: plata real de ahora (puede haberse gastado mientras tanto).
+      const cur = townResources(townId).iron;
+      let need = 0; try { need = reserveAbove(townId, 'cueva').iron || 0; } catch {}
+      const a = Math.floor(Math.min(amount, cur - need));
+      if (a < Math.max(1, +state.cueva.minDeposit || 0)) continue;
+      try {
+        const r = await gpPost('town_overviews', 'store_iron', { town_id: +townId, active_town_id: +UW.Game?.townId || +townId, iron_to_keep: 0, iron_to_store: a });
+        const prev = caveRuntime.info.get(+townId)?.stored || 0;
+        caveRuntime.info.set(+townId, { stored: Number.isFinite(+r?.iron_stored) && +r.iron_stored >= prev ? +r.iron_stored : prev + a });
+        caveRuntime.planAt = 0;
+        done += 1;
+        caveLog(`${farmTownName(townId)}: ${a.toLocaleString('es-ES')} de plata a la cueva.`, 'ok');
+      } catch (e) {
+        caveRuntime.cooldown.set(townId, Date.now() + 10 * 60000);
+        caveLog(`${farmTownName(townId)}: ${e.message}`, 'error');
+      }
+      await sleep(700 + Math.random() * 700);
+    }
+    if (done) setTimeout(() => refreshCaveInfo().catch(() => {}), 4000);
+    renderIfIdle('cueva');
+  }
+  function startCaveEngine() {
+    if (caveRuntime.timer) return;
+    caveRuntime.timer = setInterval(() => {
+      if (!caveOn() || caveRuntime.running) return;
+      caveRuntime.running = true;
+      caveTick().catch((e) => caveLog(`Error: ${e.message}`, 'error')).finally(() => { caveRuntime.running = false; });
+    }, 120000);
+  }
+  function caveLog(text, kind = 'info') {
+    caveRuntime.log.unshift({ at: Date.now(), text, kind });
+    caveRuntime.log = caveRuntime.log.slice(0, 30);
+    if (caveLogEl) paintLog(caveLogEl, caveRuntime.log);
+  }
+  function renderCuevaTab() {
+    const cfg = state.cueva;
+    const fmt = (n) => (n === Infinity ? '∞' : Math.round(n).toLocaleString('es-ES'));
+    const runNow = () => { if (caveRuntime.running) return; caveRuntime.running = true; caveTick().catch((e) => caveLog(`Error: ${e.message}`, 'error')).finally(() => { caveRuntime.running = false; }); };
+    const num = (key, min, max, step, def) => {
+      const i = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: String(min), max: String(max), step: String(step), value: cfg[key] });
+      i.addEventListener('change', () => { cfg[key] = clamp(pos(i.value, def), min, max); saveState(); caveRuntime.planAt = 0; renderBody(); });
+      return i;
+    };
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, [el('b', {}, 'Meter plata en las cuevas')]),
+        switchEl(!!cfg.enabled, (v) => { cfg.enabled = v; saveState(); caveRuntime.planAt = 0; caveLog(v ? 'Cueva activada.' : 'Cueva desactivada.'); renderBody(); if (v) { caveRuntime.infoAt = 0; runNow(); } }, false)]),
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Plata que se deja siempre en el imperio (% de la suma de almacenes)'), el('span', {}, [num('keepPct', 0, 100, 5, 25), ' %'])]),
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Tope por cueva (0 = sin tope)'), num('cap', 0, 100000000, 1000, 0)]),
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Mínimo por ingreso'), num('minDeposit', 100, 100000, 100, 500)]),
+      el('p', { class: 'nb-placeholder' }, 'Cada 2 min. Se mira la plata de TODAS las ciudades: siempre queda ese % para lo que venga, y lo que sobra se mete (aunque sea todo en una ciudad), sin tocar lo que esa ciudad necesita según la Prioridad de recursos. Cueva 10 = sin límite; si no, 1000 por nivel. Con la Cueva activa, el Intercambio con aldeas (Granjas) solo cambia por plata.')
+    ]));
+    // Estado
+    const plan = cfg.enabled ? (caveRuntime.planAt = 0, cavePlanAll()) : null;
+    const list = el('div', { class: 'nb-goals' });
+    const towns = allTownIds().map((id) => ({ id, name: farmTownName(id), ci: caveInfo(id), iron: townResources(id).iron })).sort((a, b) => a.name.localeCompare(b.name, 'es'));
+    for (const t of towns) {
+      const next = plan ? cavePlanFor(t.id) : 0;
+      const stored = t.ci.stored;
+      const full = t.ci.max !== Infinity && stored !== null && stored >= t.ci.max;
+      const capped = +cfg.cap > 0 && stored !== null && stored >= +cfg.cap;
+      const sub = !t.ci.lvl ? 'Sin cueva'
+        : stored === null ? 'Leyendo cueva…'
+        : full ? 'Cueva llena (sube su nivel para meter más)'
+        : capped ? 'Tope alcanzado'
+        : next ? el('span', {}, ['Siguiente: ', el('b', {}, fmt(next)), ' de plata'])
+        : 'Nada que meter ahora';
+      const pct = t.ci.max === Infinity ? null : Math.min(100, Math.round((stored || 0) / Math.max(1, t.ci.max) * 100));
+      list.appendChild(el('div', { class: `nb-goal${next ? ' nb-goal-next' : ''}` }, [
+        buildingIcon('hide', true),
+        el('div', { class: 'nb-goal-main' }, [el('div', { class: 'nb-goal-name' }, `${t.name} · Cueva ${t.ci.lvl}`), el('div', { class: 'nb-goal-sub' }, [sub])]),
+        el('span', { class: 'nb-pill' }, `${stored === null ? '—' : fmt(stored)} / ${fmt(t.ci.max)}`),
+        pct === null ? null : el('div', { class: 'nb-bar nb-bar-mini' }, [el('div', { class: 'nb-bar-fill', style: `width:${pct}%` })])
+      ]));
+    }
+    const totalStored = towns.reduce((s, t) => s + (t.ci.stored || 0), 0);
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+      el('div', { class: 'nb-card-title' }, 'Cuevas'),
+      plan ? el('div', { class: 'nb-alert nb-alert-info' }, [
+        'Plata en ciudades: ', el('b', {}, fmt(plan.total)), ' · se deja: ', el('b', {}, fmt(plan.keep)),
+        ' · se puede meter: ', el('b', {}, fmt(plan.budget)), ' · ya guardada: ', el('b', {}, fmt(totalStored))
+      ]) : null,
+      el('div', { class: 'nb-row nb-mt' }, [el('span', { class: 'nb-row-label' }, caveRuntime.infoAt ? `Datos de las cuevas: ${new Date(caveRuntime.infoAt).toLocaleTimeString('es-ES')}` : 'Datos de las cuevas: sin leer'),
+        el('span', { class: 'nb-btn nb-btn-sm', onclick: () => refreshCaveInfo().then(() => renderIfIdle('cueva')).catch((e) => caveLog(e.message, 'error')) }, 'Actualizar')]),
+      el('div', { class: 'nb-mt' }, [list])
+    ]));
+    const logBox = el('div', { class: 'nb-log' });
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [el('div', { class: 'nb-card-title' }, 'Actividad'), logBox]));
+    caveLogEl = logBox; paintLog(logBox, caveRuntime.log);
+    if (!caveRuntime.infoAt && !caveRuntime.infoLoading) { caveRuntime.infoLoading = true; refreshCaveInfo().then(() => renderIfIdle('cueva')).catch(() => {}).finally(() => { caveRuntime.infoLoading = false; }); }
+  }
 
   function startExchangeEngine() {
     if (exRuntime.timer) return;
@@ -1523,6 +1729,7 @@
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Tasa mínima (me dan por cada 1)'), ratioIn]),
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Sobra a partir de (% del almacén)'), el('span', {}, [pctIn, ' %'])]),
       el('p', { class: 'nb-placeholder' }, 'Cada minuto, en todas las ciudades: lo que pasa de ese % (y no necesita ninguna otra ciudad ni ningún módulo) se cambia con las aldeas de la isla por el recurso que falta, sin llenar el almacén.'),
+      caveOn() ? el('div', { class: 'nb-alert nb-alert-info nb-mt' }, 'Cueva activa: solo se cambia por plata (para meterla en las cuevas).') : null,
       preview
     ]);
   }
@@ -2007,8 +2214,8 @@
      Los módulos NO incluidos siguen funcionando, pero solo con lo que sobre y sin
      pedir nada al comercio.
   --------------------------------------------------------------------------------- */
-  const PRIO_MODULES = { construccion: 'Construcción', investigacion: 'Investigación', reclutamiento: 'Reclutamiento', festivales: 'Festivales' };
-  const PRIO_DEFAULT_ORDER = ['construccion', 'investigacion', 'reclutamiento', 'festivales'];
+  const PRIO_MODULES = { construccion: 'Construcción', investigacion: 'Investigación', reclutamiento: 'Reclutamiento', festivales: 'Festivales', cueva: 'Cueva' };
+  const PRIO_DEFAULT_ORDER = ['construccion', 'investigacion', 'reclutamiento', 'festivales', 'cueva'];
   const PRIO_MODES = {
     equilibrado: { label: 'Equilibrado', hint: 'El de siempre. Todos reciben a la vez; en cada ciudad gasta primero Construcción, luego Investigación, Reclutamiento y Festivales.' },
     orden: { label: 'Personalizado · por orden', hint: 'Uno cada vez, en tu orden. El comercio abastece primero al 1º en todas las ciudades; si en ninguna puede producir más (colas llenas o nada pendiente) pasa al siguiente, y cuando vuelve a tener hueco recupera el turno.' },
@@ -2047,7 +2254,7 @@
   // elijas (mismo nivel = en paralelo). Menor número = más prioridad.
   function prioLevel(mod, cfg = priorityConfig()) {
     if (!cfg.inc.has(mod)) return 99;
-    if (cfg.mode === 'paralelo') return clamp(+state.prioridad?.levels?.[mod] || 1, 1, 4);
+    if (cfg.mode === 'paralelo') return clamp(+state.prioridad?.levels?.[mod] || (mod === 'cueva' ? 4 : 1), 1, 4);
     return cfg.ranked.indexOf(mod) + 1;
   }
   const prioRank = (mod) => { const c = priorityConfig(); return c.mode === 'equilibrado' ? c.ranked.indexOf(mod) : prioLevel(mod, c); };
@@ -2081,6 +2288,7 @@
         return b && !b.reason ? { ...b.cost } : zero;
       }
       if (mod === 'festivales') return festivalPending(townId) ? { ...festCost() } : zero;
+      if (mod === 'cueva') { const a = cavePlanFor(townId); return a > 0 ? { wood: 0, stone: 0, iron: a } : zero; }
       if (mod === 'investigacion') { const n = researchPlan(townId).find((x) => !x.block); return n ? { ...n.cost } : zero; }
     } catch {}
     return zero;
@@ -2102,11 +2310,13 @@
   // "Por orden" / "por niveles": el NIVEL que tiene el turno en esa ciudad = el de menor
   // número con algún módulo (incluido) que puede hacer algo ahora (cola con hueco y
   // algo pendiente). below: mirar solo niveles por encima (número menor) de ese.
-  function activeLevel(townId, below = Infinity) {
+  // forTrade: la Cueva no pide nada al comercio, así que no cuenta para el turno global
+  // del comercio (si no, con la Cueva arriba el comercio se pararía).
+  function activeLevel(townId, below = Infinity, forTrade = false) {
     const cfg = priorityConfig();
     let best = null;
     for (const m of cfg.ranked) {
-      if (!cfg.inc.has(m)) continue;
+      if (!cfg.inc.has(m) || (forTrade && m === 'cueva')) continue;
       const L = prioLevel(m, cfg);
       if (L >= below || (best !== null && L >= best)) continue;
       if (sumRes(moduleClaim(townId, m)) > 0) best = L;
@@ -2407,7 +2617,7 @@
       // nivel. Se pasa al siguiente cuando ninguna ciudad tiene nada que hacer en él
       // (colas llenas o todo pedido).
       let level = null;
-      for (const t of allTownIds()) { const L = activeLevel(t); if (L !== null && (level === null || L < level)) level = L; }
+      for (const t of allTownIds()) { const L = activeLevel(t, Infinity, true); if (L !== null && (level === null || L < level)) level = L; }
       list = list.filter((d) => !d.module || prioLevel(d.module, cfg) === level);
     }
     return list.map((d) => ({ ...d, prio: d.module ? prioRank(d.module) : (d.prio ?? 9) }));
@@ -5078,26 +5288,14 @@
   function cloudSaveCreds() {
     gmSet(acctKey('nb_cloud_token'), cloud.token); gmSet(acctKey('nb_cloud_pass'), cloud.pass); gmSet(acctKey('nb_cloud_gist'), cloud.gistId);
   }
-  // Momento del último cambio local aún SIN subir (sobrevive a recargas).
+  // Último cambio local aún SIN subir (sobrevive a recargas y a cerrar la pestaña).
   const cloudDirtyAt = () => +gmGet(acctKey('nb_cloud_dirty_at'), 0) || 0;
-  // Al arrancar: SIEMPRE se baja primero lo de la nube (antes de que los módulos
-  // empiecen). Solo se sube lo local si tiene cambios sin subir más nuevos que la nube.
+  // Al arrancar: SIEMPRE se sincroniza primero con la nube (antes de que los módulos
+  // empiecen): se baja lo nuevo y solo se sube lo que este PC cambió y no subió.
   async function cloudBoot() {
     if (!cloudOn()) return;
-    cloud.booting = true; cloud.busy = true; cloud.status = 'Bajando de la nube…'; paintCloudStatus();
-    let pushLocal = false;
-    try {
-      const r = await cloudReadRemote();
-      cloud.lastPull = Date.now(); cloud.error = '';
-      const localAt = cloudDirtyAt();
-      if (r && !(localAt > +r.updatedAt)) {
-        cloudApply(r); cloud.dirty = false; gmSet(acctKey('nb_cloud_dirty_at'), 0);
-        cloud.status = `Cargado de la nube al iniciar (${new Date(+r.updatedAt).toLocaleTimeString('es-ES')})`;
-      } else pushLocal = true;
-    } catch (e) { cloud.error = e.message; }
-    finally { cloud.busy = false; cloud.booting = false; }
-    if (pushLocal) { cloud.dirty = true; await cloudPush(); }
-    paintCloudStatus();
+    cloud.booting = true; cloud.status = 'Bajando de la nube…'; paintCloudStatus();
+    try { await cloudSync(); } finally { cloud.booting = false; }
   }
   const cloudFile = () => `novabot_${UW.Game?.world_id || 'mundo'}_${UW.Game?.player_id || 'jugador'}.json`;
 
@@ -5137,12 +5335,65 @@
     } catch { throw new Error('No se pudo descifrar: contraseña distinta o datos alterados'); }
   }
   // ---- qué se sube / cómo se aplica ----
+  /* Sincronización con FUSIÓN a 3 bandas (como git): se guarda la "base" = lo último
+     que este PC y la nube tuvieron en común. En cada sincronización se compara, trozo a
+     trozo (cada módulo y, dentro, cada ciudad; cada ataque por separado):
+       · solo cambió aquí → se sube lo de aquí;  · solo cambió en la nube → se baja;
+       · cambió en los dos → gana el cambio más reciente.
+     Así, si dejas este PC abierto (o dormido), usas otro y vuelves, al despertar o al
+     volver a la pestaña baja lo del otro PC sin pisarlo, y nunca sube nada sin antes
+     haber mirado la nube. */
   function cloudPayload() {
     const st = {};
     for (const [k, v] of Object.entries(state)) if (!CLOUD_LOCAL_ONLY.has(k)) st[k] = v;
     const attacks = atk.queue.map((a) => Object.fromEntries(Object.entries(a).filter(([k]) => !k.startsWith('_'))));
     return { v: 1, updatedAt: Date.now(), pcId: cloud.pcId, version: VERSION, state: st, attacks };
   }
+  // Trocea estado + ataques en unidades comparables: "modulo", "modulo.towns.<id>", "atk.<id>".
+  function cloudUnits(st, attacks) {
+    const u = new Map();
+    for (const [k, v] of Object.entries(st || {})) {
+      if (CLOUD_LOCAL_ONLY.has(k)) continue;
+      if (v && typeof v === 'object' && !Array.isArray(v) && v.towns && typeof v.towns === 'object' && !Array.isArray(v.towns)) {
+        const { towns, ...rest } = v;
+        u.set(k, JSON.stringify(rest));
+        for (const [id, tv] of Object.entries(towns)) u.set(`${k}.towns.${id}`, JSON.stringify(tv));
+      } else u.set(k, JSON.stringify(v));
+    }
+    for (const a of attacks || []) if (a && a.id) u.set(`atk.${a.id}`, JSON.stringify(Object.fromEntries(Object.entries(a).filter(([x]) => !x.startsWith('_')))));
+    return u;
+  }
+  function cloudFromUnits(u) {
+    const st = {}, towns = {}, attacks = [];
+    for (const [path, json] of u) {
+      if (json === undefined) continue;
+      const v = JSON.parse(json);
+      if (path.startsWith('atk.')) { attacks.push(v); continue; }
+      const m = /^([^.]+)\.towns\.(.+)$/.exec(path);
+      if (m) { (towns[m[1]] || (towns[m[1]] = {}))[m[2]] = v; continue; }
+      st[path] = v;
+    }
+    for (const [k, t] of Object.entries(towns)) { if (!st[k] || typeof st[k] !== 'object') st[k] = {}; st[k].towns = t; }
+    attacks.sort((a, b) => (+a.executeAt || 0) - (+b.executeAt || 0));
+    return { state: st, attacks };
+  }
+  // base/local/remote: Map ruta → json (undefined = no existe). preferLocal decide empates.
+  function cloudMerge(base, local, remote, preferLocal) {
+    const out = new Map();
+    const keys = new Set([...base.keys(), ...local.keys(), ...remote.keys()]);
+    for (const k of keys) {
+      const b = base.get(k), l = local.get(k), r = remote.get(k);
+      const v = l === r ? l : l === b ? r : r === b ? l : (preferLocal ? l : r);
+      if (v !== undefined) out.set(k, v);
+    }
+    return out;
+  }
+  const sameUnits = (a, b) => a.size === b.size && [...a].every(([k, v]) => b.get(k) === v);
+  function cloudLoadBase() {
+    try { const o = JSON.parse(gmGet(acctKey('nb_cloud_base'), '') || 'null'); return o && Array.isArray(o.u) ? new Map(o.u) : null; } catch { return null; }
+  }
+  const cloudSaveBase = (u) => gmSet(acctKey('nb_cloud_base'), JSON.stringify({ u: [...u] }));
+
   function cloudApply(r) {
     if (!r || typeof r !== 'object' || typeof r.state !== 'object') return;
     cloud.applying = true;
@@ -5166,43 +5417,67 @@
   }
   function cloudMarkDirty() {
     if (cloud.applying || !cloudOn()) return;
-    cloud.dirty = true;
-    if (!cloudDirtyAt()) gmSet(acctKey('nb_cloud_dirty_at'), Date.now());
-    if (cloud.booting) return; // no subir nada hasta haber bajado lo de la nube
+    cloud.dirty = true; cloud.gen = (cloud.gen || 0) + 1;
+    gmSet(acctKey('nb_cloud_dirty_at'), Date.now());
+    if (cloud.booting) return; // no subir nada hasta haber sincronizado al arrancar
     clearTimeout(cloud.pushTimer);
-    cloud.pushTimer = setTimeout(cloudPush, 8000);
+    cloud.pushTimer = setTimeout(() => cloudSync(), 8000);
   }
-  async function cloudPush() {
-    if (!cloudOn() || cloud.booting) return;
-    if (cloud.busy) { if (cloudOn()) cloud.pushTimer = setTimeout(cloudPush, 5000); return; }
-    cloud.busy = true;
+  // force: 'remote' = quedarse con lo de la nube tal cual; 'local' = subir lo de aquí tal cual.
+  async function cloudSync(force = null) {
+    if (!cloudOn()) return;
+    if (cloud.busy) { clearTimeout(cloud.pushTimer); cloud.pushTimer = setTimeout(() => cloudSync(force), 3000); return; }
+    cloud.busy = true; paintCloudStatus();
+    const gen0 = cloud.gen || 0;
     try {
-      const content = await cloudEncrypt(cloudPayload());
-      await ghApi('PATCH', `/gists/${cloud.gistId}`, { files: { [cloudFile()]: { content } } });
-      cloud.dirty = false; cloud.lastPush = Date.now(); cloud.error = ''; cloud.status = 'Sincronizado';
-      gmSet(acctKey('nb_cloud_dirty_at'), 0);
-    } catch (e) { cloud.error = e.message; cloud.pushTimer = setTimeout(cloudPush, 60000); }
+      const g = await ghApi('GET', `/gists/${cloud.gistId}`);
+      cloud.lastPull = Date.now(); cloud.error = '';
+      const f = g?.files?.[cloudFile()];
+      // Nada nuevo en la nube ni aquí → no hace falta descifrar.
+      if (!force && f && !cloud.dirty && g.updated_at && g.updated_at === cloud.gistAt) { cloud.status = 'Sincronizado'; return; }
+      const r = f ? await cloudDecrypt(f.truncated && f.raw_url ? await rawGet(f.raw_url) : f.content) : null;
+      const localAt = cloudDirtyAt();
+      const local = cloudUnits(cloudPayload().state, cloudPayload().attacks);
+      const remote = r ? cloudUnits(r.state, r.attacks) : new Map();
+      const base = cloudLoadBase();
+      let merged;
+      if (!r || force === 'local') merged = local;
+      else if (force === 'remote') merged = remote;
+      else if (!base) merged = localAt > +r.updatedAt ? local : remote;   // primera vez en este PC: gana lo más reciente
+      else merged = cloudMerge(base, local, remote, localAt > +r.updatedAt);
+      let changedHere = false;
+      if (r && !sameUnits(merged, local)) {
+        const m = cloudFromUnits(merged);
+        cloudApply({ ...m, updatedAt: r.updatedAt });
+        changedHere = true;
+      }
+      const now = cloudUnits(cloudPayload().state, cloudPayload().attacks);
+      if (!r || !sameUnits(now, remote)) {
+        const content = await cloudEncrypt(cloudPayload());
+        const res = await ghApi('PATCH', `/gists/${cloud.gistId}`, { files: { [cloudFile()]: { content } } });
+        cloud.gistAt = res?.updated_at || ''; cloud.lastPush = Date.now();
+        cloudSaveBase(now);
+        cloud.status = changedHere ? 'Sincronizado (fusionado con lo de otro PC)' : 'Sincronizado (subido)';
+      } else {
+        cloud.gistAt = g.updated_at || '';
+        cloudSaveBase(remote);
+        cloud.status = changedHere ? `Cargado de la nube (${new Date(+r.updatedAt).toLocaleTimeString('es-ES')})` : 'Sincronizado';
+      }
+      // Si algo cambió aquí mientras se sincronizaba, queda pendiente para la siguiente.
+      if ((cloud.gen || 0) === gen0) { cloud.dirty = false; gmSet(acctKey('nb_cloud_dirty_at'), 0); }
+      else { clearTimeout(cloud.pushTimer); cloud.pushTimer = setTimeout(() => cloudSync(), 5000); }
+    } catch (e) { cloud.error = e.message; if (cloud.dirty) { clearTimeout(cloud.pushTimer); cloud.pushTimer = setTimeout(() => cloudSync(), 60000); } }
     finally { cloud.busy = false; paintCloudStatus(); }
   }
+  // (nombres antiguos usados por los botones)
+  const cloudPush = () => cloudSync('local');
+  const cloudPull = (force = false) => cloudSync(force ? 'remote' : null);
   async function cloudReadRemote() {
     const g = await ghApi('GET', `/gists/${cloud.gistId}`);
     const f = g?.files?.[cloudFile()];
     if (!f) return null;
     const text = f.truncated && f.raw_url ? await rawGet(f.raw_url) : f.content;
     return cloudDecrypt(text);
-  }
-  async function cloudPull(force = false) {
-    if (!cloudOn() || cloud.busy) return;
-    cloud.busy = true;
-    try {
-      const r = await cloudReadRemote();
-      cloud.lastPull = Date.now(); cloud.error = '';
-      if (r && (force || (r.pcId !== cloud.pcId && +r.updatedAt > Math.max(cloud.remoteAt, cloud.lastPush) && !cloud.dirty))) {
-        cloudApply(r); cloud.status = `Cargado de la nube (${new Date(+r.updatedAt).toLocaleTimeString('es-ES')})`;
-      } else if (!r) { cloud.busy = false; await cloudPush(); return; }
-      else cloud.status = 'Sincronizado';
-    } catch (e) { cloud.error = e.message; }
-    finally { cloud.busy = false; paintCloudStatus(); }
   }
   // Conectar: busca (o crea) el gist secreto "NOVABOT sync". Si ya hay datos de esta
   // cuenta, se CARGAN; si no, se suben los de este PC.
@@ -5219,12 +5494,14 @@
       if (!gist) {
         const content = await cloudEncrypt(cloudPayload());
         gist = await ghApi('POST', '/gists', { description: 'NOVABOT sync', public: false, files: { [cloudFile()]: { content } } });
-        cloud.gistId = gist.id; cloud.lastPush = Date.now(); cloud.status = 'Conectado: configuración de este PC subida a la nube';
+        cloud.gistId = gist.id; cloud.lastPush = Date.now();
+        cloudSaveBase(cloudUnits(cloudPayload().state, cloudPayload().attacks));
+        cloud.status = 'Conectado: configuración de este PC subida a la nube';
       } else {
         cloud.gistId = gist.id;
-        const r = await cloudReadRemote();
-        if (r) { cloudApply(r); cloud.status = 'Conectado: configuración cargada de la nube'; }
-        else { cloud.busy = false; await cloudPush(); cloud.status = 'Conectado: configuración de este PC subida a la nube'; }
+        // Si esta cuenta ya tiene datos en la nube, se CARGAN (si no, se sube lo de aquí).
+        gmSet(acctKey('nb_cloud_base'), ''); gmSet(acctKey('nb_cloud_dirty_at'), 0);
+        await cloudSync();
       }
       cloudSaveCreds(); gmSet(acctKey('nb_cloud_dirty_at'), 0);
       startCloudSync(true);
@@ -5240,9 +5517,15 @@
   function startCloudSync(alreadySynced = false) {
     if (!cloudOn() || cloud.started) return;
     cloud.started = true;
-    if (!alreadySynced) cloudPull();
-    cloud.pollTimer = setInterval(() => cloudPull(), 60000);
-    window.addEventListener('beforeunload', () => { if (cloud.dirty) cloudPush(); });
+    if (!alreadySynced) cloudSync();
+    cloud.pollTimer = setInterval(() => cloudSync(), 60000);
+    // Volver a la pestaña / al PC: sincronizar YA (no esperar al minuto).
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') cloudSync(); });
+    window.addEventListener('focus', () => { if (Date.now() - cloud.lastPull > 15000) cloudSync(); });
+    // PC dormido / pestaña congelada: si el reloj salta más de 90 s, se sincroniza al despertar.
+    let last = Date.now();
+    setInterval(() => { const n = Date.now(); if (n - last > 90000) cloudSync(); last = n; }, 10000);
+    window.addEventListener('beforeunload', () => { if (cloud.dirty) cloudSync(); });
   }
   let cloudStatusEl = null;
   function paintCloudStatus() {
@@ -5298,6 +5581,7 @@
     startResearchEngine();
     startTradeEngine();
     startExchangeEngine();
+    startCaveEngine();
     startRecruitEngine();
     startAttackEngine();
     startFestivalEngine();
@@ -5314,7 +5598,7 @@
         const evt = UW.GameEvents?.town?.town_switch;
         if ($j && evt) $j(document).on(evt, () => { updateCityLabel(); onTownMaybeChanged(); });
       } catch (e) { console.warn('[NOVABOT] No se pudo enganchar al evento de cambio de ciudad:', e); }
-      setInterval(() => { updateCityLabel(); onTownMaybeChanged(); checkBuildChanges(); }, 1000); // red de seguridad por si el evento no llega
+      setInterval(() => { updateCityLabel(); onTownMaybeChanged(); flushTownRender(); checkBuildChanges(); }, 1000); // red de seguridad por si el evento no llega
     });
   }
 
