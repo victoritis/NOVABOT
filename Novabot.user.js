@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.11.0
+// @version      1.12.0
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.11.0';
+  const VERSION = '1.12.0';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -126,6 +126,7 @@
   function defaultState() {
     return {
       open: false,
+      tourSeen: false,      // ya se ofreció el tour guiado (botón "?")
       activeTab: 'inicio',
       pos: null,        // {x, y} panel: esquina superior-izquierda; null = posición por defecto
       fabPos: null,      // {x, y} botón flotante; null = posición por defecto
@@ -320,6 +321,7 @@
     shield: '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4 6v6c0 5 3.4 7.9 8 9 4.6-1.1 8-4 8-9V6l-8-3Z"/></svg>',
     trade: '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7 10 3 6l4-4"/><path d="M3 6h13a4 4 0 0 1 4 4v1"/><path d="m17 14 4 4-4 4"/><path d="M21 18H8a4 4 0 0 1-4-4v-1"/></svg>',
     gear: '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg>',
+    help: '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9.5"/><path d="M9.3 9.2a2.8 2.8 0 0 1 5.4 1c0 1.9-2.7 2.5-2.7 4.1"/><path d="M12 17.6h.01"/></svg>',
     minus: '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/></svg>',
     close: '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><path d="m18 6-12 12M6 6l12 12"/></svg>',
     resize: '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><line x1="21" y1="9" x2="9" y2="21"/><line x1="21" y1="15" x2="15" y2="21"/></svg>',
@@ -391,6 +393,7 @@
     for (const tab of TABS) {
       const isActive = state.activeTab === tab.id;
       const node = el('div', {
+        'data-tab': tab.id,
         class: `nb-tab${isActive ? ' nb-active' : ''}${tab.disabled ? ' nb-disabled' : ''}`,
         html: `${ICON[tab.icon] || ''}<span>${esc(tab.label)}</span>`,
         title: tab.disabled ? `${tab.label} (próximamente)` : tab.label,
@@ -414,7 +417,12 @@
     renderBody();
   }
 
+  // Con el tour abierto el panel no se repinta solo (el recuadro perdería su elemento).
   function renderBody() {
+    if (tour.active && !tour.rendering) { tour.dirty = true; return; }
+    renderBodyNow();
+  }
+  function renderBodyNow() {
     bodyEl.innerHTML = '';
     queueMicrotask(() => { try { decorateTitles(bodyEl); } catch {} });
 
@@ -665,6 +673,7 @@
         ])
       ]),
       el('div', { class: 'nb-header-actions' }, [
+        el('div', { class: 'nb-icon-btn nb-help-btn', html: ICON.help, title: 'Tour guiado: te enseña todo el bot paso a paso', onclick: (e) => { e.stopPropagation(); tourMenu(false); } }),
         el('div', { class: 'nb-icon-btn', html: ICON.minus, title: 'Minimizar', onclick: (e) => { e.stopPropagation(); setOpen(false); } }),
         el('div', { class: 'nb-icon-btn', html: ICON.close, title: 'Cerrar', onclick: (e) => { e.stopPropagation(); setOpen(false); } })
       ])
@@ -712,6 +721,8 @@
     state.open = open;
     saveState();
     applyOpenState();
+    // Primera vez que se abre: ofrecer el tour guiado.
+    if (open && !state.tourSeen && !tour.active && !tour.menu) setTimeout(() => { if (state.open && !tour.active && !tour.menu) tourMenu(true); }, 450);
   }
 
   function applyOpenState() {
@@ -5908,6 +5919,614 @@
   }
 
   /* ---------------------------------------------------------------------------------
+     10) TOUR GUIADO — botón "?" de la cabecera
+     -----------------------------------------------------------------------------
+     Enseña TODO el bot paso a paso: oscurece la pantalla y recuadra el elemento del
+     que habla cada paso (como los tutoriales de las webs). Se puede hacer entero o
+     solo un apartado (índice). No cambia NINGUNA opción: solo cambia de pestaña o de
+     vista para enseñar cosas y, al salir, deja el panel como estaba.
+     Mientras está abierto, los motores siguen trabajando pero el panel no se repinta
+     solo (si no, el recuadro perdería el elemento); al salir se repinta.
+     Teclado: → / Intro = siguiente · ← = anterior · Esc = salir.
+  --------------------------------------------------------------------------------- */
+  const tour = { active: false, steps: [], i: 0, rendering: false, dirty: false, saved: null, els: null, timer: null, target: null, menu: null };
+
+  const TOUR_CSS = `
+#novabot-root .nb-tour-block{position:fixed;inset:0;pointer-events:auto;background:transparent;z-index:1000001}
+#novabot-root .nb-tour-dim{position:fixed;inset:0;background:rgba(6,8,12,.74);pointer-events:none;z-index:1000002;transition:opacity .2s}
+#novabot-root .nb-tour-spot{position:fixed;border-radius:12px;pointer-events:none;z-index:1000002;
+  box-shadow:0 0 0 9999px rgba(6,8,12,.74),0 0 0 2px var(--nb-gold,#d4af6a),0 0 26px 6px rgba(212,175,106,.35);
+  transition:left .3s cubic-bezier(.2,.7,.2,1),top .3s cubic-bezier(.2,.7,.2,1),width .3s cubic-bezier(.2,.7,.2,1),height .3s cubic-bezier(.2,.7,.2,1)}
+#novabot-root .nb-tour-card{position:fixed;z-index:1000003;pointer-events:auto;width:370px;max-width:calc(100vw - 24px);max-height:calc(100vh - 24px);overflow:auto;
+  background:var(--nb-surface,#181c23);color:var(--nb-text,#ece9e1);border:1px solid var(--nb-gold-line,rgba(212,175,106,.45));border-radius:14px;
+  box-shadow:0 24px 60px rgba(0,0,0,.6),0 4px 14px rgba(0,0,0,.4);padding:16px 18px 14px;font-size:13px;line-height:1.5;
+  transition:left .3s cubic-bezier(.2,.7,.2,1),top .3s cubic-bezier(.2,.7,.2,1);font-family:var(--nb-font,system-ui,sans-serif)}
+#novabot-root .nb-tour-card.nb-tour-wide{width:520px}
+#novabot-root .nb-tour-ch{font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--nb-gold,#d4af6a);font-weight:700}
+#novabot-root .nb-tour-title{font-size:16px;font-weight:700;margin:3px 0 8px;color:var(--nb-text,#ece9e1)}
+#novabot-root .nb-tour-body p{margin:0 0 8px}
+#novabot-root .nb-tour-body ul{margin:0 0 8px;padding-left:18px}
+#novabot-root .nb-tour-body li{margin:3px 0}
+#novabot-root .nb-tour-body b{color:var(--nb-gold-bright,#f1cf8f);font-weight:600}
+#novabot-root .nb-tour-body i{color:var(--nb-text-dim,#a8a59c)}
+#novabot-root .nb-tour-auto{margin:8px 0 6px;padding:8px 10px;border-radius:9px;background:rgba(127,182,230,.1);border:1px solid rgba(127,182,230,.28)}
+#novabot-root .nb-tour-auto::before{content:"⚙ Lo hace solo";display:block;font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:#7fb6e6;font-weight:700;margin-bottom:3px}
+#novabot-root .nb-tour-tip{margin:8px 0 6px;padding:8px 10px;border-radius:9px;background:rgba(124,199,154,.1);border:1px solid rgba(124,199,154,.28)}
+#novabot-root .nb-tour-tip::before{content:"✔ Consejo";display:block;font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:#7cc79a;font-weight:700;margin-bottom:3px}
+#novabot-root .nb-tour-warn{margin:8px 0 6px;padding:8px 10px;border-radius:9px;background:rgba(227,110,99,.1);border:1px solid rgba(227,110,99,.3)}
+#novabot-root .nb-tour-warn::before{content:"⚠ Ojo";display:block;font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:#e36e63;font-weight:700;margin-bottom:3px}
+#novabot-root .nb-tour-miss{margin:6px 0;font-size:12px;color:var(--nb-text-dim,#a8a59c);font-style:italic}
+#novabot-root .nb-tour-body kbd{display:inline-block;padding:0 5px;border-radius:4px;border:1px solid rgba(255,255,255,.2);background:rgba(255,255,255,.06);font-size:11px}
+#novabot-root .nb-tour-foot{display:flex;align-items:center;gap:6px;margin-top:12px}
+#novabot-root .nb-tour-prog{flex:1;height:4px;background:rgba(255,255,255,.08);border-radius:2px;overflow:hidden}
+#novabot-root .nb-tour-prog i{display:block;height:100%;background:var(--nb-gold,#d4af6a);transition:width .3s}
+#novabot-root .nb-tour-count{font-size:11px;color:var(--nb-text-dim,#a8a59c);white-space:nowrap}
+#novabot-root .nb-tour-btn{padding:6px 11px;border-radius:8px;border:1px solid var(--nb-border-strong,rgba(255,255,255,.16));background:var(--nb-surface-2,#1f242d);
+  color:var(--nb-text,#ece9e1);cursor:pointer;font-size:12px;user-select:none;white-space:nowrap}
+#novabot-root .nb-tour-btn:hover{border-color:var(--nb-gold-line,rgba(212,175,106,.45))}
+#novabot-root .nb-tour-btn.primary{background:var(--nb-gold,#d4af6a);color:#1a1408;border-color:var(--nb-gold,#d4af6a);font-weight:700}
+#novabot-root .nb-tour-btn.off{opacity:.35;pointer-events:none}
+#novabot-root .nb-tour-top{display:flex;align-items:flex-start;gap:8px}
+#novabot-root .nb-tour-top > div{flex:1}
+#novabot-root .nb-tour-x{cursor:pointer;color:var(--nb-text-dim,#a8a59c);font-size:18px;line-height:1;padding:0 2px}
+#novabot-root .nb-tour-x:hover{color:var(--nb-text,#ece9e1)}
+#novabot-root .nb-tour-chapters{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:10px 0 4px}
+#novabot-root .nb-tour-chapter{padding:8px 10px;border-radius:9px;border:1px solid var(--nb-border,rgba(255,255,255,.09));background:var(--nb-surface-2,#1f242d);cursor:pointer;font-size:12.5px}
+#novabot-root .nb-tour-chapter:hover{border-color:var(--nb-gold-line,rgba(212,175,106,.45))}
+#novabot-root .nb-tour-chapter small{display:block;color:var(--nb-text-dim,#a8a59c);font-size:11px}
+#novabot-root .nb-tour-chapter.cur{border-color:var(--nb-gold,#d4af6a)}
+#novabot-panel .nb-help-btn{color:var(--nb-gold,#d4af6a)}
+@media (max-width:560px){#novabot-root .nb-tour-chapters{grid-template-columns:1fr}}
+`;
+  function tourCss() {
+    if (document.getElementById('novabot-tour-css')) return;
+    const st = document.createElement('style');
+    st.id = 'novabot-tour-css';
+    st.textContent = TOUR_CSS;
+    (document.head || document.documentElement).appendChild(st);
+  }
+
+  // Buscadores de elementos (por texto: sobreviven a los repintados y a los números cambiantes).
+  const TQ = {
+    card: (re) => $$('.nb-card', bodyEl).find((c) => re.test(((c.querySelector('.nb-card-title, .nb-row-label, .nb-option-text, .nb-hero-label')?.textContent) || '').trim())) || null,
+    row: (re, within) => $$('.nb-row, .nb-field', within || bodyEl).find((r) => re.test((r.textContent || '').trim())) || null,
+    txt: (s, re, within) => $$(s, within || bodyEl).find((n) => re.test((n.textContent || '').trim())) || null,
+    sel: (s, within) => (within || panel)?.querySelector(s) || null,
+    tab: (id) => tabsEl?.querySelector(`[data-tab="${id}"]`) || null,
+    lastCard: (re) => { const l = $$('.nb-card', bodyEl).filter((c) => re.test(((c.querySelector('.nb-card-title, .nb-row-label')?.textContent) || '').trim())); return l[l.length - 1] || null; },
+    step: (n) => $$('.nb-step', bodyEl)[n - 1] || null
+  };
+  const inCard = (cardRe, rowRe) => () => { const c = TQ.card(cardRe); return c ? (TQ.row(rowRe, c) || c) : null; };
+  const AUTO = (h) => `<div class="nb-tour-auto">${h}</div>`;
+  const TIP = (h) => `<div class="nb-tour-tip">${h}</div>`;
+  const WARN = (h) => `<div class="nb-tour-warn">${h}</div>`;
+
+  /* Contenido. Cada paso: { ch (apartado), tab, t (título), h (html), find (elemento a
+     recuadrar; sin find = paso centrado), before (cambia una vista; true = repintar),
+     wide (tarjeta ancha) }. */
+  function tourSteps() {
+    const S = [];
+    const add = (ch, tab, list) => { for (const s of list) S.push({ ch, tab, ...s }); };
+
+    // ------------------------------------------------------------------ Bienvenida
+    add('Bienvenida', null, [
+      { t: '¡Bienvenido a NOVABOT!', wide: true, h: `
+        <p>NOVABOT juega por ti las partes repetitivas de Grepolis en <b>todas tus ciudades a la vez</b>, sin que tengas que cambiar de ciudad: recolecta aldeas, construye, investiga, recluta, reparte recursos, hace festivales, guarda plata en la cueva y lanza ataques al segundo.</p>
+        <p>Este tour te enseña <b>cada apartado y cada opción</b>, y también lo que el bot hace <b>por su cuenta</b> por detrás (lo verás en las cajas azules <i>⚙ Lo hace solo</i>).</p>
+        <ul><li><kbd>→</kbd> o <kbd>Intro</kbd>: siguiente · <kbd>←</kbd>: anterior · <kbd>Esc</kbd>: salir.</li>
+        <li>Con <b>Índice</b> saltas a un apartado concreto.</li>
+        <li>El tour <b>no cambia ninguna opción</b>: puedes seguirlo tranquilo.</li></ul>
+        ${WARN('El bot funciona dentro de esta pestaña del navegador: <b>si cierras el juego o el PC se duerme, se para</b>. Úsalo en un solo PC a la vez.')}` }
+    ]);
+
+    // ------------------------------------------------------------------ Panel
+    add('El panel', 'inicio', [
+      { t: 'Cabecera', find: () => TQ.sel('.nb-header'), h: `
+        <p>Arrastra la cabecera para <b>mover el panel</b> por la pantalla; se recuerda dónde lo dejas.</p>
+        <p>Al lado del nombre ves la <b>versión</b> del script y de los estilos (útil si algo se ve raro: compara con la del repositorio).</p>` },
+      { t: 'Ayuda, minimizar y cerrar', find: () => TQ.sel('.nb-header-actions'), h: `
+        <p><b>?</b> abre este tour (entero o por apartados) cuando quieras.</p>
+        <p><b>—</b> y <b>✕</b> esconden el panel. Queda un <b>botón redondo</b> flotante: púlsalo para volver a abrirlo o arrástralo para moverlo.</p>
+        ${TIP('Cerrar el panel NO para el bot: todo sigue funcionando por detrás.')}` },
+      { t: 'Pestañas', find: () => TQ.sel('.nb-tabs'), h: `
+        <p>Cada pestaña es un apartado del bot. Casi todos tienen un <b>interruptor general</b> arriba y una tarjeta <b>Actividad</b> abajo con lo último que ha hecho.</p>
+        <p>Las pestañas que trabajan por ciudad (Construcción, Investigación, Reclutamiento) muestran siempre <b>la ciudad que tienes abierta en el juego</b>: cambia de ciudad en el juego y el panel cambia con ella.</p>` },
+      { t: 'Tamaño', find: () => TQ.sel('.nb-resize'), h: `<p>Arrastra esta esquina para hacer el panel más grande o más pequeño. También se recuerda.</p>` }
+    ]);
+
+    // ------------------------------------------------------------------ Inicio
+    add('Inicio', 'inicio', [
+      { t: 'Inicio', find: () => TQ.tab('inicio'), h: `<p>La portada: ciudad actual, la <b>prioridad de recursos</b> (muy importante), la nube y un resumen de cada módulo.</p>` },
+      { t: 'Ciudad actual', find: () => TQ.card(/^Ciudad actual/), h: `<p>La ciudad que tienes abierta en el juego. Se actualiza sola al cambiar de ciudad.</p>` },
+      { t: 'Prioridad de recursos', find: () => TQ.card(/^Prioridad de recursos/), wide: true, h: `
+        <p>Decide <b>quién gasta primero</b> cuando los recursos no llegan para todo: Construcción, Investigación, Reclutamiento, Festivales y Cueva. Afecta a lo que cada módulo puede gastar en su ciudad y a qué abastece el Comercio.</p>
+        <ul>
+          <li><b>Equilibrado</b> (por defecto): todos reciben a la vez. En cada ciudad un módulo solo gasta lo que no necesita el <i>siguiente gasto</i> de los de arriba (orden fijo: Construcción → Investigación → Reclutamiento → Festivales).</li>
+          <li><b>Personalizado · por orden</b>: tú pones el orden. El comercio abastece <b>primero al 1º en todas las ciudades</b>; cuando en ninguna puede hacer más (colas llenas o nada pendiente) pasa al 2º, y en cuanto el 1º vuelve a tener hueco recupera el turno.</li>
+          <li><b>Personalizado · por niveles</b>: cada módulo tiene un nivel N1–N4. Los del mismo nivel reciben a la vez; el nivel 2 solo cuando el 1 no puede hacer nada más en ninguna ciudad.</li>
+        </ul>` },
+      { t: 'Qué entra en la prioridad', find: () => { const c = TQ.card(/^Prioridad de recursos/); return c?.querySelector('.nb-goals') || c; }, h: `
+        <p>En los modos personalizados cada módulo tiene su interruptor: si lo <b>quitas</b>, ese módulo sigue funcionando pero <b>solo con lo que sobre</b> en su ciudad y <b>no pide nada al comercio</b>.</p>
+        <p>Con ▲▼ cambias el orden (modo por orden) y con N1–N4 el nivel (modo por niveles). Debajo verás qué módulo tiene ahora el turno en tu ciudad.</p>
+        ${TIP('Si algo "no avanza" y pone <i>reservado para …</i>, es la prioridad: otro módulo más importante está guardando esos recursos.')}` },
+      { t: 'Sincronización en la nube (opcional)', find: () => TQ.card(/^Sincronización en la nube/), h: `
+        <p>Guarda toda tu configuración (objetivos, colas, prioridad, ataques programados…) en un <b>Gist secreto de tu GitHub</b>, <b>cifrado</b> con tu contraseña, para tenerla igual en otro PC.</p>
+        <ul><li>Necesitas un token de GitHub con permiso <b>solo de Gists</b> y una contraseña (8+ caracteres, la misma en todos tus PC).</li>
+        <li>Al conectar: si ya hay datos en la nube se cargan; si no, se suben los de este PC.</li></ul>
+        ${AUTO('Cada cambio se sube a los 8 s y cada 60 s baja lo del otro PC. Al arrancar, primero sincroniza y después empieza a trabajar.')}
+        ${WARN('Aun con la nube, usa el bot en <b>un solo PC a la vez</b>: si está abierto en dos, los dos enviarían recursos y ataques.')}` },
+      { t: 'Módulos', find: () => TQ.sel('.nb-tiles', bodyEl), h: `
+        <p>Una ficha por módulo con su dato principal. El interruptor lo activa o desactiva para <b>todas</b> las ciudades; pulsa la ficha para ir a su pestaña.</p>` }
+    ]);
+
+    // ------------------------------------------------------------------ Vista general
+    add('Vista general', 'resumen', [
+      { t: 'Vista general', find: () => TQ.tab('resumen'), before: () => { if (state.resumenView === 'reclutamiento') { state.resumenView = 'ciudades'; return true; } }, h: `
+        <p>Todo el imperio de un vistazo. <b>Solo lectura</b>: aquí no se cambia nada.</p>` },
+      { t: 'Ciudades', find: () => TQ.card(/^Vista general/), wide: true, h: `
+        <p>Una fila por ciudad (la tuya resaltada):</p>
+        <ul><li><b>Construcción</b>: órdenes en la cola del juego / huecos y lo primero que termina; cuántos objetivos tiene el bot.</li>
+        <li><b>Reclutamiento</b>: cola del Cuartel y del Puerto y el estado del bot en esa ciudad.</li>
+        <li><b>Festival</b>: en curso (cuenta atrás) o si puede hacerlo.</li>
+        <li><b>Llega (comercio)</b>: envíos en camino y cuándo llega el primero.</li>
+        <li><b>Ataques del bot</b>: ataques programados que salen de ella.</li></ul>` },
+      { t: 'Reclutamiento del bot', before: () => { if (state.resumenView !== 'reclutamiento') { state.resumenView = 'reclutamiento'; return true; } }, find: () => TQ.sel('.nb-rc-stats', bodyEl) || TQ.sel('.nb-seg-main', bodyEl), h: `
+        <p>La otra vista: por ciudad, qué tropas le has pedido al bot, cuánto falta (barra), el <b>siguiente lote</b> con sus recursos, las colas y los hechizos.</p>
+        <p>Colores del estado: <b>listo</b> para reclutar, reuniendo recursos, en espera (cola llena, programado, falta población…), desactivado o completo.</p>` }
+    ]);
+
+    // ------------------------------------------------------------------ Granjas
+    add('Granjas', 'granjas', [
+      { t: 'Granjas (aldeas)', find: () => TQ.tab('granjas'), h: `<p>Recolecta recursos de las <b>aldeas</b> de todas tus islas y cambia recursos con ellas.</p>` },
+      { t: 'Recolección automática', find: () => TQ.card(/^Recolección automática/), h: `
+        <p>Enciéndelo y el bot recolecta todas tus aldeas en cuanto están listas. Debajo, la <b>cuenta atrás</b> hasta la próxima recolección.</p>
+        ${AUTO(`<ul>
+          <li>Recolecta <b>todas las ciudades en una sola petición</b>, igual que el botón «Seleccionar todas» del juego.</li>
+          <li>Las aldeas son de la isla: si tienes varias ciudades en una isla, recoge <b>una por isla</b>, la que <b>menos perdería</b> por tener el almacén lleno (recurso a recurso).</li>
+          <li>Si algo falla, reintenta en 1 min; si todas las ciudades están llenas, vuelve a mirar en 5 min.</li></ul>`)}` },
+      { t: 'Tiempo de recolección', find: () => TQ.card(/^Tiempo de recolección/), h: `
+        <p>Cada cuánto se recolecta. Más corto = más recursos por hora pero más peticiones.</p>
+        <p>Los botones dicen 10 min / 40 min / 3 h / 8 h (los tiempos con la investigación <b>Lealtad de los aldeanos</b>). Las ciudades sin ella usan su equivalente: 5 min / 20 min / 1h30 / 4 h.</p>` },
+      { t: 'Retraso aleatorio', find: () => TQ.card(/^Retraso aleatorio/), h: `<p>Segundos al azar (entre mínimo y máximo) que se suman a cada ciclo, para que no recoja siempre al segundo exacto.</p>` },
+      { t: 'No recolectar si el almacén está lleno', find: () => TQ.card(/^No recolectar/), h: `
+        <p>Si en una ciudad <b>madera, piedra y plata</b> han llegado todas a ese %, no recolecta en ella (se perdería). Si a alguna le falta, sí recolecta.</p>
+        ${TIP('Con el <b>Equilibrio</b> del Comercio activo casi nunca llegarás a esto: antes de cada recolección mueve lo que no cabría.')}` },
+      { t: 'Intercambio con aldeas', find: () => TQ.card(/^Intercambio con aldeas/), wide: true, h: `
+        <p>Las aldeas cambian un recurso por otro con una <b>tasa</b> (ej. 1,25 = por 100 que das te dan 125).</p>
+        ${AUTO(`<ul>
+          <li>Cada minuto, en todas las islas, hasta 3 cambios. Cada aldea la usa la ciudad de su isla donde más ayuda.</li>
+          <li>Da lo que más <b>sobra</b> (en la ciudad y en todo el imperio) por lo que menos hay.</li>
+          <li>La tasa baja 0,03 por cada 100 que cambias y se recupera sola (0,02 × velocidad por hora, hasta 1,25). La <b>Oficina comercial</b> suma +0,1 a la ciudad que la tiene: el bot calcula la tasa real de cada ciudad.</li>
+          <li>Nunca da lo reservado para encargos, ni lo que otra ciudad está esperando, ni hace rebosar lo que recibe. Mínimo 100 y máximo 3000 por cambio.</li></ul>`)}` },
+      { t: 'Tasa para equilibrar', find: inCard(/^Intercambio con aldeas/, /^Tasa para equilibrar/), h: `
+        <p>Los cambios normales solo se hacen con la tasa <b>así de alta</b> (por defecto 1,2).</p>
+        <p>¿Por qué alta? La tasa se recupera a ritmo fijo: cambiar 3000 a 0,85 o a 1,25 "gasta" lo mismo, pero a 1,25 recibes un 47 % más. Esperar a la tasa alta rinde mucho más.</p>` },
+      { t: 'Tasa si se va a perder', find: inCard(/^Intercambio con aldeas/, /^Tasa si se va a perder/), h: `
+        <p>Tasa mínima para un <b>rescate</b>: si un recurso va a rebosar en la próxima recolección, se cambia aunque la tasa sea baja (mejor 0,85 que perderlo).</p>
+        ${AUTO('Con tasa menor que 1 solo rescata lo que de verdad se perdería, y solo si no cabe en otra ciudad (o la recolección es inminente).')}` },
+      { t: 'Traer de otras ciudades', find: inCard(/^Intercambio con aldeas/, /^Traer de otras/), h: `
+        <p>Si una aldea con buena tasa pide, por ejemplo, madera y en esa isla no queda, el comercio <b>trae madera de una ciudad a la que le sobra</b> y, al llegar, se cambia.</p>
+        <p>Solo si al imperio le sobra más ese recurso que el que da la aldea. Necesita <b>Comercio</b> y <b>Equilibrio</b> encendidos y solo lo hace cuando no hay encargos pendientes.</p>` },
+      { t: 'Vista previa', find: () => TQ.txt('.nb-card-title', /^Próximos cambios|^Aldeas de/)?.parentElement || TQ.card(/^Intercambio con aldeas/), h: `
+        <p>Las aldeas de tu ciudad actual con <b>su tasa para esta ciudad</b> (atenuadas si no llegan a la tasa para equilibrar) y los <b>próximos cambios</b> que haría en todo el imperio, con su tipo:</p>
+        <ul><li><b>equilibrar</b>: cambio normal con tasa alta.</li><li><b>rescate</b>: el recurso iba a rebosar.</li><li><b>alimentar</b>: cambia lo que el comercio trajo para esa aldea.</li></ul>
+        <p>Si la <b>Cueva</b> está activa, solo se cambia por plata (para guardarla) y aparece el ajuste «Con Cueva: cambiar por plata lo que pase de…».</p>` },
+      { t: 'Actividad', find: () => TQ.lastCard(/^Actividad/), h: `<p>Lo último que ha hecho: recolecciones, cambios con aldeas, errores. Cada pestaña tiene la suya.</p>` }
+    ]);
+
+    // ------------------------------------------------------------------ Construcción
+    add('Construcción', 'construccion', [
+      { t: 'Construcción', find: () => TQ.tab('construccion'), h: `<p>Le dices hasta qué nivel quieres cada edificio (en cada ciudad) y el bot lo va subiendo solo, sin cambiar de ciudad.</p>` },
+      { t: 'Activar: general y por ciudad', find: () => TQ.card(/^Construcción automática/), h: `
+        <ul><li><b>Construcción automática</b>: enciende o apaga en <b>todas</b> las ciudades.</li>
+        <li><b>Solo [ciudad]</b>: una <b>excepción</b> para la ciudad actual (apagada aunque el general esté encendido, o al revés). Arriba ves cuántas excepciones hay.</li></ul>
+        <p>Este patrón general + excepción es igual en Investigación y Reclutamiento.</p>` },
+      { t: 'Intercalar y orden estricto', find: inCard(/^Construcción automática/, /^Intercalar/), h: `
+        <ul><li><b>Intercalar edificios</b>: sube un nivel de cada edificio por turnos, en el orden de la lista (el turno rota de verdad). Apagado: termina un objetivo antes de empezar el siguiente.</li>
+        <li><b>Orden estricto</b>: si el primero está bloqueado (faltan requisitos, almacén pequeño, población…), <b>espera</b> en vez de saltar al siguiente.</li></ul>` },
+      { t: 'Siguiente y copiar', find: () => TQ.card(/^Ciudad actual/), h: `
+        <p><b>Siguiente</b>: lo próximo que va a encargar en esta ciudad, o por qué no puede (faltan recursos, cola llena, reservado para otro módulo…).</p>
+        <p><b>Copiar a todas</b>: copia la lista de objetivos de esta ciudad a todas las demás (pide confirmación).</p>` },
+      { t: 'Cola del juego', find: () => TQ.card(/^Cola del juego/), h: `<p>Lo que ya está construyéndose en el juego, con el nivel que deja cada orden y cuánto le queda. Solo lectura.</p>` },
+      { t: 'Objetivos del bot', find: () => TQ.card(/^Objetivos del bot/), wide: true, h: `
+        <p>La lista de lo que quieres, <b>en orden de prioridad</b>:</p>
+        <ul><li><b>− / +</b>: cambia el nivel objetivo. <b>▲ ▼</b>: sube o baja su prioridad. <b>✕</b>: lo quita. <b>Vaciar</b>: quita todos.</li>
+        <li>Un mismo edificio puede estar varias veces (Senado 20, Muralla 10, Senado 25…) para intercalar a mano.</li>
+        <li>La etiqueta roja <b>derribar</b> baja el edificio hasta ese nivel.</li>
+        <li>El resaltado es el <b>siguiente</b>; debajo de cada uno, por qué espera.</li></ul>
+        ${AUTO('Cuando un objetivo se cumple (o lo subes tú a mano) se quita solo de la lista.')}` },
+      { t: 'Añadir edificio', find: () => TQ.card(/^Añadir edificio/), h: `
+        <p>Busca el edificio, pon el nivel con <b>− / +</b> (o escríbelo) y pulsa <b>✓</b>. Se añade <b>al final</b> de la lista.</p>
+        <ul><li>Número por encima del actual (verde) = construir.</li><li>Por debajo (rojo) = <b>derribar</b> (pide confirmación).</li></ul>
+        <p>El nivel que ves ya cuenta la cola del juego y lo que hay en la lista.</p>` },
+      { t: 'Qué hace solo', find: () => TQ.lastCard(/^Actividad/), h: `
+        ${AUTO(`<ul>
+          <li>Cada 15 s, en todas las ciudades con la construcción activa, encarga el siguiente nivel si hay hueco en la cola (<b>7</b> con Administrador, si no <b>2</b>) y recursos que no estén reservados por la prioridad.</li>
+          <li>Salta los edificios bloqueados (requisitos, almacén pequeño, población, nivel máximo) salvo con orden estricto.</li>
+          <li>El <b>Comercio</b> le manda lo que falta para <b>todos los niveles que caben en la cola</b>, en el orden en que los va a construir.</li></ul>`)}` }
+    ]);
+
+    // ------------------------------------------------------------------ Investigación
+    add('Investigación', 'investigacion', [
+      { t: 'Investigación', find: () => TQ.tab('investigacion'), h: `<p>Una cola de investigaciones por ciudad que el bot va lanzando en la Academia.</p>` },
+      { t: 'Activar y puntos', find: () => TQ.card(/^Investigación automática/), h: `
+        <p>Interruptor general + excepción por ciudad (igual que Construcción).</p>
+        <p><b>Puntos de investigación</b>: los libres y usados de esta ciudad (según su Academia). <b>Siguiente</b>: lo próximo que investigará o por qué espera.</p>` },
+      { t: 'Cola del juego', find: () => TQ.card(/^Cola del juego/), h: `<p>Lo que se está investigando ahora en esta ciudad.</p>` },
+      { t: 'Cola del bot', find: () => TQ.card(/^Cola del bot/), h: `<p>Lo que quieres investigar, <b>en este orden</b>. Puedes reordenar y quitar; <b>Vaciar</b> la borra entera.</p>` },
+      { t: 'Añadir investigación', find: () => TQ.card(/^Añadir investigación/), h: `
+        <p>Las investigaciones que aún no tiene esta ciudad. Pulsa para añadirla al final de la cola.</p>
+        ${AUTO('Investiga en cuanto hay hueco, puntos y recursos. El comercio solo le manda recursos para una investigación si la ciudad <b>ya tiene puntos</b> (y Academia/requisitos) para ella. Una tropa sin investigar se puede pedir en Reclutamiento si su investigación está en esta cola.')}` }
+    ]);
+
+    // ------------------------------------------------------------------ Reclutamiento
+    add('Reclutamiento', 'reclutamiento', [
+      { t: 'Reclutamiento', find: () => TQ.tab('reclutamiento'), h: `<p>Pides un <b>total</b> de cada tropa o barco por ciudad y el bot los recluta en <b>lotes grandes</b> hasta llegar.</p>` },
+      { t: 'Activar', find: () => TQ.card(/^Reclutamiento automático/), h: `<p>Interruptor general + excepción para la ciudad actual (igual que en Construcción).</p>` },
+      { t: 'Empezar más tarde / programar', find: () => TQ.txt('.nb-alert, .nb-row', /^Empezar más tarde|^Empieza en|^Empezar dentro/) || TQ.card(/^Reclutamiento automático/), h: `
+        <p><b>Empezar más tarde</b>: la ciudad queda <b>en espera</b>: no recluta, no pide ni reserva recursos (hasta puede donar a otras). Luego pones los minutos y <b>Programar</b>: empezará a esa hora.</p>
+        <p>Útil para esperar a un <b>héroe</b> que abarata tropas: el bot te avisa si llega antes o después de empezar.</p>` },
+      { t: 'Tamaño del lote', find: inCard(/^Reclutamiento automático/, /^Lote = /), h: `
+        <p>Un lote es lo máximo de <b>una sola tropa</b> que cabe en ese % del almacén (cada tropa distinta ocupa un hueco de la cola, por eso no se mezclan).</p>
+        ${AUTO(`<ul><li>Primero las tropas a las que les falta al menos un lote completo, en el orden de la lista; los restos, al final.</li>
+        <li>El lote se recorta por la <b>población libre</b> y espera a tener <b>todo</b> el lote para reclutarlo de golpe.</li></ul>`)}` },
+      { t: 'Lotes por adelantado', find: inCard(/^Reclutamiento automático/, /^Lotes pedidos/), h: `
+        <p>Cuántos lotes pide al comercio por delante (1–4). Con 2, mientras llega lo del primero ya viaja lo del segundo: la ciudad no se queda parada esperando al donante más lejano.</p>
+        <p>Debajo: <b>Cola Cuartel / Puerto</b> (órdenes en cola / huecos). Si la cola está llena no pide recursos.</p>` },
+      { t: 'Hechizos de reclutamiento', find: () => TQ.card(/^Hechizos de reclutamiento/), h: `
+        <p>Por ciudad, para Entrenamiento espartano, Crecimiento de la población y La llamada del mar:</p>
+        <ul><li><b>No</b>: no se usa.</li><li><b>Opcional</b>: se lanza si hay favor.</li><li><b>Obligatorio</b>: no recluta hasta tenerlo activo (espera al favor y lo lanza solo).</li></ul>
+        ${AUTO('Se lanzan justo antes de mandar un lote (a lo que ya está en cola no le afectan).')}` },
+      { t: 'Siguiente lote', find: () => TQ.card(/^Siguiente lote/), h: `
+        <p>Qué tropa y cuántas, población y favor que usa, y barras con los recursos que tiene la ciudad frente a lo que cuesta.</p>
+        <p>Si no hay lote, te dice por qué: cola llena (hasta qué hora), esperando investigación, sin población, en espera, reservado para otro módulo…</p>
+        ${AUTO('El coste es el <b>real</b> que muestra el Cuartel/Puerto (con héroes e investigaciones); se relee cada 5 min y al llegar un héroe.')}` },
+      { t: 'Tropas y barcos objetivo', find: () => TQ.card(/^Cuartel · tropas objetivo/), h: `
+        <p>Lo que has pedido: <b>total</b> que quieres tener. Cambia con <b>−50 / +50</b> o escribiendo; <b>✕</b> lo quita. Debajo está la tarjeta del <b>Puerto</b> con los barcos.</p>
+        ${AUTO('Cuenta las tropas en casa, las que están fuera (atacando o apoyando) y las de la cola del juego. Cuando llegas al total, se quita sola de la lista.')}` },
+      { t: 'Añadir tropa o barco', find: () => TQ.card(/^Cuartel · añadir/), h: `
+        <p>Escribe el <b>total</b> que quieres (no cuántas más) y pulsa <b>✓</b>. Ves cuántas tienes y su coste. Abajo, lo mismo para barcos.</p>
+        ${TIP('Lo que escribes no se borra aunque el panel se repinte.')}` },
+      { t: 'Qué hace solo', find: () => TQ.lastCard(/^Actividad/), h: `
+        ${AUTO(`<ul><li>Cada 15 s revisa todas las ciudades y recluta el lote en cuanto lo tiene (respetando la prioridad).</li>
+        <li>El comercio le manda lo que falta para sus lotes y, mientras, la ciudad <b>reserva</b> lo de sus próximos lotes (no lo regala a otras).</li></ul>`)}` }
+    ]);
+
+    // ------------------------------------------------------------------ Comercio
+    add('Comercio', 'comercio', [
+      { t: 'Comercio', find: () => TQ.tab('comercio'), h: `<p>Reparte recursos entre <b>tus</b> ciudades: manda a cada una lo que le falta para lo que tiene pedido, y además evita que se pierdan recursos.</p>` },
+      { t: 'Comercio automático', find: () => TQ.card(/^Comercio automático/), wide: true, h: `
+        <p>El interruptor general y <b>a qué módulos abastece</b> (es el único sitio donde se elige): construcción, reclutamiento, investigación y festivales.</p>
+        ${AUTO(`<ul><li>Cada 10 s calcula qué falta en cada ciudad y lo envía desde las que tienen de sobra.</li>
+        <li>Primero lee <b>todos los envíos en camino</b> (vista de comercio del juego) para no mandar de más.</li>
+        <li>Nunca dona lo que la ciudad donante va a gastar; una ciudad que espera recursos solo da los que ella no necesita.</li>
+        <li>Reparto justo: las ciudades lejanas no se quedan olvidadas (cuanto más esperan, más prioridad).</li>
+        <li>Simula el almacén de destino: puede mandar más de lo que cabe si se va a gastar antes de llegar, pero <b>nunca</b> hace que se pierda nada. Descuenta lo que la ciudad producirá mientras viaja el envío.</li>
+        <li>Aprende la velocidad real de los comerciantes con cada envío.</li></ul>`)}` },
+      { t: 'Ajustes', find: () => TQ.card(/^Ajustes/), h: `
+        <ul><li><b>Envío mínimo</b>: no manda envíos más pequeños (salvo que completen lo que falta).</li>
+        <li><b>Margen almacén %</b>: hueco que deja libre en el almacén de destino.</li>
+        <li><b>Dejar siempre en donante</b>: cantidad mínima que nunca se saca de una ciudad.</li>
+        <li><b>Envíos por ciclo</b>: máximo de envíos cada 10 s.</li>
+        <li><b>Peso de la espera</b>: cuánto sube la prioridad de una ciudad por cada segundo esperando.</li></ul>` },
+      { t: 'Equilibrio entre ciudades', find: () => TQ.card(/^Equilibrio entre ciudades/), wide: true, h: `
+        <p>Usa los comerciantes que sobran para que <b>no se pierda nada</b> y cada ciudad tenga de todo. Va <b>siempre detrás de los encargos</b>: solo actúa en las vueltas en que el comercio no tiene nada que enviar.</p>
+        <p>La etiqueta dice en qué modo está:</p>
+        <ul><li><b>encargos en curso</b>: alguna ciudad espera recursos → solo evita pérdidas, con poca parte de los comerciantes y sin tocar lo que alguien espera.</li>
+        <li><b>encargos a punto</b>: algo empieza pronto (hueco de cola, lote, festival que termina) → evita pérdidas y <b>adelanta</b> a esa ciudad lo que le va a faltar.</li>
+        <li><b>libre</b>: también iguala ciudades y trae recursos a las aldeas con buena tasa.</li></ul>` },
+      { t: 'Evitar pérdidas al recolectar', find: () => { const c = TQ.card(/^Equilibrio entre ciudades/); return c ? (TQ.txt('.nb-alert', /Rebosaría|Ninguna ciudad rebosa/, c) || c) : null; }, h: `
+        ${AUTO(`<ul><li>Calcula el <b>botín de la próxima recolección</b> de cada ciudad (de cada recurso) + lo que produce + lo que le llega.</li>
+        <li>Si no cabría, manda lo que sobra a ciudades con sitio: primero a las que lo van a necesitar, luego a las que menos tienen.</li>
+        <li>Deja la ciudad en su «línea de seguridad»: sitio para 2 recolecciones y media hora de producción.</li></ul>`)}
+        <p>Aquí ves qué ciudades rebosarían ahora mismo y cuánto.</p>` },
+      { t: 'Ajustes del equilibrio', find: () => { const c = TQ.card(/^Equilibrio entre ciudades/); return c ? (TQ.row(/^Comerciantes con encargos/, c)?.parentElement || c) : null; }, h: `
+        <ul><li><b>Igualar ciudades</b>: si una tiene mucho de un recurso y otra poco, lo reparte (solo en modo libre).</li>
+        <li><b>Comerciantes con encargos</b> (20 %): lo que puede usar como mucho cada ciudad cuando hay encargos pendientes o a punto; el resto queda libre.</li>
+        <li><b>Comerciantes sin encargos</b> (60 %).</li>
+        <li><b>Encargos «a punto»</b>: qué se considera "pronto" (30 min).</li>
+        <li><b>Tolerancia</b>: al igualar, cuánto puede separarse una ciudad de la media del imperio antes de mover nada.</li>
+        <li><b>Viaje máximo</b>, <b>envío mínimo al igualar</b> y <b>envíos por vuelta</b>.</li></ul>` },
+      { t: 'Qué haría ahora', find: () => TQ.txt('.nb-card-title', /^Ahora movería/)?.parentElement || TQ.card(/^Equilibrio entre ciudades/), h: `
+        <p>El llenado medio del imperio por recurso, los <b>encargos a punto</b> (si hay) y la lista de envíos que haría ahora, con su tipo: <b>Evitar pérdida</b>, <b>Adelantar encargo</b>, <b>Para cambiar en aldea</b> o <b>Equilibrio</b>.</p>` },
+      { t: 'Prioridad de recursos', find: () => TQ.card(/^Prioridad de recursos/), h: `<p>La misma tarjeta que en Inicio, aquí a mano porque decide qué abastece primero el comercio.</p>` },
+      { t: 'Necesidades y en camino', find: () => TQ.card(/^Necesidades/), h: `
+        <p><b>Necesidades</b>: ciudades esperando recursos, para qué y cuánto falta.</p>
+        <p>Debajo, <b>En camino</b>: todos los envíos hacia tus ciudades (también los de aldeas) con su cuenta atrás.</p>` }
+    ]);
+
+    // ------------------------------------------------------------------ Festivales
+    add('Festivales', 'festivales', [
+      { t: 'Festivales', find: () => TQ.tab('festivales'), h: `<p>Lanza festivales (puntos de cultura) en todas las ciudades que pueden.</p>` },
+      { t: 'Festivales automáticos', find: () => TQ.card(/^Festivales automáticos/), h: `
+        <p>Ciudades con <b>Academia 30+</b> y sin festival en curso. Coste 15 000 madera · 18 000 piedra · 15 000 plata.</p>
+        ${AUTO('Cada 10 s: en cuanto una ciudad tiene los recursos (y no están reservados por la prioridad) lo lanza. El comercio le manda justo lo que falta si tienes «Abastecer festivales» encendido.')}` },
+      { t: 'Festival evento', find: () => TQ.card(/^Festival evento/), h: `
+        <p>Para la <b>Temporada de festivales</b> del juego: usa el coste, la Academia y la duración del evento. Al encenderlo se apagan los festivales normales.</p>
+        <p>Si ahora no hay evento, no hace nada hasta que empiece.</p>` },
+      { t: 'Ciudades aptas', find: () => TQ.card(/^Ciudades aptas/), h: `<p>Estado de cada ciudad: en curso (cuenta atrás), listo, cuánto falta y lo que ya viene de camino, o si está esperando por la prioridad.</p>` }
+    ]);
+
+    // ------------------------------------------------------------------ Cueva
+    add('Cueva', 'cueva', [
+      { t: 'Cueva', find: () => TQ.tab('cueva'), h: `<p>Mete plata en las cuevas (protege contra espías y sirve para espiar).</p>` },
+      { t: 'Meter plata en las cuevas', find: () => TQ.card(/^Meter plata/), wide: true, h: `
+        <ul><li><b>Plata que se deja siempre</b>: % de la suma de todos tus almacenes que se queda en plata en el imperio para gastar.</li>
+        <li><b>Tope por cueva</b>: máximo por cueva (0 = sin tope).</li>
+        <li><b>Mínimo por ingreso</b>: no mete menos de esto de una vez.</li></ul>
+        ${AUTO('Cada 2 min mira la plata de <b>todo el imperio</b>: lo que pasa de ese % se mete, primero donde más sobra, sin tocar lo que cada ciudad necesita según la prioridad (la Cueva es un módulo más de la prioridad) ni lo que otras ciudades esperan. Cueva 10 = sin límite; si no, 1000 por nivel.')}` },
+      { t: 'Relación con las aldeas', find: () => TQ.txt('.nb-alert', /Intercambio con aldeas|Con la Cueva activa/) || TQ.card(/^Meter plata/), h: `
+        <p>Con la Cueva activa, el <b>Intercambio con aldeas</b> solo cambia <b>por plata</b>: la madera o piedra que sobra se convierte en plata y la Cueva la guarda. El equilibrio entre ciudades deja de mover plata.</p>` },
+      { t: 'Estado de las cuevas', find: () => TQ.card(/^Cuevas/), h: `<p>Por ciudad: nivel de la cueva, plata guardada / máximo y lo siguiente que meterá. <b>Actualizar</b> relee las cuevas del juego.</p>` }
+    ]);
+
+    // ------------------------------------------------------------------ Ataques
+    add('Ataques', 'ataques', [
+      { t: 'Ataques y apoyos', find: () => TQ.tab('ataques'), before: () => { if (atk.view !== 'new') { atk.view = 'new'; return true; } }, h: `<p>Programa ataques y apoyos para que <b>lleguen</b> (o salgan) al segundo exacto.</p>` },
+      { t: 'Hora del servidor', find: () => TQ.sel('.nb-hero-atk', bodyEl), h: `
+        <p>El reloj del <b>servidor</b> (no el de tu PC) y su precisión, y la próxima salida programada.</p>
+        ${AUTO('Sincroniza el reloj con cada respuesta del juego hasta unas decenas de milisegundos, y dispara cada orden para que el servidor la procese a mitad del segundo buscado.')}` },
+      { t: 'Nuevo / Programados', find: () => TQ.sel('.nb-seg-main', bodyEl), h: `<p><b>Nuevo</b>: el formulario. <b>Programados</b>: la lista de lo que tienes pendiente y lo ya enviado.</p>` },
+      { t: '1 y 2 · Origen y objetivo', find: () => TQ.step(2) || TQ.step(1), h: `
+        <p><b>Origen</b>: tu ciudad desde la que sale.</p>
+        <p><b>Objetivo</b>: busca por nombre, jugador, alianza, id o pega un <b>[town]…[/town]</b>. Debajo salen los recientes. Las tuyas aparecen como <b>tuya</b> (a esas solo se manda Apoyo).</p>` },
+      { t: '3 · Tipo', find: () => TQ.step(3), h: `<p>Ataque, los tipos especiales que permita el juego (asedio, revuelta…) o <b>Apoyo</b>. Si hay estrategias de ataque, se eligen aquí.</p>` },
+      { t: '4 · Tropas, héroe y hechizo', find: () => TQ.step(4), wide: true, h: `
+        <ul><li>Escribe cuántas de cada una o pulsa <b>máx</b>. Atajos: Todas, Ofensivas, Solo tierra, Ninguna.</li>
+        <li>Cada tropa muestra su tiempo de viaje; la que <b>marca</b> el tiempo (la más lenta, o los barcos si es otra isla) se resalta.</li>
+        <li><b>Héroe</b>: solo los de la ciudad de origen que estén disponibles.</li>
+        <li><b>Hechizo</b>: uno, de los que se pueden lanzar sobre esa orden, con su coste de favor.</li></ul>` },
+      { t: '5 · Hora', find: () => TQ.step(5), wide: true, h: `
+        <ul><li><b>Llegar a las</b> o <b>Salir a las</b> + hora HH:MM:SS del servidor. Botones: <b>ya</b> (lo antes posible), −1s, +1s, +10s, +1m, +10m.</li>
+        <li><b>Rango</b> (solo llegar): acepta llegadas entre la hora y el «hasta».</li>
+        <li><b>Preciso</b>: un envío calculado al milisegundo. <b>Ultra</b> y <b>Humano</b>: envía y, si la llegada cae fuera del rango, cancela y reintenta (esperando a que vuelvan las tropas) hasta acertar o hasta que no dé tiempo.</li></ul>` },
+      { t: 'Plan y avisos', find: () => TQ.sel('.nb-plan', bodyEl), h: `
+        <p>Viaje, hora de <b>salida</b> y de <b>llegada</b> calculadas con los datos del juego, y avisos: objetivo de tu alianza o con pacto, protección de principiante, <b>modo noche</b>, moral, <b>faltan barcos</b> (con botón para añadirlos) o tropas ya usadas en otro ataque.</p>` },
+      { t: 'Opciones y programar', find: () => TQ.sel('.nb-options', bodyEl), h: `
+        <ul><li><b>Si faltan tropas al salir</b>: enviar lo que haya o no enviar.</li>
+        <li><b>Modo tren</b>: tras programar, mantiene el objetivo y adelanta la hora X segundos para meter el siguiente.</li></ul>
+        <p>Después, <b>Programar ataque/apoyo</b>: primero lo comprueba con el juego.</p>` },
+      { t: 'Programados', before: () => { if (atk.view !== 'queue') { atk.view = 'queue'; return true; } }, find: () => TQ.card(/^Programados/), wide: true, h: `
+        <p>Cada orden con su estado (programado, enviando, enviado con el error de llegada, perdido, no enviado…).</p>
+        <ul><li><b>+1s</b>: duplica llegando 1 s después (para trenes). <b>✎</b>: editar. <b>✕</b>: cancelar/quitar.</li>
+        <li><b>Limpiar terminados</b>: quita los ya enviados.</li></ul>
+        ${AUTO(`<ul><li>Los temporizadores van en un proceso aparte: funcionan aunque la pestaña esté en segundo plano.</li>
+        <li>6 s antes precarga las tropas disponibles; después de enviar lee la llegada real y corrige el desfase para los siguientes.</li>
+        <li>Si la hora pasó hace más de 8 s (p. ej. el PC se durmió), <b>no lo envía</b> y lo marca como perdido.</li></ul>`)}
+        ${WARN('Para que salgan, el juego tiene que estar abierto y el PC despierto a esa hora.')}` }
+    ]);
+
+    // ------------------------------------------------------------------ Por detrás + primeros pasos
+    add('Resumen final', 'inicio', [
+      { t: 'Lo que el bot hace solo (todo junto)', wide: true, h: `
+        <ul><li><b>Granjas</b>: recolecta todas las islas en una petición; cada isla, la ciudad que menos pierde.</li>
+        <li><b>Aldeas</b> (cada minuto): cambios con tasa alta para equilibrar; rescates si algo va a rebosar.</li>
+        <li><b>Construcción / Investigación / Reclutamiento</b> (cada 15 s): encargan lo siguiente sin cambiar de ciudad.</li>
+        <li><b>Comercio</b> (cada 10 s): manda lo que falta para los encargos; después, el <b>equilibrio</b> evita pérdidas, adelanta encargos e iguala.</li>
+        <li><b>Festivales</b> (cada 10 s) y <b>Cueva</b> (cada 2 min).</li>
+        <li><b>Ataques</b>: al segundo, aunque la pestaña esté en segundo plano.</li>
+        <li>Lee las vistas generales del juego al arrancar y cada minuto (envíos y colas de todas las ciudades).</li>
+        <li>Guarda la configuración por <b>cuenta</b> (mundo + jugador): otra cuenta en el mismo PC no ve la tuya.</li></ul>` },
+      { t: 'Primeros pasos recomendados', wide: true, h: `
+        <ol style="margin:0 0 8px;padding-left:18px">
+          <li><b>Granjas</b>: enciende la recolección y elige el tiempo.</li>
+          <li><b>Comercio</b>: enciéndelo (el equilibrio ya viene activado).</li>
+          <li><b>Construcción</b>: en cada ciudad añade los edificios y niveles que quieres (o hazlo en una y <b>Copiar a todas</b>).</li>
+          <li><b>Investigación</b> y <b>Reclutamiento</b>: añade lo que quieras por ciudad.</li>
+          <li>Revisa la <b>Prioridad de recursos</b> en Inicio si quieres que algo vaya antes.</li>
+          <li>Opcional: Intercambio con aldeas, Festivales, Cueva, nube.</li></ol>
+        <p>Mira la tarjeta <b>Actividad</b> de cada pestaña para ver qué va haciendo. Y si algo no avanza, el propio panel te dice por qué (cola llena, faltan recursos, reservado…).</p>
+        ${TIP('Puedes volver a este tour cuando quieras con el botón <b>?</b> de la cabecera, entero o por apartados.')}` }
+    ]);
+    return S;
+  }
+
+  // ---- Motor ----
+  function tourOverlay() {
+    if (tour.els) return tour.els;
+    const block = el('div', { class: 'nb-tour-block' });
+    const dim = el('div', { class: 'nb-tour-dim' });
+    const spot = el('div', { class: 'nb-tour-spot' });
+    const card = el('div', { class: 'nb-tour-card' });
+    block.addEventListener('mousedown', (e) => e.stopPropagation());
+    block.addEventListener('click', (e) => e.stopPropagation());
+    // La rueda sigue moviendo el panel (para ver lo que hay alrededor del recuadro).
+    block.addEventListener('wheel', (e) => { if (bodyEl) bodyEl.scrollTop += e.deltaY; }, { passive: true });
+    root.appendChild(block); root.appendChild(dim); root.appendChild(spot); root.appendChild(card);
+    tour.els = { block, dim, spot, card };
+    return tour.els;
+  }
+  function tourRemoveOverlay() {
+    if (!tour.els) return;
+    for (const n of Object.values(tour.els)) n.remove();
+    tour.els = null;
+  }
+  function tourRender() {
+    tour.rendering = true;
+    try { renderBodyNow(); } finally { tour.rendering = false; tour.dirty = false; }
+  }
+  function tourKey(e) {
+    if (!tour.active && !tour.menu) return;
+    const k = e.key;
+    if (!['ArrowRight', 'ArrowLeft', 'Enter', 'Escape'].includes(k)) return;
+    e.preventDefault(); e.stopPropagation();
+    if (tour.menu) { if (k === 'Escape') tourMenuClose(true); return; }
+    if (k === 'Escape') tourEnd();
+    else if (k === 'ArrowLeft') tourGo(tour.i - 1);
+    else tourGo(tour.i + 1);
+  }
+  function tourStart(steps, idx = 0) {
+    if (!panel || !steps.length) return;
+    tourCss();
+    tourMenuClose(false);
+    if (!tour.active) tour.saved = { tab: state.activeTab, resumenView: state.resumenView, atkView: atk.view };
+    tour.steps = steps; tour.active = true; tour.i = -1;
+    if (!state.open) setOpen(true);
+    tourOverlay().card.style.display = '';
+    document.addEventListener('keydown', tourKey, true);
+    window.addEventListener('resize', tourPlace);
+    clearInterval(tour.timer);
+    tour.timer = setInterval(tourPlace, 200);
+    tourGo(idx);
+  }
+  function tourGo(i) {
+    if (!tour.active) return;
+    if (i >= tour.steps.length) { tourEnd(); return; }
+    i = clamp(i, 0, tour.steps.length - 1);
+    tour.i = i;
+    const s = tour.steps[i];
+    let need = tour.dirty;
+    if (s.tab && state.activeTab !== s.tab) { state.activeTab = s.tab; buildTabs(); need = true; }
+    try { if (s.before && s.before() === true) need = true; } catch {}
+    if (need) tourRender();
+    // Tras el repintado (y los iconos que se añaden en un microtask).
+    setTimeout(() => {
+      if (!tour.active || tour.i !== i) return;
+      let t = null;
+      try { t = s.find ? s.find() : null; } catch {}
+      tour.target = t;
+      if (t) {
+        const r = t.getBoundingClientRect();
+        t.scrollIntoView({ block: r.height > window.innerHeight * 0.7 ? 'start' : 'center', behavior: 'smooth' });
+      }
+      tourPaintCard(s, !!(s.find && !t));
+      tourPlace();
+    }, 30);
+  }
+  function tourPaintCard(s, missing) {
+    const { card } = tourOverlay();
+    const n = tour.steps.length, i = tour.i;
+    card.className = `nb-tour-card${s.wide ? ' nb-tour-wide' : ''}`;
+    card.innerHTML = '';
+    const body = el('div', { class: 'nb-tour-body', html: s.h || '' });
+    card.appendChild(el('div', { class: 'nb-tour-top' }, [
+      el('div', {}, [el('div', { class: 'nb-tour-ch' }, s.ch), el('div', { class: 'nb-tour-title' }, s.t)]),
+      el('span', { class: 'nb-tour-x', title: 'Salir (Esc)', onclick: () => tourEnd() }, '×')
+    ]));
+    card.appendChild(body);
+    if (missing) card.appendChild(el('div', { class: 'nb-tour-miss' }, 'Ahora mismo este elemento no se ve en tu partida (depende de tus datos), pero funciona como se explica.'));
+    const last = i === n - 1;
+    card.appendChild(el('div', { class: 'nb-tour-foot' }, [
+      el('span', { class: 'nb-tour-btn', onclick: () => tourMenu(false) }, 'Índice'),
+      el('div', { class: 'nb-tour-prog' }, [el('i', { style: `width:${Math.round((i + 1) / n * 100)}%` })]),
+      el('span', { class: 'nb-tour-count' }, `${i + 1} / ${n}`),
+      el('span', { class: `nb-tour-btn${i === 0 ? ' off' : ''}`, onclick: () => tourGo(i - 1) }, '‹'),
+      el('span', { class: 'nb-tour-btn primary', onclick: () => tourGo(i + 1) }, last ? 'Terminar' : 'Siguiente ›')
+    ]));
+  }
+  // Coloca el recuadro sobre el elemento y la tarjeta a su lado (donde quepa).
+  function tourPlace() {
+    if (!tour.active || !tour.els) return;
+    const { spot, dim, card } = tour.els;
+    const vw = window.innerWidth, vh = window.innerHeight, M = 12;
+    let t = tour.target;
+    if (t && !t.isConnected) {
+      // El panel se repintó: se vuelve a buscar el elemento.
+      try { t = tour.target = tour.steps[tour.i]?.find?.() || null; } catch { t = null; }
+    }
+    const r = t ? t.getBoundingClientRect() : null;
+    const visible = r && r.width > 0 && r.height > 0;
+    const cw = card.offsetWidth, ch = card.offsetHeight;
+    let x, y;
+    if (!visible) {
+      spot.style.display = 'none'; dim.style.display = 'block';
+      x = (vw - cw) / 2; y = (vh - ch) / 2;
+    } else {
+      dim.style.display = 'none'; spot.style.display = 'block';
+      const pad = 6;
+      const L = clamp(r.left - pad, 2, vw - 4), T = clamp(r.top - pad, 2, vh - 4);
+      const R = clamp(r.right + pad, L + 4, vw - 2), B = clamp(r.bottom + pad, T + 4, vh - 2);
+      Object.assign(spot.style, { left: `${L}px`, top: `${T}px`, width: `${R - L}px`, height: `${B - T}px` });
+      const tries = [
+        () => ({ x: R + 14, y: clamp(T, M, vh - ch - M), ok: R + 14 + cw <= vw - M }),
+        () => ({ x: L - 14 - cw, y: clamp(T, M, vh - ch - M), ok: L - 14 - cw >= M }),
+        () => ({ x: clamp(L, M, vw - cw - M), y: B + 14, ok: B + 14 + ch <= vh - M }),
+        () => ({ x: clamp(L, M, vw - cw - M), y: T - 14 - ch, ok: T - 14 - ch >= M })
+      ];
+      let p = null;
+      for (const f of tries) { const q = f(); if (q.ok) { p = q; break; } }
+      // Sin sitio alrededor (elemento enorme): abajo a la derecha, encima del elemento.
+      if (!p) p = { x: vw - cw - M, y: vh - ch - M };
+      x = p.x; y = p.y;
+    }
+    card.style.left = `${Math.round(clamp(x, M, Math.max(M, vw - cw - M)))}px`;
+    card.style.top = `${Math.round(clamp(y, M, Math.max(M, vh - ch - M)))}px`;
+  }
+  function tourEnd() {
+    if (!tour.active) return;
+    tour.active = false;
+    clearInterval(tour.timer); tour.timer = null;
+    window.removeEventListener('resize', tourPlace);
+    if (!tour.menu) document.removeEventListener('keydown', tourKey, true);
+    tourRemoveOverlay();
+    const sv = tour.saved || {};
+    if (sv.tab) state.activeTab = sv.tab;
+    if (sv.resumenView !== undefined) state.resumenView = sv.resumenView;
+    if (sv.atkView) atk.view = sv.atkView;
+    state.tourSeen = true;
+    saveState();
+    try { buildTabs(); } catch {}
+    renderBodyNow();
+  }
+
+  // Índice: tour completo, solo la pestaña actual o un apartado.
+  function tourMenu(welcome = false) {
+    tourCss();
+    const steps = tourSteps();
+    const chapters = [];
+    for (const s of steps) if (!chapters.some((c) => c.ch === s.ch)) chapters.push({ ch: s.ch, tab: s.tab, n: steps.filter((x) => x.ch === s.ch).length });
+    const wasActive = tour.active;
+    const curCh = wasActive ? tour.steps[tour.i]?.ch : null;
+    if (wasActive) { tour.els.card.style.display = 'none'; tour.els.spot.style.display = 'none'; tour.els.dim.style.display = 'block'; clearInterval(tour.timer); }
+    tourMenuClose(false);
+    const dim = el('div', { class: 'nb-tour-dim', style: 'display:block' });
+    const block = el('div', { class: 'nb-tour-block' });
+    const tabCh = chapters.find((c) => c.tab === state.activeTab && c.ch !== 'El panel' && c.ch !== 'Resumen final');
+    const go = (list) => { tourMenuClose(false); tourStart(list, 0); };
+    const card = el('div', { class: 'nb-tour-card nb-tour-wide' }, [
+      el('div', { class: 'nb-tour-top' }, [
+        el('div', {}, [el('div', { class: 'nb-tour-ch' }, 'Tour guiado'), el('div', { class: 'nb-tour-title' }, welcome ? '¿Primera vez con NOVABOT?' : '¿Qué quieres ver?')]),
+        el('span', { class: 'nb-tour-x', title: 'Cerrar (Esc)', onclick: () => tourMenuClose(true) }, '×')
+      ]),
+      el('div', { class: 'nb-tour-body', html: welcome
+        ? '<p>Te enseño el bot paso a paso: cada pestaña, cada opción y lo que hace solo por detrás. No cambia nada de tu configuración.</p>'
+        : '<p>El tour completo recorre todo en orden. También puedes ver solo un apartado.</p>' }),
+      el('div', { class: 'nb-tour-foot', style: 'margin-top:4px' }, [
+        el('span', { class: 'nb-tour-btn primary', onclick: () => go(steps) }, `Tour completo (${steps.length} pasos)`),
+        tabCh ? el('span', { class: 'nb-tour-btn', onclick: () => go(steps.filter((s) => s.ch === tabCh.ch)) }, `Solo ${tabCh.ch}`) : null,
+        welcome ? el('span', { class: 'nb-tour-btn', onclick: () => tourMenuClose(true) }, 'Ahora no') : null
+      ]),
+      el('div', { class: 'nb-tour-chapters' }, chapters.map((c) => el('div', { class: `nb-tour-chapter${c.ch === curCh ? ' cur' : ''}`, onclick: () => go(steps.filter((s) => s.ch === c.ch)) }, [
+        el('b', {}, c.ch), el('small', {}, `${c.n} paso${c.n > 1 ? 's' : ''}`)
+      ])))
+    ]);
+    root.appendChild(block); root.appendChild(dim); root.appendChild(card);
+    tour.menu = { dim, block, card, wasActive };
+    document.addEventListener('keydown', tourKey, true);
+    requestAnimationFrame(() => {
+      card.style.left = `${Math.max(12, Math.round((window.innerWidth - card.offsetWidth) / 2))}px`;
+      card.style.top = `${Math.max(12, Math.round((window.innerHeight - card.offsetHeight) / 2))}px`;
+    });
+  }
+  // resume = volver al tour que estaba abierto (o cerrar del todo si no había).
+  function tourMenuClose(resume) {
+    const m = tour.menu;
+    if (!m) return;
+    for (const n of [m.dim, m.block, m.card]) n.remove();
+    tour.menu = null;
+    if (resume) {
+      if (m.wasActive && tour.active) {
+        tour.els.card.style.display = '';
+        clearInterval(tour.timer); tour.timer = setInterval(tourPlace, 200);
+        tourGo(tour.i);
+      } else {
+        document.removeEventListener('keydown', tourKey, true);
+        if (!state.tourSeen) { state.tourSeen = true; saveState(); }
+      }
+    }
+  }
+
+  /* ---------------------------------------------------------------------------------
      9) INIT
   --------------------------------------------------------------------------------- */
   function waitFor(cond, timeoutMs = 20000, stepMs = 200) {
@@ -6265,6 +6884,7 @@
     }
     buildUI();
     window.addEventListener('resize', () => { applyPanelSize(); applyPanelPosition(); applyFabPosition(); });
+    if (!state.tourSeen && state.open) setTimeout(() => { if (state.open && !tour.active && !tour.menu) tourMenu(true); }, 2500);
     startFarmEngine();
     startOverviewSync();
     startBuildEngine();
