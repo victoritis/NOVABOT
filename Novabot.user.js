@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.9.4
+// @version      1.10.0
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.9.4';
+  const VERSION = '1.10.0';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -176,8 +176,19 @@
       },
       aldeas: {
         enabled: false,       // intercambio de recursos con las aldeas de la isla
-        minRatio: 0.85,       // solo si por cada 1 que doy me dan al menos esto
-        excessPct: 70         // "sobra" lo que pasa de este % del almacén
+        gainRatio: 1.2,       // cambios para equilibrar: solo con la tasa así de alta
+        minRatio: 0.85,       // cambios de rescate (el recurso se iba a perder): tasa mínima
+        excessPct: 70,        // con Cueva: se cambia por plata lo que pase de este % del almacén
+        feed: true            // traer de otras ciudades lo que piden las aldeas con buena tasa
+      },
+      equilibrio: {
+        enabled: true,        // mover recursos entre ciudades con los comerciantes libres
+        balance: true,        // además de evitar pérdidas, igualar ciudades
+        tolPct: 20,           // tolerancia sobre la media del imperio (% del almacén)
+        maxCapPct: 60,        // % de comerciantes que puede usar para igualar
+        maxTravelMin: 45,     // viaje máximo (evitar pérdida: el doble)
+        minMove: 1000,        // envío mínimo al igualar
+        maxMoves: 4           // envíos por vuelta
       },
       comercio: {
         enabled: true,        // general, no por ciudad
@@ -201,7 +212,7 @@
       if (raw && typeof raw === 'object') {
         const def = defaultState();
         const out = { ...def, ...raw };
-        for (const k of ['granjas', 'aldeas', 'cueva', 'construccion', 'comercio', 'reclutamiento', 'ataques', 'festivales', 'prioridad', 'investigacion']) out[k] = { ...def[k], ...(raw[k] || {}) };
+        for (const k of ['granjas', 'aldeas', 'equilibrio', 'cueva', 'construccion', 'comercio', 'reclutamiento', 'ataques', 'festivales', 'prioridad', 'investigacion']) out[k] = { ...def[k], ...(raw[k] || {}) };
         // Prioridad guardada con el formato antiguo (preset): que prioMode() la convierta.
         if (raw.prioridad && !raw.prioridad.mode) delete out.prioridad.mode;
         return out;
@@ -596,7 +607,7 @@
         granjas: el('span', { 'data-nb-countdown': '' }, '—'),
         construccion: (() => { const exc = state.construccion.enabled ? 0 : allTownIds().filter(buildEnabledFor).length; return `${goalsBuild} objetivos · ${buildQueueLimit()} huecos de cola${exc ? ` · activa en ${exc} ciudad(es) por excepción` : ''}`; })(),
         reclutamiento: (() => { const sch = allTownIds().filter((id) => recruitOnFor(id) && recruitWaiting(id)).length; return `${goalsRec} ciudades con tropas pedidas${sch ? ` · ${sch} programada(s)` : ''}`; })(),
-        comercio: `${transit} en camino · ${needs} ciudades esperando`,
+        comercio: `${transit} en camino · ${needs} ciudades esperando${state.equilibrio?.enabled ? ' · equilibrio' : ''}`,
         festivales: (() => { const apt = allTownIds().filter(canFestival); const on = apt.filter((id) => festivalEnd(id)).length; return `${on}/${apt.length} con festival`; })()
       };
     } catch {}
@@ -1157,19 +1168,94 @@
     return collectTown(candidates[0]);
   }
 
+  /* Botín por recolección — el juego calcula claim_resource_values = [t1..t4] (lo que
+     da la aldea de CADA recurso con cada tiempo) solo para las aldeas de la isla de la
+     ciudad abierta (comprobado 24/09/2026: nivel 6 con Lealtad = [228,496,1068,2100] a
+     velocidad 4; las demás islas vienen a 0). Se apunta por nivel y Lealtad (por
+     cuenta) y se usa para estimar cuánto recibirá cada ciudad en la próxima recolección. */
+  const BOOTY_FACTOR = 2.15; // Lealtad de los aldeanos: +115 %
+  const lootRuntime = { table: null, learnedAt: 0 };
+  function lootTable() {
+    if (!lootRuntime.table) {
+      try { lootRuntime.table = JSON.parse(localStorage.getItem(acctKey('novabot_loot_v1')) || '{}') || {}; } catch { lootRuntime.table = {}; }
+    }
+    return lootRuntime.table;
+  }
+  function learnLootValues() {
+    if (Date.now() - lootRuntime.learnedAt < 20000) return;
+    lootRuntime.learnedAt = Date.now();
+    const tid = +UW.Game?.townId;
+    if (!tid) return;
+    const booty = farmTownData(tid).booty_researched ? 1 : 0;
+    const tab = lootTable();
+    let changed = false;
+    for (const rel of exCollection('FarmTownPlayerRelation')) {
+      const v = rel.claim_resource_values, lvl = +rel.expansion_stage || 0;
+      if (!v || typeof v !== 'object' || !lvl) continue;
+      const arr = [0, 1, 2, 3].map((i) => +v[i] || 0);
+      if (!arr[0]) continue;
+      const key = `${booty}_${lvl}`;
+      if (JSON.stringify(tab[key]) !== JSON.stringify(arr)) { tab[key] = arr; changed = true; }
+    }
+    if (changed) { try { localStorage.setItem(acctKey('novabot_loot_v1'), JSON.stringify(tab)); } catch {} }
+  }
+  function lootValue(level, booty, tier) {
+    if (!level) return 0;
+    const tab = lootTable(), b = booty ? 1 : 0;
+    const direct = tab[`${b}_${level}`]?.[tier];
+    if (direct) return direct;
+    const other = tab[`${1 - b}_${level}`]?.[tier];
+    if (other) return Math.round(b ? other * BOOTY_FACTOR : other / BOOTY_FACTOR);
+    // Otro nivel conocido: se escala con el máximo diario de cada nivel.
+    const perDay = UW.GameData?.farm_town?.max_resources_per_day || {};
+    for (const [key, arr] of Object.entries(tab)) {
+      const [kb, kl] = key.split('_').map(Number);
+      if (!arr?.[tier] || !perDay[kl] || !perDay[level]) continue;
+      let v = arr[tier] * perDay[level] / perDay[kl];
+      if (kb !== b) v = b ? v * BOOTY_FACTOR : v / BOOTY_FACTOR;
+      return Math.round(v);
+    }
+    return 0;
+  }
+  // Botín (de CADA recurso) que recibe una ciudad si es la que recolecta su isla.
+  function islandLoot(townId) {
+    if (!state.granjas.enabled) return 0;
+    try { learnLootValues(); } catch {}
+    const d = farmTownData(townId);
+    const booty = !!d.booty_researched, tier = clamp(state.granjas.tier, 0, 3);
+    const farms = new Map(exCollection('FarmTown').map((f) => [+f.id, f]));
+    let sum = 0;
+    for (const rel of exCollection('FarmTownPlayerRelation')) {
+      if (+rel.relation_status !== 1) continue;
+      const f = farms.get(+rel.farm_town_id);
+      if (!f || +f.island_x !== +d.island_x || +f.island_y !== +d.island_y) continue;
+      sum += lootValue(+rel.expansion_stage || 0, booty, tier);
+    }
+    return sum;
+  }
+  // Lo que se perdería (suma de los 3 recursos) si esta ciudad recolecta ahora.
+  function claimWaste(townId) {
+    const cap = townStorage(townId);
+    if (!cap) return 0;
+    const loot = islandLoot(townId), r = townResources(townId);
+    return ['wood', 'stone', 'iron'].reduce((s, k) => s + Math.max(0, r[k] + loot - cap), 0);
+  }
+
   /* Recogida de TODAS las ciudades en una sola petición — capturada del propio
      juego al pulsar "Seleccionar todas" + "Recoger" (22/09/2026):
        POST farm_town_overviews?action=claim_loads_multiple
        json: { towns:[ids], time_option_base:<s sin Lealtad>, time_option_booty:<s con Lealtad>,
                claim_factor:"normal", town_id, nl_init:true }
-     Se manda una ciudad por isla (la de almacén más vacío) y se excluyen las
-     que ya llegaron al % de almacén configurado. */
+     Se manda una ciudad por isla: la que MENOS pierde con el botín (recurso a
+     recurso), y a igualdad la de almacén más vacío. Se excluyen las que ya llegaron
+     al % de almacén configurado. */
   function pickTownsForClaim() {
     const towns = [], full = [];
     for (const [, group] of townsByIsland()) {
       const ok = group.filter((id) => !isTownStorageAtThreshold(id))
-        .sort((a, b) => townFill(a) - townFill(b));
-      if (ok.length) towns.push(ok[0]); else full.push(...group);
+        .map((id) => ({ id, waste: claimWaste(id), fill: townFill(id) }))
+        .sort((a, b) => (a.waste - b.waste) || (a.fill - b.fill));
+      if (ok.length) towns.push(ok[0].id); else full.push(...group);
     }
     return { towns, full };
   }
@@ -1366,8 +1452,9 @@
   }
 
   /* ---------------------------------------------------------------------------------
-     8a-bis) INTERCAMBIO CON ALDEAS — si una ciudad tiene mucho de un recurso, lo cambia
-     con las aldeas de su isla por el que le falta, solo si la tasa es buena.
+     8a-bis) INTERCAMBIO CON ALDEAS — cambia recursos con las aldeas de la isla para
+     equilibrar la ciudad (dar lo que sobra, recibir lo que falta) y para no perder
+     lo que no cabe en el almacén.
      -----------------------------------------------------------------------------
      Leído del código del juego (23/09/2026):
        FarmTownPlayerRelation.trade(amount) →
@@ -1375,51 +1462,87 @@
          { model_url:'FarmTownPlayerRelation/<relId>', action_name:'trade', captcha:null,
            arguments:{ farm_town_id, amount } }
        Doy <amount> de resource_demand y recibo round(amount × tasa) de resource_offer.
-     Datos: MM.getCollections().FarmTown (isla, offer/demand) y FarmTownPlayerRelation
-     (relation_status 1 = mía, trade_ratio, ratio_updated_at, max_trade_capacity…).
-     La tasa se recupera sola 0,02 × velocidad por hora hasta 1,25.
-     No toca lo que el comercio necesita: solo cambia lo que sobra en TODO el imperio
-     (excedente de la ciudad por encima del % elegido, menos lo que otras ciudades
-     esperan de ese recurso) y nunca llena el almacén con lo que recibe.
+       Límites (isTradeAllowed del propio juego): 100 ≤ amount ≤ 3000, ≤ comerciantes
+       libres de la ciudad y ≤ lo que tenga del recurso.
+     Tasa (24/09/2026, applyTradeRatioBonus del juego):
+       tasa = min(trade_ratio + recuperado, 1,25) + 0,1 si LA CIUDAD que cambia tiene
+       Oficina comercial (Game.constants.farm_towns.trade_ratio_bonus).
+       Recuperado = 0,02 × velocidad por hora desde ratio_updated_at.
+       Tras cambiar baja 0,03 por cada 100 entregados (wiki del juego): cambiar 3000
+       la deja 0,9 más baja.
+     Por qué solo con tasa alta: la tasa se recupera a ritmo fijo y se para al llegar
+     al máximo. Cambiar la misma cantidad con tasa 0,85 o con 1,25 "gasta" lo mismo
+     de recuperación, pero con 1,25 recibes un 47 % más. Así que los cambios normales
+     (equilibrar) se hacen solo con la tasa alta; con tasa baja solo si el recurso se
+     va a perder de todas formas (almacén lleno y sin sitio en otras ciudades).
+     Tres tipos de cambio (por orden de preferencia):
+       · alimentar: el comercio trajo ese recurso de otra ciudad para esta aldea.
+       · rescate:   el recurso rebosará en la próxima recolección.
+       · equilibrar: la ciudad (y el imperio) tiene más del que doy que del que recibo.
+     Nunca da lo que la ciudad reserva para sus encargos ni hace rebosar lo que recibe.
   --------------------------------------------------------------------------------- */
-  const exRuntime = { timer: null, running: false, pending: [], cooldown: new Map(), capGuess: new Map(), last: null };
+  const exRuntime = {
+    timer: null, running: false, pending: [], cooldown: new Map(), capGuess: new Map(), last: null,
+    ratioOverride: new Map(),  // relId -> { base, at } tasa tras un cambio propio, hasta que el juego la actualice
+    feeds: []                  // { townId, relId, give, get, amount, arrival, expires } envíos para alimentar una aldea
+  };
+  const EX_DROP_PER_UNIT = 0.0003; // la tasa baja 0,03 por cada 100 entregados
+  const EX_MIN_GAIN = 300;         // no hacer cambios de equilibrio más pequeños que esto
 
   function exCollection(name) {
     try { return [].concat(UW.MM.getCollections()?.[name] || []).flatMap((c) => c?.models || []).map((m) => m.attributes); } catch { return []; }
   }
-  // Tasa actual (lo que me dan por cada 1). Si el juego ya la tiene calculada, la
-  // mayor de las dos (la suya incluye bonificaciones).
-  function exRatio(rel, now = Date.now()) {
-    const def = +UW.Game?.constants?.farm_towns?.trade_ratio_default || 1.25;
-    const speed = +UW.Game?.game_speed || 1;
-    const base = +rel.trade_ratio || 0;
-    const upd = +rel.ratio_updated_at || 0;
-    const rec = upd ? Math.round(Math.max(0, now / 1000 - upd) / 3600 * 0.02 * speed * 100) / 100 : 0;
-    const mine = Math.min(def, base + rec);
-    return Math.max(mine, +rel.current_trade_ratio || 0);
+  function hasTradeOffice(townId) {
+    try { return (+UW.ITowns.getTown(townId)?.getBuildings?.()?.attributes?.trade_office || 0) >= 1; } catch { return false; }
   }
-  // Máximo por intercambio: 3000 (límite del juego). Además lo limitan los
-  // comerciantes libres y lo que sobre (se aplica en exPlanTown). Si el juego
-  // rechaza, se reduce solo para esa aldea.
+  // Hora del servidor en segundos (Timestamp del juego; si no, la del PC).
+  const serverNow = () => { try { const t = +UW.Timestamp?.now?.(); if (t > 1e9) return t; } catch {} return Date.now() / 1000; };
+  // Tasa base (sin bonus) ahora mismo: lo guardado + lo recuperado, hasta 1,25.
+  function exBaseRatio(rel, nowS = serverNow()) {
+    const def = +UW.Game?.constants?.farm_towns?.trade_ratio_default || 1.25;
+    let base = +rel.trade_ratio || 0, upd = +rel.ratio_updated_at || 0;
+    // Tras un cambio propio el juego tarda en mandar la tasa nueva: mientras la aldea
+    // siga con los datos de antes, se usa la estimada.
+    const ov = exRuntime.ratioOverride.get(+rel.id);
+    if (ov) {
+      if (upd === ov.prevUpd && (+rel.trade_ratio || 0) === ov.prevTr) { base = ov.base; upd = ov.at; }
+      else exRuntime.ratioOverride.delete(+rel.id);
+    }
+    const speed = +UW.Game?.game_speed || 1;
+    const rec = upd ? Math.max(0, nowS - upd) / 3600 * 0.02 * speed : 0;
+    return Math.min(def, base + rec);
+  }
+  // Tasa real para UNA ciudad (el bonus de la Oficina comercial es de la ciudad que cambia).
+  function exRatioFor(rel, townId) {
+    const bonus = hasTradeOffice(townId) ? (+UW.Game?.constants?.farm_towns?.trade_ratio_bonus || 0.1) : 0;
+    return Math.round((exBaseRatio(rel) + bonus) * 100) / 100;
+  }
+  // Máximo por intercambio: 3000 (límite del juego). Si el juego rechaza, se reduce
+  // solo para esa aldea.
   const EX_MAX = 3000;
   function exMaxAmount(rel) {
     let m = EX_MAX;
     if (+rel.max_trade_capacity > 0) m = Math.min(m, +rel.max_trade_capacity);
-    if (exRuntime.capGuess.has(rel.id)) m = Math.min(m, exRuntime.capGuess.get(rel.id));
+    if (exRuntime.capGuess.has(+rel.id)) m = Math.min(m, exRuntime.capGuess.get(+rel.id));
     return m;
   }
-  function exVillagesFor(townId) {
-    const xy = townXY(townId);
+  // Aldeas propias con las que se puede cambiar, agrupadas por isla ("x_y").
+  function exVillagesByIsland() {
     const farms = new Map(exCollection('FarmTown').map((f) => [+f.id, f]));
-    const out = [];
+    const out = new Map();
     for (const rel of exCollection('FarmTownPlayerRelation')) {
       if (+rel.relation_status !== 1) continue;
       const f = farms.get(+rel.farm_town_id);
-      if (!f || +f.island_x !== xy.x || +f.island_y !== xy.y) continue;
-      if (!RES.includes(f.resource_demand) || !RES.includes(f.resource_offer) || f.resource_demand === f.resource_offer) continue;
-      out.push({ rel, farm: f, give: f.resource_demand, get: f.resource_offer, ratio: exRatio(rel) });
+      if (!f || !RES.includes(f.resource_demand) || !RES.includes(f.resource_offer) || f.resource_demand === f.resource_offer) continue;
+      const key = `${+f.island_x}_${+f.island_y}`;
+      if (!out.has(key)) out.set(key, []);
+      out.get(key).push({ rel, farm: f, give: f.resource_demand, get: f.resource_offer });
     }
     return out;
+  }
+  function exVillagesFor(townId) {
+    const xy = townXY(townId);
+    return (exVillagesByIsland().get(`${xy.x}_${xy.y}`) || []).map((v) => ({ ...v, ratio: exRatioFor(v.rel, townId) }));
   }
   function exPendingTo(townId) {
     const now = Date.now();
@@ -1429,7 +1552,7 @@
     return out;
   }
 
-  // Estado del imperio para decidir qué sobra de verdad.
+  // Estado del imperio (lo usa también la Cueva: globalMiss.iron).
   function exContext() {
     const towns = allTownIds();
     let demands = [];
@@ -1449,76 +1572,140 @@
     return { towns, ctx, globalMiss };
   }
 
-  // Plan de UNA ciudad: el mejor intercambio posible ahora (o null + motivo).
-  function exPlanTown(townId, E, cfg = state.aldeas) {
-    const c = E.ctx[townId];
-    if (!c || !c.storage) return { why: 'almacén desconocido' };
-    const pct = clamp(+cfg.excessPct || 70, 10, 100) / 100;
-    const minRatio = Math.max(0.1, +cfg.minRatio || 0.85);
-    const line = c.storage * pct;
-    const room = { wood: 0, stone: 0, iron: 0 }, excess = { wood: 0, stone: 0, iron: 0 };
-    for (const k of RES) {
-      const keep = Math.max(line, c.total[k], c.reserve[k]);
-      // Lo que otras ciudades esperan de este recurso lo pone antes el comercio (1:1).
-      const others = E.globalMiss[k] - c.miss[k];
-      excess[k] = Math.max(0, Math.floor(c.cur[k] - keep - Math.max(0, others)));
-      room[k] = Math.max(0, Math.floor(c.storage * 0.95 - c.cur[k] - c.inc[k] - c.pend[k]));
+  // Envío de alimentación que ya llegó (o está a punto) para esta aldea y ciudad.
+  function exFeedFor(relId, townId, now = Date.now()) {
+    return exRuntime.feeds.find((f) => f.relId === +relId && f.townId === +townId && f.arrival <= now + 5000 && f.expires > now) || null;
+  }
+
+  // Mejor cambio posible de UNA aldea en UNA ciudad (o null). M = resourceModel().
+  // Devuelve { amount, receive, mode, score }.
+  function exCandidate(M, townId, v, ratio, cfg = state.aldeas, now = Date.now()) {
+    const t = M.T[townId];
+    if (!t || !t.storage) return null;
+    const X = v.give, Y = v.get, S = t.storage;
+    const cave = caveOn();
+    // Con la Cueva activa: solo se cambia POR plata (la Cueva la guarda) y nunca se da plata.
+    if (cave && (Y !== 'iron' || X === 'iron')) return null;
+    const cap = t.capLeft ?? t.cap;
+    if (cap < 100) return null;
+    const avail = Math.max(0, Math.floor(t.cur[X] - t.keep[X]));
+    if (avail < 100) return null;
+    // Sitio para lo que recibo: hasta la línea de seguridad (con Cueva, la plata hasta el 95 %).
+    const roomY = cave ? S * 0.95 - t.lvl.iron : t.safe[Y] - t.lvl[Y];
+    if (roomY / ratio < 100) return null;
+    const gainR = clamp(+cfg.gainRatio || 1.2, 0.5, 1.5);
+    const minR = clamp(+cfg.minRatio || 0.85, 0.3, 1.5);
+    let amount = 0, mode = null, rank = 0, pref = 0;
+    // Lo traído para esta aldea: se cambia en cuanto haya llegado (casi todo).
+    const feed = exFeedFor(v.rel.id, townId, now);
+    if (feed && avail >= feed.amount * 0.8 && ratio + 1e-9 >= Math.min(gainR, minR)) {
+      mode = 'alimentar'; rank = 3; amount = Math.min(feed.amount, avail);
+    } else if (t.over[X] > 0 && ratio + 1e-9 >= minR) {
+      // Rescate con pérdida (tasa < 1) solo si no hay otra salida: el equilibrio entre
+      // ciudades está apagado, no queda sitio en otras ciudades o la recolección es ya.
+      const eqOn = !!(state.equilibrio?.enabled && state.comercio?.enabled);
+      const imminent = M.dt !== null && M.dt < 3 / 60;
+      if (ratio >= 1 || !eqOn || imminent || (M.roomAll[X] || 0) < t.over[X]) {
+        // Con pérdida, solo lo que de verdad rebosaría; con ganancia, hasta la línea de seguridad.
+        mode = 'rescate'; rank = 2; amount = Math.min(avail, ratio >= 1 ? Math.max(t.over[X], t.lvl[X] - t.safe[X]) : t.over[X]);
+        pref = 1 - t.lvl[Y] / S; // mejor recibir lo que menos tiene
+      }
     }
-    if (!RES.some((k) => excess[k] > 0)) return { why: 'nada sobra' };
-    let cap = tradeCapacityOf(townId);
-    if (cap <= 0) return { why: 'sin comerciantes libres' };
+    if (!mode && ratio + 1e-9 >= gainR) {
+      // Lo que otras ciudades esperan de X se lo manda antes el comercio.
+      const others = Math.max(0, (M.globalMiss[X] || 0) - t.miss[X]);
+      if (cave) {
+        // Con Cueva: se cambia por plata lo que pase del % elegido del almacén.
+        const line = S * clamp(+cfg.excessPct || 70, 10, 100) / 100;
+        if (t.lvl[X] > line) { mode = 'equilibrar'; rank = 1; pref = (t.lvl[X] - line) / S; amount = Math.min(t.lvl[X] - line, avail - others); }
+      } else {
+        // Equilibrar: cuánto más tengo de X que de Y, en la ciudad y en todo el imperio.
+        const d = (t.lvl[X] - t.lvl[Y]) / S + (M.F[X] - M.F[Y]);
+        if (d > 0.04) { mode = 'equilibrar'; rank = 1; pref = d; amount = Math.min(d * S / (1 + ratio), avail - others); }
+      }
+    }
+    if (!mode) return null;
+    amount = Math.floor(Math.min(amount, cap, exMaxAmount(v.rel), roomY / ratio));
+    if (amount < (mode === 'equilibrar' ? EX_MIN_GAIN : 100)) return null;
+    return { amount, receive: Math.round(amount * ratio), mode, score: rank * 1e9 + pref * 1e6 + ratio * 1e4 + amount / 1000 };
+  }
+
+  // Plan de intercambios de TODAS las islas (máx. `limit`). Cada aldea se usa una vez
+  // por vuelta y la hace la ciudad de la isla donde más ayuda (y con mejor tasa: la
+  // Oficina comercial da +0,1).
+  function exPlanAll(M, cfg = state.aldeas, limit = 3) {
     const now = Date.now();
-    let best = null;
-    for (const v of exVillagesFor(townId)) {
-      if ((exRuntime.cooldown.get(v.rel.id) || 0) > now) continue;
-      if (v.ratio + 1e-9 < minRatio || excess[v.give] <= 0) continue;
-      // Con la Cueva activa: solo se cambia POR PLATA (y la plata puede llegar hasta el
-      // 95 % del almacén: la Cueva la irá guardando).
-      const forCave = caveOn();
-      if (forCave && v.get !== 'iron') continue;
-      // No recibir un recurso que ya está en exceso (se cambiaría en círculo).
-      if (!forCave && c.cur[v.get] + c.inc[v.get] + c.pend[v.get] >= line) continue;
-      const maxRecv = forCave ? room.iron : Math.min(room[v.get], Math.max(0, line - c.cur[v.get] - c.inc[v.get] - c.pend[v.get]) + c.miss[v.get]);
-      const amount = Math.floor(Math.min(excess[v.give], cap, exMaxAmount(v.rel), maxRecv / v.ratio));
-      if (amount < 100) continue;
-      // Mejor: lo que más falta al imperio, luego mejor tasa, luego más cantidad.
-      const score = (E.globalMiss[v.get] > 0 ? 1e9 : 0) + v.ratio * 1e6 + amount;
-      if (!best || score > best.score) best = { ...v, amount, receive: Math.round(amount * v.ratio), score };
+    const byIsland = new Map();
+    for (const id of M.towns) {
+      const t = M.T[id];
+      if (!t) continue;
+      t.capLeft = t.cap;
+      if (!byIsland.has(t.island)) byIsland.set(t.island, []);
+      byIsland.get(t.island).push(id);
     }
-    return best ? { trade: best } : { why: caveOn() ? `ninguna aldea que dé plata con tasa ≥ ${minRatio}` : `ninguna aldea con tasa ≥ ${minRatio}` };
+    const villages = [];
+    for (const [key, list] of exVillagesByIsland()) {
+      if (!byIsland.has(key)) continue;
+      for (const v of list) {
+        if ((exRuntime.cooldown.get(+v.rel.id) || 0) > now) continue;
+        // Aldea esperando lo que le trae el comercio: no se usa para otra cosa mientras.
+        if (exRuntime.feeds.some((f) => f.relId === +v.rel.id && f.arrival > now + 5000 && f.expires > now)) continue;
+        villages.push({ ...v, towns: byIsland.get(key) });
+      }
+    }
+    const plan = [];
+    const used = new Set();
+    while (plan.length < limit) {
+      let best = null;
+      for (const v of villages) {
+        if (used.has(v.rel.id)) continue;
+        for (const tid of v.towns) {
+          const ratio = exRatioFor(v.rel, tid);
+          const c = exCandidate(M, tid, v, ratio, cfg, now);
+          if (c && (!best || c.score > best.score)) best = { ...c, townId: tid, rel: v.rel, farm: v.farm, give: v.give, get: v.get, ratio };
+        }
+      }
+      if (!best) break;
+      used.add(best.rel.id);
+      plan.push(best);
+      const t = M.T[best.townId];
+      t.cur[best.give] -= best.amount; t.lvl[best.give] -= best.amount;
+      t.lvl[best.get] += best.receive; t.capLeft -= best.amount;
+      t.over[best.give] = Math.max(0, t.over[best.give] - best.amount);
+    }
+    return plan;
   }
 
   async function exchangeTick() {
     const cfg = state.aldeas;
     if (!cfg.enabled) return;
-    const E = exContext();
-    let done = 0;
-    for (const townId of E.towns) {
-      if (done >= 3) break;
-      const p = exPlanTown(townId, E, cfg);
-      if (!p.trade) continue;
-      const t = p.trade;
+    const now = Date.now();
+    exRuntime.feeds = exRuntime.feeds.filter((f) => f.expires > now);
+    const M = resourceModel();
+    const plan = exPlanAll(M, cfg, 3);
+    for (const t of plan) {
+      if (!state.aldeas.enabled) return;
+      const baseBefore = exBaseRatio(t.rel);
       try {
-        await gpPostAs(townId, 'frontend_bridge', 'execute', {
+        await gpPostAs(t.townId, 'frontend_bridge', 'execute', {
           model_url: `FarmTownPlayerRelation/${t.rel.id}`, action_name: 'trade', captcha: null,
           arguments: { farm_town_id: +t.farm.id, amount: t.amount }, nl_init: true
         });
-        const dur = Math.max(30, +t.rel.trade_duration || 120);
-        exRuntime.pending.push({ townId, res: t.get, amount: t.receive, arrival: Date.now() + dur * 1000 + 15000 });
-        exRuntime.cooldown.set(t.rel.id, Date.now() + 3 * 60000);
-        // Descontar ya de la ciudad (hasta que el juego actualice sus datos).
-        E.ctx[townId].cur[t.give] -= t.amount;
-        E.ctx[townId].pend[t.get] += t.receive;
-        if (E.globalMiss[t.get] > 0) E.globalMiss[t.get] = Math.max(0, E.globalMiss[t.get] - t.receive);
-        done += 1;
-        farmLog(`${farmTownName(townId)}: ${t.amount} ${RES_ES[t.give]} → ${t.receive} ${RES_ES[t.get]} con ${t.farm.name} (tasa ${t.ratio.toFixed(2)}).`, 'ok');
+        const dur = Math.max(30, +t.rel.trade_duration || 150);
+        exRuntime.pending.push({ townId: t.townId, res: t.get, amount: t.receive, arrival: Date.now() + dur * 1000 + 15000 });
+        exRuntime.cooldown.set(+t.rel.id, Date.now() + 3 * 60000);
+        exRuntime.ratioOverride.set(+t.rel.id, { base: Math.max(0, baseBefore - t.amount * EX_DROP_PER_UNIT), at: serverNow(), prevUpd: +t.rel.ratio_updated_at || 0, prevTr: +t.rel.trade_ratio || 0 });
+        if (t.mode === 'alimentar') exRuntime.feeds = exRuntime.feeds.filter((f) => !(f.relId === +t.rel.id && f.townId === t.townId));
+        farmLog(`${farmTownName(t.townId)} (${t.mode}): ${t.amount} ${RES_ES[t.give]} → ${t.receive} ${RES_ES[t.get]} con ${t.farm.name} (tasa ${t.ratio.toFixed(2)}).`, 'ok');
       } catch (e) {
-        exRuntime.cooldown.set(t.rel.id, Date.now() + 5 * 60000);
-        exRuntime.capGuess.set(t.rel.id, Math.max(500, Math.floor(t.amount / 2)));
-        farmLog(`${farmTownName(townId)}: intercambio con ${t.farm.name} rechazado (${e.message}).`, 'error');
+        exRuntime.cooldown.set(+t.rel.id, Date.now() + 5 * 60000);
+        exRuntime.capGuess.set(+t.rel.id, Math.max(500, Math.floor(t.amount / 2)));
+        farmLog(`${farmTownName(t.townId)}: intercambio con ${t.farm.name} rechazado (${e.message}).`, 'error');
       }
+      await sleep(600 + Math.random() * 700);
     }
     exRuntime.last = Date.now();
+    if (plan.length) renderIfIdle('granjas');
   }
   const RES_ES = { wood: 'madera', stone: 'piedra', iron: 'plata' };
 
@@ -1668,7 +1855,7 @@
     const exOn = !!state.aldeas?.enabled;
     bodyEl.appendChild(el('div', { class: `nb-alert ${cfg.enabled && exOn ? 'nb-alert-info' : 'nb-alert-warn'}` }, [
       el('span', {}, cfg.enabled
-        ? (exOn ? [el('b', {}, 'Intercambio con aldeas: activo · solo por plata. '), `Lo que sobre de madera o piedra (más del ${state.aldeas.excessPct}% del almacén) se cambia por plata con tasa ≥ ${state.aldeas.minRatio}, y la Cueva la guarda.`]
+        ? (exOn ? [el('b', {}, 'Intercambio con aldeas: activo · solo por plata. '), `Lo que sobre de madera o piedra (más del ${state.aldeas.excessPct}% del almacén) se cambia por plata con tasa ≥ ${state.aldeas.gainRatio ?? 1.2} (o ≥ ${state.aldeas.minRatio} si rebosaría), y la Cueva la guarda.`]
                 : [el('b', {}, 'Intercambio con aldeas: desactivado. '), 'Actívalo en Granjas para cambiar lo que sobre de madera o piedra por plata y meterla en las cuevas.'])
         : [el('b', {}, 'Con la Cueva activa, '), 'el Intercambio con aldeas (Granjas) solo cambia por plata.']),
       el('span', { class: 'nb-btn nb-btn-sm', onclick: () => gotoCard('granjas', 'aldeas') }, 'Ir al intercambio con aldeas')
@@ -1725,37 +1912,52 @@
 
   function renderExchangeCard() {
     const cfg = state.aldeas;
-    const ratioIn = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '0.5', max: '1.35', step: '0.05', value: cfg.minRatio });
-    ratioIn.addEventListener('change', () => { cfg.minRatio = clamp(+ratioIn.value || 0.85, 0.5, 1.35); saveState(); renderBody(); });
-    const pctIn = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '10', max: '100', step: '5', value: cfg.excessPct });
-    pctIn.addEventListener('change', () => { cfg.excessPct = clamp(pos(pctIn.value, 70), 10, 100); saveState(); renderBody(); });
-    // Vista previa de la ciudad abierta.
+    const numIn = (key, min, max, step, def, isFloat = true) => {
+      const i = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: String(min), max: String(max), step: String(step), value: cfg[key] ?? def });
+      i.addEventListener('change', () => { cfg[key] = clamp(isFloat ? (+i.value || def) : pos(i.value, def), min, max); saveState(); renderBody(); });
+      return i;
+    };
+    const runNow = () => { if (exRuntime.running) return; exRuntime.running = true; exchangeTick().catch((e) => farmLog(`Intercambio: ${e.message}`, 'error')).finally(() => { exRuntime.running = false; }); };
+    // Vista previa: aldeas de la ciudad abierta (con SU tasa) y próximos cambios de todo el imperio.
     let preview = null;
     const tid = +UW.Game?.townId;
-    if (tid) {
-      try {
-        const vs = exVillagesFor(tid);
-        const p = exPlanTown(tid, exContext(), cfg);
-        preview = el('div', { class: 'nb-mt' }, [
-          el('div', { class: 'nb-ex-list' }, vs.map((v) => el('div', { class: `nb-ex-item${v.ratio + 1e-9 >= cfg.minRatio ? '' : ' nb-ex-off'}` }, [
-            el('span', { class: 'nb-ex-name' }, v.farm.name),
-            el('span', { class: 'nb-ex-trade' }, [resIcon(v.give), '→', resIcon(v.get)]),
-            el('b', {}, v.ratio.toFixed(2))
-          ]))),
-          el('div', { class: 'nb-alert nb-alert-info nb-mt' }, p.trade
-            ? [`${farmTownName(tid)}: cambiaría ${p.trade.amount} `, resIcon(p.trade.give), ` por ${p.trade.receive} `, resIcon(p.trade.get), ` con ${p.trade.farm.name}.`]
-            : `${farmTownName(tid)}: ${vs.length ? p.why : 'sin aldeas propias en su isla'}.`)
-        ]);
-      } catch {}
-    }
+    try {
+      const vs = tid ? exVillagesFor(tid) : [];
+      const gainR = +cfg.gainRatio || 1.2;
+      const plan = cfg.enabled ? exPlanAll(resourceModel(), cfg, 6) : [];
+      const now = Date.now();
+      const feeds = exRuntime.feeds.filter((f) => f.expires > now);
+      preview = el('div', { class: 'nb-mt' }, [
+        vs.length ? el('div', { class: 'nb-card-title' }, `Aldeas de ${farmTownName(tid)}${hasTradeOffice(tid) ? ' (Oficina comercial +0,1)' : ''}`) : null,
+        vs.length ? el('div', { class: 'nb-ex-list' }, vs.map((v) => el('div', { class: `nb-ex-item${v.ratio + 1e-9 >= gainR ? '' : ' nb-ex-off'}` }, [
+          el('span', { class: 'nb-ex-name' }, v.farm.name),
+          el('span', { class: 'nb-ex-trade' }, [resIcon(v.give), '→', resIcon(v.get)]),
+          el('b', {}, v.ratio.toFixed(2))
+        ]))) : el('p', { class: 'nb-placeholder' }, 'La ciudad abierta no tiene aldeas propias en su isla.'),
+        el('div', { class: 'nb-card-title nb-mt' }, `Próximos cambios (${plan.length})`),
+        plan.length
+          ? el('div', { class: 'nb-queue' }, plan.map((t) => el('div', { class: 'nb-queue-item' }, [
+              el('span', {}, [el('span', { class: 'nb-pill' }, t.mode), ` ${farmTownName(t.townId)}: ${t.amount} `, resIcon(t.give), ` → ${t.receive} `, resIcon(t.get), ` · ${t.farm.name}`]),
+              el('span', { class: 'nb-queue-time' }, t.ratio.toFixed(2))
+            ])))
+          : el('p', { class: 'nb-placeholder' }, cfg.enabled ? `Nada ahora: ninguna aldea con tasa ≥ ${gainR} tiene algo que equilibrar, y nada rebosa.` : 'Desactivado.'),
+        feeds.length ? el('div', { class: 'nb-card-title nb-mt' }, `Esperando envío para cambiar (${feeds.length})`) : null,
+        feeds.length ? el('div', { class: 'nb-queue' }, feeds.map((f) => el('div', { class: 'nb-queue-item' }, [
+          el('span', {}, [`${farmTownName(f.townId)}: ${f.amount} `, resIcon(f.give), ' → ', resIcon(f.get)]),
+          el('span', { class: 'nb-queue-time', 'data-nb-until': Math.round(f.arrival / 1000) }, formatLeft(Math.round(f.arrival / 1000)))
+        ]))) : null
+      ]);
+    } catch (e) { console.warn('[NOVABOT][aldeas]', e); }
     return el('div', { class: `nb-card${caveOn() ? ' nb-card-accent' : ''}`, 'data-nb-card': 'aldeas' }, [
       el('div', { class: 'nb-row' }, [
         el('span', { class: 'nb-row-label' }, [el('b', {}, 'Intercambio con aldeas'), caveOn() ? el('span', { class: 'nb-pill nb-ml' }, 'solo plata') : null]),
-        switchEl(!!cfg.enabled, (v) => { cfg.enabled = v; saveState(); farmLog(v ? 'Intercambio con aldeas activado.' : 'Intercambio con aldeas desactivado.', 'info'); if (v && !exRuntime.running) { exRuntime.running = true; exchangeTick().catch((e) => farmLog(`Intercambio: ${e.message}`, 'error')).finally(() => { exRuntime.running = false; }); } }, false)
+        switchEl(!!cfg.enabled, (v) => { cfg.enabled = v; saveState(); farmLog(v ? 'Intercambio con aldeas activado.' : 'Intercambio con aldeas desactivado.', 'info'); renderBody(); if (v) runNow(); }, false)
       ]),
-      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Tasa mínima (me dan por cada 1)'), ratioIn]),
-      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Sobra a partir de (% del almacén)'), el('span', {}, [pctIn, ' %'])]),
-      el('p', { class: 'nb-placeholder' }, 'Cada minuto, en todas las ciudades: lo que pasa de ese % (y no necesita ninguna otra ciudad ni ningún módulo) se cambia con las aldeas de la isla por el recurso que falta, sin llenar el almacén.'),
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Tasa para equilibrar (≥)'), numIn('gainRatio', 0.8, 1.35, 0.05, 1.2)]),
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Tasa si se va a perder (≥)'), numIn('minRatio', 0.5, 1.35, 0.05, 0.85)]),
+      caveOn() ? el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Con Cueva: cambiar por plata lo que pase de (% del almacén)'), el('span', {}, [numIn('excessPct', 10, 100, 5, 70, false), ' %'])]) : null,
+      optionRow('Traer de otras ciudades', 'Si una aldea con buena tasa pide un recurso que su isla no tiene, el comercio lo trae de donde sobra y aquí se cambia al llegar (necesita Comercio y Equilibrio)', cfg.feed !== false, (v) => { cfg.feed = v; saveState(); renderBody(); }),
+      el('p', { class: 'nb-placeholder' }, 'Cada minuto, en todas las islas: con tasa alta da lo que más sobra (en la ciudad y en el imperio) por lo que menos hay. Con tasa baja solo si ese recurso rebosaría en la próxima recolección y no cabe en otra ciudad. La tasa se recupera sola y a ritmo fijo, así que cambiar solo con tasa alta da bastante más por lo mismo. Nunca da lo reservado para encargos ni hace rebosar lo que recibe.'),
       caveOn() ? el('div', { class: 'nb-alert nb-alert-info nb-mt' }, [
         el('span', {}, [el('b', {}, 'Cueva activa: '), 'solo se cambia POR PLATA (para meterla en las cuevas). El resto de aldeas no se usan mientras la Cueva esté activa.']),
         el('span', { class: 'nb-btn nb-btn-sm', onclick: () => gotoCard('cueva', 'cueva') }, 'Ver Cueva')
@@ -2548,7 +2750,7 @@
      wood/stone/iron, started_at, arrival_at) + registro propio hasta que aparecen.
   --------------------------------------------------------------------------------- */
   const RES = ['wood', 'stone', 'iron'];
-  const tradeRuntime = { timer: null, running: false, log: [], ledger: [], pairCooldown: new Map(), waitingSince: new Map() };
+  const tradeRuntime = { timer: null, running: false, log: [], ledger: [], pairCooldown: new Map(), waitingSince: new Map(), capSeen: new Map(), lastSendAt: 0 };
   let tradeLogEl = null;
   const sumRes = (r) => RES.reduce((s, k) => s + (+r?.[k] || 0), 0);
   const fmtRes = (r) => RES.filter((k) => r[k] > 0).map((k) => `${Math.round(r[k])} ${({ wood: 'madera', stone: 'piedra', iron: 'plata' })[k]}`).join(', ');
@@ -2961,6 +3163,316 @@
     return { plan, needs };
   }
 
+  /* ---------------------------------------------------------------------------------
+     8c-bis) EQUILIBRIO ENTRE CIUDADES — que no se pierda nada al recolectar y que
+     cada ciudad tenga de todo.
+     -----------------------------------------------------------------------------
+     Usa los comerciantes que el comercio deja libres (solo en vueltas en que el
+     comercio no tiene nada que enviar para encargos). Tres pases, por orden:
+       1) Evitar pérdida: la ciudad que recolecta su isla recibe el botín de CADA
+          recurso (lo que dan sus aldeas con el tiempo elegido). Si con eso + lo que
+          produce hasta entonces + lo que le llega pasaría del almacén, lo que sobra
+          (hasta su "línea de seguridad", que deja sitio para 2 recolecciones) se
+          manda a las ciudades con sitio, primero a las que menos tienen de ese recurso.
+       2) Alimentar aldeas: si una aldea con tasa alta pide un recurso que su isla no
+          tiene y al imperio le sobra ese recurso más que el que da la aldea, se trae
+          de la ciudad más cercana a la que le sobra; al llegar, el Intercambio con
+          aldeas lo cambia (ver 8a-bis).
+       3) Igualar: por recurso, la "cuota justa" de cada ciudad es el llenado medio del
+          imperio × su almacén. Las que pasan de la cuota + tolerancia mandan a las que
+          están por debajo de la cuota − tolerancia, hasta la mitad de la tolerancia
+          (así no se mueve lo mismo de un lado a otro).
+     Nunca se da lo que la ciudad reserva para sus encargos (ni un recurso que ella
+     misma está esperando) y nunca se manda por encima de la línea de seguridad del
+     destino.
+  --------------------------------------------------------------------------------- */
+  const balRuntime = { nextAt: 0 };
+  const KIND_LABEL = { urgente: 'Evitar pérdida', aldea: 'Para cambiar en aldea', equilibrio: 'Equilibrio' };
+  const KIND_RANK = { urgente: 0, aldea: 1, equilibrio: 2 };
+
+  // Comerciantes totales: Mercado × 500 (× 1,5 con Oficina comercial) — comprobado en
+  // las 22 ciudades el 24/09/2026. Por si acaso, nunca menos de lo visto libre.
+  function maxTradeCapOf(townId) {
+    let m = 0;
+    try {
+      const b = UW.ITowns.getTown(townId)?.getBuildings?.()?.attributes || {};
+      m = (+b.market || 0) * 500 * (hasTradeOffice(townId) ? 1.5 : 1);
+    } catch {}
+    const seen = Math.max(tradeRuntime.capSeen.get(+townId) || 0, tradeCapacityOf(townId));
+    tradeRuntime.capSeen.set(+townId, seen);
+    return Math.max(m, seen);
+  }
+  function islandKey(townId) { const xy = townXY(townId); return `${xy.x}_${xy.y}`; }
+  function nextClaimHours() {
+    if (!state.granjas.enabled) return null;
+    return Math.max(0, (farmRuntime.nextCycleAt || 0) - Date.now()) / 3.6e6;
+  }
+
+  // Foto de TODAS las ciudades para decidir qué mover y qué cambiar. Nueva en cada
+  // llamada: los planificadores la van modificando al asignar.
+  function resourceModel() {
+    const towns = allTownIds();
+    const zero = () => ({ wood: 0, stone: 0, iron: 0 });
+    let demands = []; try { demands = collectDemands(); } catch {}
+    let transit = []; try { transit = transitRows(); } catch {}
+    let claimers = new Set(); try { if (state.granjas.enabled) claimers = new Set(pickTownsForClaim().towns); } catch {}
+    const dt = nextClaimHours();
+    const marginPct = clamp(+state.comercio.storageMarginPct || 0, 0, 50) / 100;
+    const keepMin = +state.comercio.keepMin || 0;
+    const T = {}, sumLvl = zero(), globalMiss = zero(), roomAll = zero();
+    let sumS = 0;
+    for (const id of towns) {
+      const storage = townStorage(id) || 0;
+      if (!storage) continue;
+      const cur = townResources(id), inc = incomingTo(id, transit), pend = exPendingTo(id), prod = productionOf(id);
+      const total = zero(), reserve = zero();
+      for (const d of demands) if (+d.townId === id) for (const k of RES) (d.reserveOnly ? reserve : total)[k] += +d[k] || 0;
+      const loot = claimers.has(id) ? islandLoot(id) : 0;
+      const top = storage * (1 - marginPct);
+      // Lo recibido de aldeas ya sale en los envíos del juego (origen vacío): no contarlo dos veces.
+      const vinc = zero();
+      for (const r of transit) if (r.to === id && !r.from) for (const k of RES) vinc[k] += r[k];
+      const lvl = {}, miss = {}, keep = {}, safe = {}, over = {};
+      for (const k of RES) {
+        pend[k] = Math.max(0, pend[k] - vinc[k]);
+        lvl[k] = cur[k] + inc[k] + pend[k];
+        miss[k] = Math.max(0, total[k] - lvl[k]);
+        keep[k] = Math.max(total[k], reserve[k]) + keepMin;
+        // Línea de seguridad: deja sitio para 2 recolecciones y media hora de producción.
+        safe[k] = Math.max(storage * 0.5, top - 2 * loot - prod[k] * 0.5);
+        // Lo que rebosaría en la próxima recolección si no se hace nada.
+        over[k] = Math.max(0, lvl[k] + prod[k] * (dt ?? 0.25) + loot - top);
+        sumLvl[k] += lvl[k]; globalMiss[k] += miss[k];
+      }
+      sumS += storage;
+      T[id] = { id, storage, cur, inc, pend, prod, lvl, total, reserve, miss, keep, loot, safe, over, top,
+        cap: tradeCapacityOf(id), maxCap: maxTradeCapOf(id), island: islandKey(id), claimer: claimers.has(id) };
+    }
+    // Sitio libre (hasta la línea de seguridad) en las ciudades que no rebosan.
+    for (const t of Object.values(T)) for (const k of RES) if (!t.over[k]) roomAll[k] += Math.max(0, t.safe[k] - t.lvl[k]);
+    // Llenado medio del imperio por recurso: la cuota justa de una ciudad es F × su almacén.
+    const F = Object.fromEntries(RES.map((k) => [k, sumS ? sumLvl[k] / sumS : 0]));
+    return { towns: Object.keys(T).map(Number), T, F, globalMiss, roomAll, dt, claimers, at: Date.now() };
+  }
+
+  // Aldeas con tasa alta que piden un recurso que su isla no tiene para dar. Solo si al
+  // imperio le sobra más ese recurso que el que da la aldea (con Cueva: solo por plata).
+  function exFeedWants(M, cfg = state.aldeas) {
+    if (!cfg.enabled || !cfg.feed) return [];
+    const gainR = clamp(+cfg.gainRatio || 1.2, 0.5, 1.5);
+    const cave = caveOn();
+    const now = Date.now();
+    const byIsland = new Map();
+    for (const id of M.towns) { const k = M.T[id].island; if (!byIsland.has(k)) byIsland.set(k, []); byIsland.get(k).push(id); }
+    const out = [];
+    for (const [key, list] of exVillagesByIsland()) {
+      const towns = byIsland.get(key);
+      if (!towns) continue;
+      for (const v of list) {
+        if ((exRuntime.cooldown.get(+v.rel.id) || 0) > now) continue;
+        if (exRuntime.feeds.some((f) => f.relId === +v.rel.id)) continue;
+        const X = v.give, Y = v.get;
+        if (cave ? (Y !== 'iron' || X === 'iron') : (M.F[X] - M.F[Y] < 0.05)) continue;
+        // Si una ciudad de la isla ya puede hacer el cambio ella sola, no hace falta traer nada.
+        if (towns.some((tid) => exCandidate(M, tid, v, exRatioFor(v.rel, tid), cfg, now))) continue;
+        let best = null;
+        for (const tid of towns) {
+          const t = M.T[tid], r = exRatioFor(v.rel, tid);
+          if (r + 1e-9 < gainR) continue;
+          const roomY = cave ? t.storage * 0.95 - t.lvl.iron : t.safe[Y] - t.lvl[Y];
+          const roomX = t.safe[X] - t.lvl[X];
+          const amount = Math.floor(Math.min(exMaxAmount(v.rel), roomY / r, roomX, t.maxCap));
+          if (amount < 500) continue;
+          if (!best || r > best.ratio || (r === best.ratio && amount > best.amount)) best = { townId: tid, rel: v.rel, farm: v.farm, give: X, get: Y, ratio: r, amount };
+        }
+        if (best) out.push(best);
+      }
+    }
+    return out.sort((a, b) => (b.ratio - a.ratio) || (b.amount - a.amount));
+  }
+
+  // Movimientos de equilibrio (agrupados por pareja origen → destino).
+  // idle = el comercio no tiene encargos que enviar ahora (entonces también iguala).
+  function planBalance(M, idle = true) {
+    const cfg = state.equilibrio;
+    const now = Date.now();
+    const resList = caveOn() ? ['wood', 'stone'] : RES; // con Cueva la plata la gestiona la Cueva
+    const tol = clamp(+cfg.tolPct || 20, 5, 60) / 100;
+    const maxTravel = Math.max(1, +cfg.maxTravelMin || 45) * 60;
+    const capPct = clamp(+cfg.maxCapPct || 60, 10, 100) / 100;
+    const ids = M.towns;
+    const moves = new Map();
+    // Comerciantes: para evitar pérdidas, todos los libres; para lo demás se deja
+    // libre el resto para los encargos.
+    const capAll = {}, capBal = {};
+    for (const id of ids) { const t = M.T[id]; capAll[id] = t.cap; capBal[id] = Math.max(0, t.cap - t.maxCap * (1 - capPct)); }
+    const giveable = (d, k) => (M.T[d].miss[k] > 0 ? 0 : Math.max(0, Math.floor(M.T[d].cur[k] - M.T[d].keep[k])));
+    const onCooldown = (a, b) => (tradeRuntime.pairCooldown.get(`${a}>${b}`) || 0) > now;
+    const fill = (id, k) => M.T[id].lvl[k] / M.T[id].storage;
+    const room = (r, k, eta) => { const t = M.T[r]; return t.over[k] > 0 ? 0 : Math.floor(t.safe[k] - t.lvl[k] - t.prod[k] * eta / 3600); };
+    // Destinos: primero los que menos tienen de ese recurso; cada 12 min de viaje cuenta como un 10 % más lleno.
+    const receivers = (d, k, maxT, cond) => ids
+      .filter((r) => r !== d && !onCooldown(d, r) && travelSec(d, r) <= maxT && cond(r))
+      .sort((a, b) => (fill(a, k) + travelSec(d, a) / 7200) - (fill(b, k) + travelSec(d, b) / 7200));
+    function add(d, r, k, x, kind, feed = null) {
+      const key = `${d}>${r}`;
+      let m = moves.get(key);
+      if (!m) { m = { from: d, to: r, ship: { wood: 0, stone: 0, iron: 0 }, kinds: new Set(), eta: travelSec(d, r), feeds: [] }; moves.set(key, m); }
+      m.ship[k] += x; m.kinds.add(kind);
+      if (feed) m.feeds.push(feed);
+      const D = M.T[d], R = M.T[r];
+      D.cur[k] -= x; D.lvl[k] -= x; D.over[k] = Math.max(0, D.over[k] - x);
+      R.lvl[k] += x; R.inc[k] += x;
+      capAll[d] -= x; capBal[d] = Math.max(0, Math.min(capBal[d] - x, capAll[d]));
+    }
+
+    // 1) Evitar pérdida en la próxima recolección.
+    const urgent = [];
+    for (const d of ids) for (const k of resList) if (M.T[d].over[k] > 0) urgent.push({ d, k, over: M.T[d].over[k] });
+    urgent.sort((a, b) => b.over - a.over);
+    for (const u of urgent) {
+      const D = M.T[u.d];
+      let want = Math.min(giveable(u.d, u.k), Math.ceil(Math.max(D.over[u.k], D.lvl[u.k] - D.safe[u.k])));
+      if (want < 100) continue;
+      for (const r of receivers(u.d, u.k, maxTravel * 2, (r) => room(r, u.k, travelSec(u.d, r)) >= 100)) {
+        if (want < 100 || capAll[u.d] < 100) break;
+        const x = Math.floor(Math.min(want, room(r, u.k, travelSec(u.d, r)), capAll[u.d]));
+        if (x < 100) continue;
+        add(u.d, r, u.k, x, 'urgente');
+        want -= x;
+      }
+    }
+
+    // 2) Alimentar aldeas con tasa alta.
+    if (state.aldeas.enabled && state.aldeas.feed) {
+      for (const w of exFeedWants(M)) {
+        const X = w.give, e = w.townId;
+        const donor = ids
+          .filter((d) => d !== e && !onCooldown(d, e) && travelSec(d, e) <= maxTravel)
+          .map((d) => ({ d, x: Math.floor(Math.min(giveable(d, X), M.T[d].lvl[X] - M.F[X] * M.T[d].storage, capBal[d])) }))
+          .filter((o) => o.x >= Math.max(500, w.amount * 0.5))
+          .sort((a, b) => travelSec(a.d, e) - travelSec(b.d, e))[0];
+        if (!donor) continue;
+        // Revalidar con lo ya asignado en esta vuelta (sitio para X al llegar y para Y al cambiar).
+        const E = M.T[e], Y = w.get;
+        const roomY = (caveOn() ? E.storage * 0.95 - E.lvl[Y] : E.safe[Y] - E.lvl[Y]) / w.ratio;
+        const x = Math.floor(Math.min(w.amount, donor.x, room(e, X, travelSec(donor.d, e)), roomY));
+        if (x < 500) continue;
+        add(donor.d, e, X, x, 'aldea', { rel: w.rel, farm: w.farm, give: X, get: Y, amount: x, ratio: w.ratio });
+        // Al llegar se cambia: en el modelo, X se convierte en Y.
+        E.lvl[X] -= x; E.lvl[Y] += Math.round(x * w.ratio);
+      }
+    }
+
+    // 3) Igualar (solo con el comercio libre).
+    if (idle && cfg.balance !== false) {
+      const donors = [];
+      for (const d of ids) for (const k of resList) {
+        const t = M.T[d];
+        const ex = t.lvl[k] - (M.F[k] + tol) * t.storage;
+        if (ex > 0) donors.push({ d, k, ex });
+      }
+      donors.sort((a, b) => b.ex - a.ex);
+      for (const u of donors) {
+        const D = M.T[u.d];
+        let want = Math.min(giveable(u.d, u.k), Math.floor(D.lvl[u.k] - (M.F[u.k] + tol / 2) * D.storage));
+        if (want < 100) continue;
+        // Por abajo la tolerancia no pasa de la mitad de la media (si no, con un recurso
+        // escaso en todo el imperio ninguna ciudad quedaría "por debajo").
+        const tolDown = Math.min(tol, M.F[u.k] / 2);
+        const below = (r) => M.T[r].lvl[u.k] < (M.F[u.k] - tolDown) * M.T[r].storage;
+        for (const r of receivers(u.d, u.k, maxTravel, below)) {
+          if (want < 100 || capBal[u.d] < 100) break;
+          const R = M.T[r];
+          const take = Math.min((M.F[u.k] - tolDown / 2) * R.storage - R.lvl[u.k], room(r, u.k, travelSec(u.d, r)));
+          const x = Math.floor(Math.min(want, take, capBal[u.d]));
+          if (x < 100) continue;
+          add(u.d, r, u.k, x, 'equilibrio');
+          want -= x;
+        }
+      }
+    }
+
+    const minMove = Math.max(100, +cfg.minMove || 1000);
+    const out = [];
+    for (const m of moves.values()) {
+      const total = sumRes(m.ship);
+      const kinds = [...m.kinds].sort((a, b) => KIND_RANK[a] - KIND_RANK[b]);
+      const min = kinds[0] === 'urgente' ? 300 : kinds[0] === 'aldea' ? 500 : minMove;
+      if (total < min) continue;
+      out.push({ ...m, kind: kinds[0], kinds, total });
+    }
+    return out.sort((a, b) => (KIND_RANK[a.kind] - KIND_RANK[b.kind]) || (b.total - a.total));
+  }
+
+  async function balanceTick() {
+    const cfg = state.equilibrio;
+    const moves = planBalance(resourceModel(), true);
+    const max = Math.max(1, +cfg.maxMoves || 4);
+    let sent = 0;
+    for (const m of moves) {
+      if (sent >= max || !state.equilibrio.enabled || !state.comercio.enabled) break;
+      const label = KIND_LABEL[m.kind];
+      try {
+        await gpPostAs(m.from, 'town_info', 'trade', { id: m.to, wood: m.ship.wood, stone: m.ship.stone, iron: m.ship.iron, nl_init: true });
+        const arrival = Date.now() + m.eta * 1000;
+        tradeRuntime.ledger.push({ from: m.from, to: m.to, ...m.ship, arrival, expires: arrival + 120000 });
+        tradeRuntime.pairCooldown.set(`${m.from}>${m.to}`, Date.now() + 60000);
+        tradeRuntime.lastSendAt = Date.now();
+        for (const f of m.feeds) {
+          exRuntime.feeds.push({ townId: m.to, relId: +f.rel.id, give: f.give, get: f.get, amount: f.amount, arrival: arrival + 10000, expires: arrival + 20 * 60000 });
+        }
+        const extra = m.feeds.length ? ` · para ${m.feeds.map((f) => `${f.farm.name} (${RES_ES[f.give]} → ${RES_ES[f.get]} a ${f.ratio.toFixed(2)})`).join(', ')}` : '';
+        tradeLog(`${label} · ${farmTownName(m.from)} → ${farmTownName(m.to)}: ${fmtRes(m.ship)} · ${Math.max(1, Math.round(m.eta / 60))} min${extra}`, 'ok');
+        sent += 1;
+      } catch (e) {
+        tradeRuntime.pairCooldown.set(`${m.from}>${m.to}`, Date.now() + 5 * 60000);
+        tradeLog(`${label} · ${farmTownName(m.from)} → ${farmTownName(m.to)}: ${e.message}`, 'error');
+      }
+      await sleep(700 + Math.random() * 900);
+    }
+    if (sent) { setTimeout(refreshOverviews, 3000); renderIfIdle('comercio'); }
+  }
+
+  function renderBalanceCard() {
+    const cfg = state.equilibrio;
+    const num = (key, label, step, min, max) => {
+      const i = el('input', { class: 'nb-input', type: 'number', step: String(step), min: String(min), max: String(max), value: cfg[key] });
+      i.addEventListener('change', () => { cfg[key] = clamp(pos(i.value, cfg[key]), min, max); saveState(); renderIfIdle('comercio'); });
+      return el('label', { class: 'nb-field' }, [label, i]);
+    };
+    const pct = (v) => `${Math.round(v * 100)}%`;
+    let M = null, risk = [], moves = [];
+    try {
+      M = resourceModel();
+      risk = M.towns.map((id) => ({ id, over: { ...M.T[id].over }, claimer: M.T[id].claimer })).filter((r) => sumRes(r.over) >= 1);
+      moves = planBalance(M, true);
+    } catch (e) { console.warn('[NOVABOT][equilibrio]', e); }
+    const riskEl = risk.length
+      ? el('div', { class: 'nb-alert nb-alert-warn nb-mt' }, [el('span', {}, [el('b', {}, 'Rebosaría en la próxima recolección: '),
+          ...risk.flatMap((r, i) => [i ? ' · ' : '', `${farmTownName(r.id)} `, fmtResEl(r.over)])])])
+      : el('div', { class: 'nb-alert nb-alert-info nb-mt' }, 'Ninguna ciudad rebosa en la próxima recolección.');
+    const movesEl = moves.length
+      ? el('div', { class: 'nb-queue' }, moves.slice(0, 10).map((m) => el('div', { class: 'nb-queue-item' }, [
+          el('span', {}, [el('span', { class: 'nb-pill' }, KIND_LABEL[m.kind]), ` ${farmTownName(m.from)} → ${farmTownName(m.to)} `, fmtResEl(m.ship)]),
+          el('span', { class: 'nb-queue-time' }, `${Math.max(1, Math.round(m.eta / 60))} min`)
+        ])))
+      : el('p', { class: 'nb-placeholder' }, 'Nada que mover ahora.');
+    return el('div', { class: 'nb-card', 'data-nb-card': 'equilibrio' }, [
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, [el('b', {}, 'Equilibrio entre ciudades')]),
+        switchEl(!!cfg.enabled, (v) => { cfg.enabled = v; saveState(); tradeLog(v ? 'Equilibrio activado.' : 'Equilibrio desactivado.'); renderBody(); }, false)]),
+      optionRow('Igualar ciudades', 'Si una ciudad tiene mucho de un recurso y otra poco, lo reparte (solo cuando el comercio no tiene encargos que enviar)', cfg.balance !== false, (v) => { cfg.balance = v; saveState(); renderBody(); }),
+      el('div', { class: 'nb-field-row' }, [num('tolPct', 'Tolerancia (% del almacén)', 5, 5, 60), num('maxCapPct', 'Comerciantes para igualar (%)', 10, 10, 100)]),
+      el('div', { class: 'nb-field-row' }, [num('maxTravelMin', 'Viaje máximo (min)', 5, 1, 600), num('minMove', 'Envío mínimo al igualar', 100, 100, 100000)]),
+      el('div', { class: 'nb-field-row' }, [num('maxMoves', 'Envíos por vuelta', 1, 1, 20)]),
+      el('p', { class: 'nb-placeholder' }, 'Antes de cada recolección calcula el botín que va a recibir cada ciudad: lo que no cabría se manda a ciudades con sitio (primero a las que menos tienen). Si una aldea con buena tasa pide algo que su isla no tiene, lo trae de donde sobra. Y con el comercio libre, las que pasan de la media del imperio + tolerancia mandan a las que están por debajo. Nunca toca lo reservado para encargos.'),
+      M ? el('p', { class: 'nb-placeholder' }, `Imperio: madera ${pct(M.F.wood)} · piedra ${pct(M.F.stone)} · plata ${pct(M.F.iron)} del almacén${M.dt !== null ? ` · próxima recolección en ${Math.max(0, Math.round(M.dt * 60))} min` : ''}.`) : null,
+      riskEl,
+      el('div', { class: 'nb-card-title nb-mt' }, `Ahora movería (${moves.length})`),
+      movesEl
+    ]);
+  }
+
   async function tradeTick() {
     if (!state.comercio.enabled) return;
     if (!overviewReady()) return; // sin conocer TODOS los envíos en camino se enviaría de más
@@ -2973,6 +3485,7 @@
         await gpPostAs(p.from, 'town_info', 'trade', { id: p.to, wood: p.ship.wood, stone: p.ship.stone, iron: p.ship.iron, nl_init: true });
         tradeRuntime.ledger.push({ from: p.from, to: p.to, ...p.ship, arrival: Date.now() + p.eta * 1000, expires: Date.now() + p.eta * 1000 + 120000 });
         tradeRuntime.pairCooldown.set(`${p.from}>${p.to}`, Date.now() + 20000);
+        tradeRuntime.lastSendAt = Date.now();
         tradeLog(`${farmTownName(p.from)} → ${farmTownName(p.to)}: ${fmtRes(p.ship)} · ${Math.round(p.eta / 60)} min · para ${p.label}`, 'ok');
         setTimeout(refreshOverviews, 3000);
       } catch (e) {
@@ -2984,6 +3497,12 @@
       await sleep(700 + Math.random() * 900);
     }
     if (plan.length) renderIfIdle('comercio');
+    // Equilibrio (8c-bis): solo en vueltas en que no hubo nada que enviar para encargos
+    // y con los datos ya al día tras el último envío (cada 30 s como mucho).
+    if (!plan.length && state.equilibrio?.enabled && Date.now() >= balRuntime.nextAt && Date.now() - (tradeRuntime.lastSendAt || 0) > 15000) {
+      balRuntime.nextAt = Date.now() + 30000;
+      await balanceTick();
+    }
   }
 
   function startTradeEngine() {
@@ -3032,6 +3551,7 @@
       el('div', { class: 'nb-field-row' }, [num('agingWeight', 'Peso de la espera (anti-olvido)', 1, 0)]),
       el('p', { class: 'nb-placeholder' }, `Velocidad de viaje calibrada: ${secPerUnit()} s por casilla.`)
     ]));
+    bodyEl.appendChild(renderBalanceCard());
 
     if (!overviewReady()) bodyEl.appendChild(el('div', { class: 'nb-alert nb-alert-info' }, 'Leyendo los envíos en camino de todas las ciudades… el comercio empieza en cuanto termine.'));
     bodyEl.appendChild(renderPriorityCard());
@@ -3053,7 +3573,7 @@
       el('div', { class: 'nb-card-title' }, `En camino (${rows.length})`),
       rows.length
         ? el('div', { class: 'nb-queue' }, rows.map((r) => el('div', { class: 'nb-queue-item' }, [
-            el('span', {}, [`${farmTownName(r.from)} → ${farmTownName(r.to)} `, fmtResEl(r)]),
+            el('span', {}, [`${r.from ? farmTownName(r.from) : 'Aldea'} → ${farmTownName(r.to)} `, fmtResEl(r)]),
             el('span', { class: 'nb-queue-time', 'data-nb-until': Math.round(r.arrival / 1000) }, formatLeft(Math.round(r.arrival / 1000)))
           ])))
         : el('p', { class: 'nb-placeholder' }, 'Nada en camino.')
