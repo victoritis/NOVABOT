@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.12.0
+// @version      1.12.3
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.12.0';
+  const VERSION = '1.12.3';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -127,6 +127,7 @@
     return {
       open: false,
       tourSeen: false,      // ya se ofreció el tour guiado (botón "?")
+      newsSeen: '',         // última versión cuyas novedades ya se enseñaron
       activeTab: 'inicio',
       pos: null,        // {x, y} panel: esquina superior-izquierda; null = posición por defecto
       fabPos: null,      // {x, y} botón flotante; null = posición por defecto
@@ -180,12 +181,16 @@
         gainRatio: 1.2,       // cambios para equilibrar: solo con la tasa así de alta
         minRatio: 0.85,       // cambios de rescate (el recurso se iba a perder): tasa mínima
         excessPct: 70,        // con Cueva: se cambia por plata lo que pase de este % del almacén
-        feed: true            // traer de otras ciudades lo que piden las aldeas con buena tasa
+        feed: true,           // traer de otras ciudades lo que piden las aldeas con buena tasa
+        bulk: true,           // cambiar con pérdida cuando sobra muchísimo de un recurso
+        bulkPct: 85,          // "sobra mucho": la ciudad pasa de este % del almacén…
+        bulkRatio: 0.6        // …y se acepta hasta esta tasa
       },
       equilibrio: {
         enabled: true,        // mover recursos entre ciudades con los comerciantes libres
         balance: true,        // además de evitar pérdidas, igualar ciudades
-        tolPct: 20,           // tolerancia sobre la media del imperio (% del almacén)
+        tolPct: 20,           // tolerancia por arriba sobre la media del imperio (% del almacén)
+        tolDownPct: 13,       // tolerancia por abajo: recibe la que está por debajo de la media − esto
         maxCapPct: 60,        // % de comerciantes que puede usar sin encargos pendientes ni a punto
         busyCapPct: 20,       // % de comerciantes con encargos pendientes o a punto (el resto, libre)
         horizonMin: 30,       // encargos "a punto": los que empiezan dentro de estos minutos
@@ -722,7 +727,7 @@
     saveState();
     applyOpenState();
     // Primera vez que se abre: ofrecer el tour guiado.
-    if (open && !state.tourSeen && !tour.active && !tour.menu) setTimeout(() => { if (state.open && !tour.active && !tour.menu) tourMenu(true); }, 450);
+    if (open && !tour.active && !tour.menu) setTimeout(tourAutoOffer, 450);
   }
 
   function applyOpenState() {
@@ -1643,9 +1648,23 @@
         amount = Math.min(amount, cap - t.maxCap * (1 - busyPct));
       }
     }
+    // Exceso: si la ciudad va muy llena de X y en todo el imperio sobra X mucho más que Y,
+    // se cambia aunque la tasa sea baja (por defecto desde 0,6): mejor plata que almacenes
+    // llenos de madera o piedra sin usar.
+    if (!mode && cfg.bulk !== false) {
+      const bulkLine = S * clamp(+cfg.bulkPct || 85, 50, 100) / 100;
+      const bulkR = clamp(+cfg.bulkRatio || 0.6, 0.3, 1.5);
+      const gap = M.F[X] - M.F[Y];
+      if (t.lvl[X] > bulkLine && ratio + 1e-9 >= bulkR && gap >= 0.15 && (t.lvl[X] - t.lvl[Y]) / S >= 0.15) {
+        const others = Math.max(0, (M.globalMiss[X] || 0) - t.miss[X]);
+        mode = 'exceso'; rank = 0.5; pref = gap;
+        amount = Math.min(t.lvl[X] - bulkLine * 0.95, (t.lvl[X] - t.lvl[Y]) / (1 + ratio), avail - others);
+        if (M.busy) amount = Math.min(amount, cap - t.maxCap * (1 - clamp(+state.equilibrio?.busyCapPct || 20, 0, 100) / 100));
+      }
+    }
     if (!mode) return null;
     amount = Math.floor(Math.min(amount, cap, exMaxAmount(v.rel), roomY / ratio));
-    if (amount < (mode === 'equilibrar' ? EX_MIN_GAIN : 100)) return null;
+    if (amount < (mode === 'equilibrar' || mode === 'exceso' ? EX_MIN_GAIN : 100)) return null;
     return { amount, receive: Math.round(amount * ratio), mode, score: rank * 1e9 + pref * 1e6 + ratio * 1e4 + amount / 1000 };
   }
 
@@ -1976,6 +1995,8 @@
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Tasa para equilibrar (≥)'), numIn('gainRatio', 0.8, 1.35, 0.05, 1.2)]),
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Tasa si se va a perder (≥)'), numIn('minRatio', 0.5, 1.35, 0.05, 0.85)]),
       caveOn() ? el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Con Cueva: cambiar por plata lo que pase de (% del almacén)'), el('span', {}, [numIn('excessPct', 10, 100, 5, 70, false), ' %'])]) : null,
+      optionRow('Cambiar con pérdida si sobra mucho', 'Si una ciudad pasa del % de abajo en un recurso y en todo el imperio sobra ese recurso mucho más que otro (p. ej. madera 80 % y plata 45 %), lo cambia por el que falta aunque la tasa sea baja', cfg.bulk !== false, (v) => { cfg.bulk = v; saveState(); renderBody(); }),
+      cfg.bulk !== false ? el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Sobra mucho a partir de (% del almacén) · tasa mínima'), el('span', {}, [numIn('bulkPct', 50, 100, 5, 85, false), ' % · ', numIn('bulkRatio', 0.3, 1.35, 0.05, 0.6)])]) : null,
       optionRow('Traer de otras ciudades', 'Si una aldea con buena tasa pide un recurso que su isla no tiene, el comercio lo trae de donde sobra y aquí se cambia al llegar (necesita Comercio y Equilibrio)', cfg.feed !== false, (v) => { cfg.feed = v; saveState(); renderBody(); }),
       el('p', { class: 'nb-placeholder' }, 'Cada minuto, en todas las islas: con tasa alta da lo que más sobra (en la ciudad y en el imperio) por lo que menos hay. Con tasa baja solo si ese recurso rebosaría en la próxima recolección y no cabe en otra ciudad. La tasa se recupera sola y a ritmo fijo, así que cambiar solo con tasa alta da bastante más por lo mismo. Nunca da lo reservado para encargos ni hace rebosar lo que recibe.'),
       caveOn() ? el('div', { class: 'nb-alert nb-alert-info nb-mt' }, [
@@ -3395,9 +3416,9 @@
     return { mode, up };
   }
   const MODE_TEXT = {
-    encargos: 'Hay ciudades esperando recursos: el comercio va primero. Solo se evita perder recursos, con poca parte de los comerciantes y sin tocar lo que alguien espera.',
-    pronto: 'Hay encargos a punto de empezar: se evita perder recursos y se adelanta a esas ciudades lo que les va a faltar, con poca parte de los comerciantes.',
-    libre: 'Nada pendiente ni a punto: también se igualan ciudades y se alimentan aldeas.'
+    encargos: 'Hay ciudades esperando recursos: el comercio va primero. Se evita perder y se iguala con poca parte de los comerciantes, sin tocar lo que alguien espera.',
+    pronto: 'Hay encargos a punto de empezar: se evita perder recursos, se adelanta a esas ciudades lo que les va a faltar y se igualan ciudades, con poca parte de los comerciantes.',
+    libre: 'Nada pendiente ni a punto: se evita perder, se igualan ciudades y se alimentan aldeas con más comerciantes.'
   };
 
   // Movimientos de equilibrio (agrupados por pareja origen → destino).
@@ -3501,22 +3522,28 @@
       }
     }
 
-    // 4) Igualar (solo en modo libre).
-    if (free && cfg.balance !== false) {
+    // 4) Igualar. En cualquier modo (con encargos, solo con la parte pequeña de
+    //    comerciantes y sin tocar lo que alguien espera).
+    // La tolerancia se adapta a lo lleno que está el imperio: por arriba no pasa de la
+    // mitad de lo que queda hasta el 100 % (con todo al 78 % y tolerancia 20, las que
+    // pasan del 89 % dan a las que están por debajo del 65 %, con la tolerancia por abajo en 13).
+    const tolUpOf = (k) => Math.min(tol, Math.max(0.03, (1 - M.F[k]) / 2));
+    if (cfg.balance !== false) {
       const donors = [];
       for (const d of ids) for (const k of resList) {
+        if (waited(k)) continue;
         const t = M.T[d];
-        const ex = t.lvl[k] - (M.F[k] + tol) * t.storage;
+        const ex = t.lvl[k] - (M.F[k] + tolUpOf(k)) * t.storage;
         if (ex > 0) donors.push({ d, k, ex });
       }
       donors.sort((a, b) => b.ex - a.ex);
       for (const u of donors) {
         const D = M.T[u.d];
-        let want = Math.min(giveable(u.d, u.k), Math.floor(D.lvl[u.k] - (M.F[u.k] + tol / 2) * D.storage));
+        let want = Math.min(giveable(u.d, u.k), Math.floor(D.lvl[u.k] - (M.F[u.k] + tolUpOf(u.k) / 2) * D.storage));
         if (want < 100) continue;
         // Por abajo la tolerancia no pasa de la mitad de la media (si no, con un recurso
         // escaso en todo el imperio ninguna ciudad quedaría "por debajo").
-        const tolDown = Math.min(tol, M.F[u.k] / 2);
+        const tolDown = Math.min(clamp(+(cfg.tolDownPct ?? 13), 2, 60) / 100, M.F[u.k] / 2);
         const below = (r) => M.T[r].lvl[u.k] < (M.F[u.k] - tolDown) * M.T[r].storage;
         for (const r of receivers(u.d, u.k, maxTravel, below)) {
           if (want < 100 || capLeft[u.d] < 100) break;
@@ -3610,11 +3637,11 @@
     return el('div', { class: 'nb-card', 'data-nb-card': 'equilibrio' }, [
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, [el('b', {}, 'Equilibrio entre ciudades'), el('span', { class: 'nb-pill nb-ml' }, ctx.mode === 'encargos' ? 'encargos en curso' : ctx.mode === 'pronto' ? 'encargos a punto' : 'libre')]),
         switchEl(!!cfg.enabled, (v) => { cfg.enabled = v; saveState(); tradeLog(v ? 'Equilibrio activado.' : 'Equilibrio desactivado.'); renderBody(); }, false)]),
-      optionRow('Igualar ciudades', 'Si una ciudad tiene mucho de un recurso y otra poco, lo reparte (solo cuando no hay encargos pendientes ni a punto)', cfg.balance !== false, (v) => { cfg.balance = v; saveState(); renderBody(); }),
+      optionRow('Igualar ciudades', 'Si una ciudad tiene mucho de un recurso y otra poco, lo reparte (con encargos, solo con la parte pequeña de comerciantes)', cfg.balance !== false, (v) => { cfg.balance = v; saveState(); renderBody(); }),
       el('div', { class: 'nb-field-row' }, [num('busyCapPct', 'Comerciantes con encargos (%)', 5, 0, 100), num('maxCapPct', 'Comerciantes sin encargos (%)', 10, 10, 100)]),
-      el('div', { class: 'nb-field-row' }, [num('horizonMin', 'Encargos «a punto»: en (min)', 5, 5, 240), num('tolPct', 'Tolerancia al igualar (%)', 5, 5, 60)]),
+      el('div', { class: 'nb-field-row' }, [num('horizonMin', 'Encargos «a punto»: en (min)', 5, 5, 240), num('tolPct', 'Tolerancia por arriba (%)', 5, 5, 60)]),
       el('div', { class: 'nb-field-row' }, [num('maxTravelMin', 'Viaje máximo (min)', 5, 1, 600), num('minMove', 'Envío mínimo al igualar', 100, 100, 100000)]),
-      el('div', { class: 'nb-field-row' }, [num('maxMoves', 'Envíos por vuelta', 1, 1, 20)]),
+      el('div', { class: 'nb-field-row' }, [num('tolDownPct', 'Tolerancia por abajo (%)', 1, 2, 60), num('maxMoves', 'Envíos por vuelta', 1, 1, 20)]),
       el('p', { class: 'nb-placeholder' }, 'Solo actúa en las vueltas en que el comercio no tiene nada que enviar para encargos. Antes de cada recolección calcula el botín de cada ciudad y lo que no cabría lo manda a ciudades con sitio (primero a las que lo van a necesitar). Con encargos a punto, les adelanta lo que les faltará. Sin nada pendiente, iguala ciudades y trae recursos a las aldeas con buena tasa. Nunca toca lo reservado para encargos.'),
       el('div', { class: 'nb-alert nb-alert-info nb-mt' }, MODE_TEXT[ctx.mode]),
       M ? el('p', { class: 'nb-placeholder' }, `Imperio: madera ${pct(M.F.wood)} · piedra ${pct(M.F.stone)} · plata ${pct(M.F.iron)} del almacén${M.dt !== null ? ` · próxima recolección en ${Math.max(0, Math.round(M.dt * 60))} min` : ''}.`) : null,
@@ -6097,19 +6124,23 @@
           <li>Cada minuto, en todas las islas, hasta 3 cambios. Cada aldea la usa la ciudad de su isla donde más ayuda.</li>
           <li>Da lo que más <b>sobra</b> (en la ciudad y en todo el imperio) por lo que menos hay.</li>
           <li>La tasa baja 0,03 por cada 100 que cambias y se recupera sola (0,02 × velocidad por hora, hasta 1,25). La <b>Oficina comercial</b> suma +0,1 a la ciudad que la tiene: el bot calcula la tasa real de cada ciudad.</li>
-          <li>Nunca da lo reservado para encargos, ni lo que otra ciudad está esperando, ni hace rebosar lo que recibe. Mínimo 100 y máximo 3000 por cambio.</li></ul>`)}` },
+          <li>Nunca da lo reservado para encargos, ni lo que otra ciudad está esperando, ni hace rebosar lo que recibe. Mínimo 100 y máximo 3000 por cambio.</li>
+          <li>Si hay ciudades esperando recursos, los cambios normales no usan más que la parte pequeña de comerciantes (la misma que el equilibrio, 20 %), para no frenar al comercio.</li></ul>`)}` },
       { t: 'Tasa para equilibrar', find: inCard(/^Intercambio con aldeas/, /^Tasa para equilibrar/), h: `
         <p>Los cambios normales solo se hacen con la tasa <b>así de alta</b> (por defecto 1,2).</p>
         <p>¿Por qué alta? La tasa se recupera a ritmo fijo: cambiar 3000 a 0,85 o a 1,25 "gasta" lo mismo, pero a 1,25 recibes un 47 % más. Esperar a la tasa alta rinde mucho más.</p>` },
       { t: 'Tasa si se va a perder', find: inCard(/^Intercambio con aldeas/, /^Tasa si se va a perder/), h: `
         <p>Tasa mínima para un <b>rescate</b>: si un recurso va a rebosar en la próxima recolección, se cambia aunque la tasa sea baja (mejor 0,85 que perderlo).</p>
         ${AUTO('Con tasa menor que 1 solo rescata lo que de verdad se perdería, y solo si no cabe en otra ciudad (o la recolección es inminente).')}` },
+      { t: 'Cambiar con pérdida si sobra mucho', find: inCard(/^Intercambio con aldeas/, /^Cambiar con pérdida/), h: `
+        <p>Si una ciudad pasa de ese % del almacén en un recurso (85 % por defecto) y en <b>todo el imperio</b> sobra ese recurso mucho más que otro (15 puntos o más, ej. madera al 80 % y plata al 45 %), lo cambia por el que falta aunque la tasa sea baja (desde <b>0,6</b>).</p>
+        <p>Deja la ciudad un poco por debajo de ese % y nunca pasa de igualar los dos recursos.</p>` },
       { t: 'Traer de otras ciudades', find: inCard(/^Intercambio con aldeas/, /^Traer de otras/), h: `
         <p>Si una aldea con buena tasa pide, por ejemplo, madera y en esa isla no queda, el comercio <b>trae madera de una ciudad a la que le sobra</b> y, al llegar, se cambia.</p>
         <p>Solo si al imperio le sobra más ese recurso que el que da la aldea. Necesita <b>Comercio</b> y <b>Equilibrio</b> encendidos y solo lo hace cuando no hay encargos pendientes.</p>` },
       { t: 'Vista previa', find: () => TQ.txt('.nb-card-title', /^Próximos cambios|^Aldeas de/)?.parentElement || TQ.card(/^Intercambio con aldeas/), h: `
         <p>Las aldeas de tu ciudad actual con <b>su tasa para esta ciudad</b> (atenuadas si no llegan a la tasa para equilibrar) y los <b>próximos cambios</b> que haría en todo el imperio, con su tipo:</p>
-        <ul><li><b>equilibrar</b>: cambio normal con tasa alta.</li><li><b>rescate</b>: el recurso iba a rebosar.</li><li><b>alimentar</b>: cambia lo que el comercio trajo para esa aldea.</li></ul>
+        <ul><li><b>equilibrar</b>: cambio normal con tasa alta.</li><li><b>exceso</b>: sobra muchísimo de ese recurso; se cambia aunque la tasa sea baja.</li><li><b>rescate</b>: el recurso iba a rebosar.</li><li><b>alimentar</b>: cambia lo que el comercio trajo para esa aldea.</li></ul>
         <p>Si la <b>Cueva</b> está activa, solo se cambia por plata (para guardarla) y aparece el ajuste «Con Cueva: cambiar por plata lo que pase de…».</p>` },
       { t: 'Actividad', find: () => TQ.lastCard(/^Actividad/), h: `<p>Lo último que ha hecho: recolecciones, cambios con aldeas, errores. Cada pestaña tiene la suya.</p>` }
     ]);
@@ -6212,20 +6243,23 @@
       { t: 'Equilibrio entre ciudades', find: () => TQ.card(/^Equilibrio entre ciudades/), wide: true, h: `
         <p>Usa los comerciantes que sobran para que <b>no se pierda nada</b> y cada ciudad tenga de todo. Va <b>siempre detrás de los encargos</b>: solo actúa en las vueltas en que el comercio no tiene nada que enviar.</p>
         <p>La etiqueta dice en qué modo está:</p>
-        <ul><li><b>encargos en curso</b>: alguna ciudad espera recursos → solo evita pérdidas, con poca parte de los comerciantes y sin tocar lo que alguien espera.</li>
-        <li><b>encargos a punto</b>: algo empieza pronto (hueco de cola, lote, festival que termina) → evita pérdidas y <b>adelanta</b> a esa ciudad lo que le va a faltar.</li>
-        <li><b>libre</b>: también iguala ciudades y trae recursos a las aldeas con buena tasa.</li></ul>` },
+        <ul><li><b>encargos en curso</b>: alguna ciudad espera recursos → evita pérdidas e iguala con poca parte de los comerciantes (20 %), sin tocar lo que alguien espera.</li>
+        <li><b>encargos a punto</b>: algo empieza pronto (hueco de cola, lote, festival que termina) → además <b>adelanta</b> a esa ciudad lo que le va a faltar.</li>
+        <li><b>libre</b>: usa más comerciantes (60 %) y también trae recursos a las aldeas con buena tasa.</li></ul>` },
+      { t: 'Igualar ciudades', find: inCard(/^Equilibrio entre ciudades/, /^Igualar ciudades/), h: `
+        <p>Si una ciudad tiene mucho de un recurso y otra poco, lo reparte. Compara con la <b>media del imperio</b>: las que pasan de la media + tolerancia dan a las que están por debajo de la media − tolerancia.</p>
+        ${AUTO('La tolerancia se adapta: con el imperio muy lleno se estrecha por arriba (con todo al 78 %, dan las que pasan del 89 % y reciben las que están por debajo del 65 %). Con encargos pendientes o a punto también iguala, pero solo con la parte pequeña de comerciantes.')}` },
       { t: 'Evitar pérdidas al recolectar', find: () => { const c = TQ.card(/^Equilibrio entre ciudades/); return c ? (TQ.txt('.nb-alert', /Rebosaría|Ninguna ciudad rebosa/, c) || c) : null; }, h: `
         ${AUTO(`<ul><li>Calcula el <b>botín de la próxima recolección</b> de cada ciudad (de cada recurso) + lo que produce + lo que le llega.</li>
         <li>Si no cabría, manda lo que sobra a ciudades con sitio: primero a las que lo van a necesitar, luego a las que menos tienen.</li>
         <li>Deja la ciudad en su «línea de seguridad»: sitio para 2 recolecciones y media hora de producción.</li></ul>`)}
         <p>Aquí ves qué ciudades rebosarían ahora mismo y cuánto.</p>` },
       { t: 'Ajustes del equilibrio', find: () => { const c = TQ.card(/^Equilibrio entre ciudades/); return c ? (TQ.row(/^Comerciantes con encargos/, c)?.parentElement || c) : null; }, h: `
-        <ul><li><b>Igualar ciudades</b>: si una tiene mucho de un recurso y otra poco, lo reparte (solo en modo libre).</li>
+        <ul><li><b>Igualar ciudades</b>: si una tiene mucho de un recurso y otra poco, lo reparte.</li>
         <li><b>Comerciantes con encargos</b> (20 %): lo que puede usar como mucho cada ciudad cuando hay encargos pendientes o a punto; el resto queda libre.</li>
         <li><b>Comerciantes sin encargos</b> (60 %).</li>
         <li><b>Encargos «a punto»</b>: qué se considera "pronto" (30 min).</li>
-        <li><b>Tolerancia</b>: al igualar, cuánto puede separarse una ciudad de la media del imperio antes de mover nada.</li>
+        <li><b>Tolerancia por arriba / por abajo</b>: al igualar, cuánto puede pasarse una ciudad de la media del imperio antes de dar (20) o quedarse corta antes de recibir (13).</li>
         <li><b>Viaje máximo</b>, <b>envío mínimo al igualar</b> y <b>envíos por vuelta</b>.</li></ul>` },
       { t: 'Qué haría ahora', find: () => TQ.txt('.nb-card-title', /^Ahora movería/)?.parentElement || TQ.card(/^Equilibrio entre ciudades/), h: `
         <p>El llenado medio del imperio por recurso, los <b>encargos a punto</b> (si hay) y la lista de envíos que haría ahora, con su tipo: <b>Evitar pérdida</b>, <b>Adelantar encargo</b>, <b>Para cambiar en aldea</b> o <b>Equilibrio</b>.</p>` },
@@ -6300,7 +6334,7 @@
     add('Resumen final', 'inicio', [
       { t: 'Lo que el bot hace solo (todo junto)', wide: true, h: `
         <ul><li><b>Granjas</b>: recolecta todas las islas en una petición; cada isla, la ciudad que menos pierde.</li>
-        <li><b>Aldeas</b> (cada minuto): cambios con tasa alta para equilibrar; rescates si algo va a rebosar.</li>
+        <li><b>Aldeas</b> (cada minuto): cambios con tasa alta para equilibrar; con tasa baja (desde 0,6) si sobra muchísimo de algo; rescates si algo va a rebosar.</li>
         <li><b>Construcción / Investigación / Reclutamiento</b> (cada 15 s): encargan lo siguiente sin cambiar de ciudad.</li>
         <li><b>Comercio</b> (cada 10 s): manda lo que falta para los encargos; después, el <b>equilibrio</b> evita pérdidas, adelanta encargos e iguala.</li>
         <li><b>Festivales</b> (cada 10 s) y <b>Cueva</b> (cada 2 min).</li>
@@ -6319,6 +6353,64 @@
         ${TIP('Puedes volver a este tour cuando quieras con el botón <b>?</b> de la cabecera, entero o por apartados.')}` }
     ]);
     return S;
+  }
+
+
+  /* Novedades por versión — REGLA: cada cambio que se note en el bot se apunta aquí
+     (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
+     verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
+  const TOUR_NEWS = [
+    { v: '1.12.3', items: [
+      { t: 'Novedades en la ayuda', find: () => TQ.sel('.nb-help-btn'), h: `<p>Cada vez que el bot se actualiza, te enseña aquí lo que ha cambiado, paso a paso. También lo tienes en <b>?</b> → <b>Novedades</b>.</p>` }
+    ] },
+    { v: '1.12.2', items: [
+      { t: 'Tolerancia por abajo', tab: 'comercio', find: () => { const c = TQ.card(/^Equilibrio entre ciudades/); return c ? (TQ.row(/^Tolerancia por abajo/, c) || c) : null; }, h: `<p>Al igualar, ahora <b>reciben</b> las ciudades que están por debajo de la media del imperio − 13 puntos (con la media al 78 %, las que tienen menos del <b>65 %</b>). Antes era el 58 %.</p>` }
+    ] },
+    { v: '1.12.1', items: [
+      { t: 'Igualar también con encargos', tab: 'comercio', find: () => { const c = TQ.card(/^Equilibrio entre ciudades/); return c ? (TQ.row(/^Igualar ciudades/, c) || c) : null; }, h: `
+        <p>Antes solo se igualaba cuando no había nada pendiente, y con 20+ ciudades casi nunca pasaba. Ahora iguala <b>siempre</b>; con encargos, solo con el 20 % de los comerciantes y sin tocar lo que alguien espera.</p>
+        <p>La tolerancia por arriba se adapta a lo lleno que esté el imperio: con todo al 78 %, dan las ciudades que pasan del <b>89 %</b> (antes hacía falta pasar del 98 %).</p>` },
+      { t: 'Cambiar con pérdida si sobra mucho', tab: 'granjas', find: inCard(/^Intercambio con aldeas/, /^Cambiar con pérdida/), h: `
+        <p>Si una ciudad pasa del <b>85 %</b> de un recurso y en todo el imperio sobra ese recurso mucho más que otro (p. ej. madera 78 % y plata 49 %), lo cambia en las aldeas por el que falta aunque la tasa sea baja (desde <b>0,6</b>). Los dos números se pueden cambiar.</p>` }
+    ] },
+    { v: '1.12.0', items: [
+      { t: 'Tour guiado', find: () => TQ.sel('.nb-help-btn'), h: `<p>El botón <b>?</b> enseña todo el bot paso a paso, entero o por apartados.</p>` }
+    ] },
+    { v: '1.11.0', items: [
+      { t: 'Los encargos van primero', tab: 'comercio', find: () => TQ.card(/^Equilibrio entre ciudades/), h: `
+        <p>El equilibrio solo actúa en las vueltas en que el comercio no tiene nada que enviar para encargos, y con encargos pendientes o a punto deja libre el <b>80 %</b> de los comerciantes (ajustable).</p>
+        <p><b>Adelantar encargos</b>: si algo empieza pronto (hueco en la cola de construcción, lote de tropas, festival que termina), le lleva antes lo que le va a faltar. La lista sale en <b>Encargos a punto</b>.</p>` }
+    ] },
+    { v: '1.10.1', items: [
+      { t: 'Qué abastece el comercio: solo en Comercio', tab: 'comercio', find: () => TQ.card(/^Comercio automático/), h: `<p>Los interruptores de abastecer (construcción, reclutamiento, investigación y ahora también <b>festivales</b>) están solo aquí; se quitaron de Reclutamiento y Festivales.</p>` }
+    ] },
+    { v: '1.10.0', items: [
+      { t: 'Equilibrio entre ciudades', tab: 'comercio', find: () => TQ.card(/^Equilibrio entre ciudades/), h: `
+        <p>Nuevo: antes de cada recolección calcula el botín de cada ciudad y lo que no cabría lo manda a otras ciudades con sitio. También reparte entre ciudades y trae recursos a las aldeas que tienen buena tasa.</p>` },
+      { t: 'Intercambio con aldeas más listo', tab: 'granjas', find: () => TQ.card(/^Intercambio con aldeas/), h: `
+        <ul><li>Calcula la <b>tasa real de cada ciudad</b> (antes usaba la de la ciudad abierta y el +0,1 de la Oficina comercial engañaba).</li>
+        <li>Los cambios normales, solo con <b>tasa alta</b> (rinde mucho más); con tasa baja solo si se iba a perder.</li>
+        <li><b>Traer de otras ciudades</b> lo que pide una aldea con buena tasa.</li></ul>` },
+      { t: 'Granjas: recolecta la que menos pierde', tab: 'granjas', find: () => TQ.card(/^Recolección automática/), h: `<p>En islas con varias ciudades, recolecta la que menos perdería por tener el almacén lleno.</p>` }
+    ] }
+  ];
+  const vNum = (v) => String(v || '0').split('.').map((n) => +n || 0).reduce((a, n) => a * 1000 + n, 0);
+  const newsSince = (seen) => TOUR_NEWS.filter((n) => vNum(n.v) > vNum(seen));
+  function newsSteps(seen = '') {
+    const list = newsSince(seen);
+    if (!list.length) return [];
+    const out = [{ ch: 'Novedades', t: `Novedades${seen ? ` desde la v${seen}` : ''}`, wide: true, h: `
+      <p>Lo que ha cambiado, versión a versión. Ahora te lo enseño en el panel.</p>
+      <ul>${list.map((n) => `<li><b>v${n.v}</b>: ${n.items.map((i) => i.t).join(' · ')}</li>`).join('')}</ul>` }];
+    for (const n of list) for (const i of n.items) out.push({ ch: 'Novedades', tab: i.tab || 'inicio', ...i, t: `v${n.v} · ${i.t}` });
+    return out;
+  }
+  function markNewsSeen() { if (state.newsSeen !== VERSION) { state.newsSeen = VERSION; saveState(); } }
+  // Al arrancar / abrir: primera vez → bienvenida; tras actualizar → novedades.
+  function tourAutoOffer() {
+    if (!state.open || tour.active || tour.menu) return;
+    if (!state.tourSeen) { tourMenu(true); return; }
+    if (state.newsSeen !== VERSION && newsSince(state.newsSeen || '').length) tourMenu('news');
   }
 
   // ---- Motor ----
@@ -6464,6 +6556,7 @@
     if (sv.resumenView !== undefined) state.resumenView = sv.resumenView;
     if (sv.atkView) atk.view = sv.atkView;
     state.tourSeen = true;
+    if (tour.steps.some((x) => x.ch === 'Novedades') || !state.newsSeen) state.newsSeen = VERSION;
     saveState();
     try { buildTabs(); } catch {}
     renderBodyNow();
@@ -6472,7 +6565,10 @@
   // Índice: tour completo, solo la pestaña actual o un apartado.
   function tourMenu(welcome = false) {
     tourCss();
+    const isNews = welcome === 'news';
+    if (isNews) welcome = false;
     const steps = tourSteps();
+    const news = newsSteps(isNews ? (state.newsSeen || '') : '');
     const chapters = [];
     for (const s of steps) if (!chapters.some((c) => c.ch === s.ch)) chapters.push({ ch: s.ch, tab: s.tab, n: steps.filter((x) => x.ch === s.ch).length });
     const wasActive = tour.active;
@@ -6483,20 +6579,26 @@
     const block = el('div', { class: 'nb-tour-block' });
     const tabCh = chapters.find((c) => c.tab === state.activeTab && c.ch !== 'El panel' && c.ch !== 'Resumen final');
     const go = (list) => { tourMenuClose(false); tourStart(list, 0); };
+    const goNews = () => { markNewsSeen(); go(news); };
     const card = el('div', { class: 'nb-tour-card nb-tour-wide' }, [
       el('div', { class: 'nb-tour-top' }, [
-        el('div', {}, [el('div', { class: 'nb-tour-ch' }, 'Tour guiado'), el('div', { class: 'nb-tour-title' }, welcome ? '¿Primera vez con NOVABOT?' : '¿Qué quieres ver?')]),
+        el('div', {}, [el('div', { class: 'nb-tour-ch' }, isNews ? 'Actualización' : 'Tour guiado'), el('div', { class: 'nb-tour-title' }, isNews ? `NOVABOT se ha actualizado a la v${VERSION}` : welcome ? '¿Primera vez con NOVABOT?' : '¿Qué quieres ver?')]),
         el('span', { class: 'nb-tour-x', title: 'Cerrar (Esc)', onclick: () => tourMenuClose(true) }, '×')
       ]),
-      el('div', { class: 'nb-tour-body', html: welcome
+      el('div', { class: 'nb-tour-body', html: isNews
+        ? `<p>Esto es lo nuevo:</p><ul>${newsSince(state.newsSeen || '').map((n) => `<li><b>v${n.v}</b>: ${n.items.map((i) => i.t).join(' · ')}</li>`).join('')}</ul>`
+        : welcome
         ? '<p>Te enseño el bot paso a paso: cada pestaña, cada opción y lo que hace solo por detrás. No cambia nada de tu configuración.</p>'
-        : '<p>El tour completo recorre todo en orden. También puedes ver solo un apartado.</p>' }),
+        : '<p>El tour completo recorre todo en orden. También puedes ver solo un apartado o las novedades de cada versión.</p>' }),
       el('div', { class: 'nb-tour-foot', style: 'margin-top:4px' }, [
-        el('span', { class: 'nb-tour-btn primary', onclick: () => go(steps) }, `Tour completo (${steps.length} pasos)`),
-        tabCh ? el('span', { class: 'nb-tour-btn', onclick: () => go(steps.filter((s) => s.ch === tabCh.ch)) }, `Solo ${tabCh.ch}`) : null,
+        isNews ? el('span', { class: 'nb-tour-btn primary', onclick: goNews }, `Ver novedades (${news.length} pasos)`) : null,
+        isNews ? el('span', { class: 'nb-tour-btn', onclick: () => { markNewsSeen(); tourMenuClose(true); } }, 'Ahora no') : null,
+        !isNews ? el('span', { class: 'nb-tour-btn primary', onclick: () => go(steps) }, `Tour completo (${steps.length} pasos)`) : null,
+        tabCh && !isNews ? el('span', { class: 'nb-tour-btn', onclick: () => go(steps.filter((s) => s.ch === tabCh.ch)) }, `Solo ${tabCh.ch}`) : null,
+        !isNews && news.length ? el('span', { class: 'nb-tour-btn', onclick: goNews }, 'Novedades') : null,
         welcome ? el('span', { class: 'nb-tour-btn', onclick: () => tourMenuClose(true) }, 'Ahora no') : null
       ]),
-      el('div', { class: 'nb-tour-chapters' }, chapters.map((c) => el('div', { class: `nb-tour-chapter${c.ch === curCh ? ' cur' : ''}`, onclick: () => go(steps.filter((s) => s.ch === c.ch)) }, [
+      isNews ? null : el('div', { class: 'nb-tour-chapters' }, chapters.map((c) => el('div', { class: `nb-tour-chapter${c.ch === curCh ? ' cur' : ''}`, onclick: () => go(steps.filter((s) => s.ch === c.ch)) }, [
         el('b', {}, c.ch), el('small', {}, `${c.n} paso${c.n > 1 ? 's' : ''}`)
       ])))
     ]);
@@ -6522,6 +6624,7 @@
       } else {
         document.removeEventListener('keydown', tourKey, true);
         if (!state.tourSeen) { state.tourSeen = true; saveState(); }
+        markNewsSeen();
       }
     }
   }
@@ -6884,7 +6987,7 @@
     }
     buildUI();
     window.addEventListener('resize', () => { applyPanelSize(); applyPanelPosition(); applyFabPosition(); });
-    if (!state.tourSeen && state.open) setTimeout(() => { if (state.open && !tour.active && !tour.menu) tourMenu(true); }, 2500);
+    setTimeout(tourAutoOffer, 2500);
     startFarmEngine();
     startOverviewSync();
     startBuildEngine();
