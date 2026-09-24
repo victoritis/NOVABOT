@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.12.3
+// @version      1.12.4
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.12.3';
+  const VERSION = '1.12.4';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -256,6 +256,8 @@
     state = loadState();
     if (state.layoutV !== 2) { state.size = null; state.pos = null; state.layoutV = 2; }
     // v1.9.4: el % de "sobra" del intercambio con aldeas pasa de 80 a 70 (una vez).
+    // El festival evento está oculto: quien lo tenía puesto vuelve a los festivales normales.
+    if (!FEST_EVENT_ON && state.festivales?.event) { state.festivales.event = false; state.festivales.enabled = true; saveState(); }
     if (!state.aldeas.v70) { if (+state.aldeas.excessPct === 80) state.aldeas.excessPct = 70; state.aldeas.v70 = true; saveState(); }
     return true;
   }
@@ -648,7 +650,7 @@
       mod('construccion', 'Construcción', state.construccion, 'Sube edificios por objetivos'),
       mod('reclutamiento', 'Reclutamiento', state.reclutamiento, 'Lotes que llenan el almacén'),
       mod('comercio', 'Comercio', state.comercio, 'Reparte recursos entre ciudades'),
-      mod('festivales', 'Festivales', state.festivales, state.festivales.event ? 'Festival evento activo (normales apagados)' : 'Academia 30+, sin festival en curso'),
+      mod('festivales', 'Festivales', state.festivales, FEST_EVENT_ON && state.festivales.event ? 'Festival evento activo (normales apagados)' : 'Academia 30+, sin festival en curso'),
       (() => {
         const nx = nextPending();
         const n = atk.queue.filter((a) => a.status === 'pending').length;
@@ -5819,15 +5821,20 @@
     } catch {}
     return null;
   }
+  // "Festival evento" OCULTO (el evento terminó, 25/09/2026). El código se queda: si el
+  // juego vuelve a sacar la «Temporada de festivales», basta con poner esto a true
+  // (vuelve la tarjeta, su paso del tour y el modo evento).
+  const FEST_EVENT_ON = false;
   // Festival que toca ahora: el del evento (si está elegido y activo) o el normal.
   function festCfg() {
     const f = state.festivales;
+    if (!FEST_EVENT_ON) return f.enabled ? { cost: FESTIVAL_COST, academy: FESTIVAL_ACADEMY, hours: 6, event: false } : null;
     if (f.event) { const e = partyEvent(); return e ? { ...e, event: true } : null; }
     if (f.enabled) return { cost: FESTIVAL_COST, academy: FESTIVAL_ACADEMY, hours: 6, event: false };
     return null;
   }
   const festCost = () => festCfg()?.cost || FESTIVAL_COST;
-  const festAcademy = () => festCfg()?.academy ?? (state.festivales.event ? (partyEvent()?.academy ?? 5) : FESTIVAL_ACADEMY);
+  const festAcademy = () => festCfg()?.academy ?? (FEST_EVENT_ON && state.festivales.event ? (partyEvent()?.academy ?? 5) : FESTIVAL_ACADEMY);
   const canFestival = (townId) => academyLevel(townId) >= festAcademy();
   // (tras iniciarlo, hasta que el juego actualice sus datos, se da por en marcha)
   const festivalPending = (townId) => !!festCfg() && canFestival(townId) && !festivalEnd(townId) && !((festRuntime.startedUntil.get(+townId) || 0) > Date.now());
@@ -5891,9 +5898,9 @@
       el('p', { class: 'nb-placeholder' }, `Solo ciudades con Academia ${FESTIVAL_ACADEMY}+ y sin festival en curso. Coste: 15 000 madera · 18 000 piedra · 15 000 plata.`)
     ]));
 
-    // Festival evento ("Temporada de festivales")
-    const ev = partyEvent();
-    bodyEl.appendChild(el('div', { class: `nb-card${cfg.event ? ' nb-card-accent' : ''}` }, [
+    // Festival evento ("Temporada de festivales") — oculto mientras FEST_EVENT_ON = false.
+    const ev = FEST_EVENT_ON ? partyEvent() : null;
+    if (FEST_EVENT_ON) bodyEl.appendChild(el('div', { class: `nb-card${cfg.event ? ' nb-card-accent' : ''}` }, [
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, [el('b', {}, 'Festival evento')]),
         switchEl(!!cfg.event, (v) => { cfg.event = v; if (v) cfg.enabled = false; saveState(); renderBody(); festLog(v ? 'Festival evento activado (festivales normales desactivados).' : 'Festival evento desactivado.'); }, false)]),
       ev
@@ -6275,9 +6282,10 @@
       { t: 'Festivales automáticos', find: () => TQ.card(/^Festivales automáticos/), h: `
         <p>Ciudades con <b>Academia 30+</b> y sin festival en curso. Coste 15 000 madera · 18 000 piedra · 15 000 plata.</p>
         ${AUTO('Cada 10 s: en cuanto una ciudad tiene los recursos (y no están reservados por la prioridad) lo lanza. El comercio le manda justo lo que falta si tienes «Abastecer festivales» encendido.')}` },
-      { t: 'Festival evento', find: () => TQ.card(/^Festival evento/), h: `
+      // (oculto con el festival evento: vuelve solo al poner FEST_EVENT_ON = true)
+      ...(FEST_EVENT_ON ? [{ t: 'Festival evento', find: () => TQ.card(/^Festival evento/), h: `
         <p>Para la <b>Temporada de festivales</b> del juego: usa el coste, la Academia y la duración del evento. Al encenderlo se apagan los festivales normales.</p>
-        <p>Si ahora no hay evento, no hace nada hasta que empiece.</p>` },
+        <p>Si ahora no hay evento, no hace nada hasta que empiece.</p>` }] : []),
       { t: 'Ciudades aptas', find: () => TQ.card(/^Ciudades aptas/), h: `<p>Estado de cada ciudad: en curso (cuenta atrás), listo, cuánto falta y lo que ya viene de camino, o si está esperando por la prioridad.</p>` }
     ]);
 
@@ -6360,6 +6368,9 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.12.4', items: [
+      { t: 'Festivales: vuelven los normales', tab: 'festivales', find: () => TQ.card(/^Festivales automáticos/), h: `<p>La «Temporada de festivales» terminó: se quita la opción <b>Festival evento</b> y, si la tenías puesta, se vuelve a los <b>festivales normales</b> (Academia 30+, 15 000 / 18 000 / 15 000).</p>` }
+    ] },
     { v: '1.12.3', items: [
       { t: 'Novedades en la ayuda', find: () => TQ.sel('.nb-help-btn'), h: `<p>Cada vez que el bot se actualiza, te enseña aquí lo que ha cambiado, paso a paso. También lo tienes en <b>?</b> → <b>Novedades</b>.</p>` }
     ] },
