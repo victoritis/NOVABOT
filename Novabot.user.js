@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.8.8
+// @version      1.8.9
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,8 +54,12 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.8.8';
+  const VERSION = '1.8.9';
   const STORAGE_KEY = 'novabot_ui_state_v1';
+  // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
+  // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
+  let ACCOUNT = '';
+  const acctKey = (k) => (ACCOUNT ? `${k}__${ACCOUNT}` : k);
 
   // Evita cargar el script dos veces si Tampermonkey lo reinyecta.
   if (UW.__NOVABOT_ACTIVE__) return;
@@ -171,7 +175,7 @@
 
   function loadState() {
     try {
-      const raw = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
+      const raw = JSON.parse(localStorage.getItem(acctKey(STORAGE_KEY)) || 'null');
       if (raw && typeof raw === 'object') {
         const def = defaultState();
         const out = { ...def, ...raw };
@@ -185,13 +189,33 @@
   }
 
   function saveState() {
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch {}
+    try { localStorage.setItem(acctKey(STORAGE_KEY), JSON.stringify(state)); } catch {}
     try { cloudMarkDirty(); } catch {}
   }
 
   let state = loadState();
   // v1.6.1: panel más grande por defecto → se olvida una vez el tamaño guardado.
-  if (state.layoutV !== 2) { state.size = null; state.pos = null; state.layoutV = 2; try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch {} }
+  if (state.layoutV !== 2) { state.size = null; state.pos = null; state.layoutV = 2; }
+  // Se llama al arrancar, en cuanto se conoce la cuenta: carga SU configuración.
+  // La de versiones anteriores (una sola para todo el PC) se la queda la primera
+  // cuenta que arranque con esta versión.
+  function bindAccount() {
+    const w = UW.Game?.world_id, pid = UW.Game?.player_id;
+    if (!w || !pid) return false;
+    ACCOUNT = `${w}_${pid}`;
+    try {
+      if (!localStorage.getItem('novabot_legacy_owner')) {
+        localStorage.setItem('novabot_legacy_owner', ACCOUNT);
+        for (const k of [STORAGE_KEY, 'novabot_attacks_v2']) {
+          const old = localStorage.getItem(k);
+          if (old !== null && localStorage.getItem(acctKey(k)) === null) localStorage.setItem(acctKey(k), old);
+        }
+      }
+    } catch {}
+    state = loadState();
+    if (state.layoutV !== 2) { state.size = null; state.pos = null; state.layoutV = 2; }
+    return true;
+  }
 
   /* ---------------------------------------------------------------------------------
      4) ESTILOS — carga novabot.css declarado en @resource y lo inyecta.
@@ -3267,10 +3291,9 @@
       if (!recruitEnabledFor(townId)) continue;
       const tc = townRecruitCfg(townId);
       if (tc.startAt && tc.startAt <= Date.now()) { delete tc.startAt; saveState(); recruitLog(`${farmTownName(townId)}: empieza el reclutamiento programado.`, 'ok'); }
-      // Con órdenes ya en cola, mantener sus hechizos activos (aceleran lo que hay en cola).
-      if (tc.spells) for (const kind of ['ground', 'naval']) {
-        if (townUnitOrders(townId).some((o) => (o.kind === 'naval') === (kind === 'naval'))) await ensureRecruitSpells(townId, kind);
-      }
+      // (Los hechizos NO se lanzan por lo que ya está en la cola del juego: solo
+      // afectan a lo que se recluta después, así que se lanzan justo antes de
+      // mandar un lote del bot — ver abajo.)
       if (!townRecruitCfg(townId).goals.length || !unitQueueFree(townId)) continue;
       if ((recruitRuntime.cooldown.get(townId) || 0) > Date.now()) continue;
       // (recruitBatch sin atMs = huecos de ahora mismo)
@@ -3282,8 +3305,9 @@
       if (RES.some((k) => cur[k] - fr[k] < b.cost[k])) continue;
       if (b.favor && godFavor(townGod(townId)) < b.favor) continue;
       // Hechizos del cuartel / puerto: los obligatorios deben estar activos antes de reclutar.
-      const lotKind = isNavalUnit(Object.keys(b.units)[0]) ? 'naval' : 'ground';
-      const waitSpell = await ensureRecruitSpells(townId, lotKind);
+      const lotKinds = [...new Set(Object.entries(b.units).filter(([, n]) => n > 0).map(([u]) => (isNavalUnit(u) ? 'naval' : 'ground')))];
+      let waitSpell = null;
+      for (const kind of lotKinds) { waitSpell = await ensureRecruitSpells(townId, kind); if (waitSpell) break; }
       if (waitSpell) { if (recruitRuntime.wait.get(townId) !== waitSpell) { recruitRuntime.wait.set(townId, waitSpell); renderIfIdle('reclutamiento'); } continue; }
       recruitRuntime.wait.delete(townId);
       for (const [unitId, amount] of Object.entries(b.units)) {
@@ -3920,10 +3944,10 @@
   }
 
   // ---------- cola ----------
-  function atkLoad() { try { atk.queue = JSON.parse(localStorage.getItem(ATK_KEY) || '[]'); } catch { atk.queue = []; } }
+  function atkLoad() { try { atk.queue = JSON.parse(localStorage.getItem(acctKey(ATK_KEY)) || '[]'); } catch { atk.queue = []; } }
   function atkSave() {
     // (los campos "_" son de esta sesión: precarga, armado… no se guardan)
-    try { localStorage.setItem(ATK_KEY, JSON.stringify(atk.queue.map((a) => Object.fromEntries(Object.entries(a).filter(([k]) => !k.startsWith('_')))))); } catch {}
+    try { localStorage.setItem(acctKey(ATK_KEY), JSON.stringify(atk.queue.map((a) => Object.fromEntries(Object.entries(a).filter(([k]) => !k.startsWith('_')))))); } catch {}
     try { cloudMarkDirty(); } catch {}
   }
   const atkCorrection = () => clamp(+state.ataques?.correctionMs || 0, -1500, 1500);
@@ -5042,11 +5066,39 @@
   const gmGet = (k, d = '') => { try { return typeof GM_getValue === 'function' ? GM_getValue(k, d) : d; } catch { return d; } };
   const gmSet = (k, v) => { try { if (typeof GM_setValue === 'function') GM_setValue(k, v); } catch {} };
   const cloud = {
-    token: gmGet('nb_cloud_token'), pass: gmGet('nb_cloud_pass'), gistId: gmGet('nb_cloud_gist'),
+    token: '', pass: '', gistId: '', booting: false, // credenciales POR CUENTA: se cargan en cloudLoadCreds()
     pcId: gmGet('nb_pc_id') || (() => { const id = Math.random().toString(36).slice(2, 10); gmSet('nb_pc_id', id); return id; })(),
     status: '', error: '', lastPush: 0, lastPull: 0, remoteAt: 0, dirty: false, applying: false, busy: false, pushTimer: null, pollTimer: null, started: false
   };
-  const cloudOn = () => !!(cloud.token && cloud.pass && cloud.gistId);
+  const cloudOn = () => !!(ACCOUNT && cloud.token && cloud.pass && cloud.gistId);
+  // Credenciales de ESTA cuenta (otra cuenta en el mismo PC sale desconectada).
+  function cloudLoadCreds() {
+    cloud.token = gmGet(acctKey('nb_cloud_token')); cloud.pass = gmGet(acctKey('nb_cloud_pass')); cloud.gistId = gmGet(acctKey('nb_cloud_gist'));
+  }
+  function cloudSaveCreds() {
+    gmSet(acctKey('nb_cloud_token'), cloud.token); gmSet(acctKey('nb_cloud_pass'), cloud.pass); gmSet(acctKey('nb_cloud_gist'), cloud.gistId);
+  }
+  // Momento del último cambio local aún SIN subir (sobrevive a recargas).
+  const cloudDirtyAt = () => +gmGet(acctKey('nb_cloud_dirty_at'), 0) || 0;
+  // Al arrancar: SIEMPRE se baja primero lo de la nube (antes de que los módulos
+  // empiecen). Solo se sube lo local si tiene cambios sin subir más nuevos que la nube.
+  async function cloudBoot() {
+    if (!cloudOn()) return;
+    cloud.booting = true; cloud.busy = true; cloud.status = 'Bajando de la nube…'; paintCloudStatus();
+    let pushLocal = false;
+    try {
+      const r = await cloudReadRemote();
+      cloud.lastPull = Date.now(); cloud.error = '';
+      const localAt = cloudDirtyAt();
+      if (r && !(localAt > +r.updatedAt)) {
+        cloudApply(r); cloud.dirty = false; gmSet(acctKey('nb_cloud_dirty_at'), 0);
+        cloud.status = `Cargado de la nube al iniciar (${new Date(+r.updatedAt).toLocaleTimeString('es-ES')})`;
+      } else pushLocal = true;
+    } catch (e) { cloud.error = e.message; }
+    finally { cloud.busy = false; cloud.booting = false; }
+    if (pushLocal) { cloud.dirty = true; await cloudPush(); }
+    paintCloudStatus();
+  }
   const cloudFile = () => `novabot_${UW.Game?.world_id || 'mundo'}_${UW.Game?.player_id || 'jugador'}.json`;
 
   function ghApi(method, path, body) {
@@ -5115,16 +5167,20 @@
   function cloudMarkDirty() {
     if (cloud.applying || !cloudOn()) return;
     cloud.dirty = true;
+    if (!cloudDirtyAt()) gmSet(acctKey('nb_cloud_dirty_at'), Date.now());
+    if (cloud.booting) return; // no subir nada hasta haber bajado lo de la nube
     clearTimeout(cloud.pushTimer);
     cloud.pushTimer = setTimeout(cloudPush, 8000);
   }
   async function cloudPush() {
-    if (!cloudOn() || cloud.busy) { if (cloudOn()) cloud.pushTimer = setTimeout(cloudPush, 5000); return; }
+    if (!cloudOn() || cloud.booting) return;
+    if (cloud.busy) { if (cloudOn()) cloud.pushTimer = setTimeout(cloudPush, 5000); return; }
     cloud.busy = true;
     try {
       const content = await cloudEncrypt(cloudPayload());
       await ghApi('PATCH', `/gists/${cloud.gistId}`, { files: { [cloudFile()]: { content } } });
       cloud.dirty = false; cloud.lastPush = Date.now(); cloud.error = ''; cloud.status = 'Sincronizado';
+      gmSet(acctKey('nb_cloud_dirty_at'), 0);
     } catch (e) { cloud.error = e.message; cloud.pushTimer = setTimeout(cloudPush, 60000); }
     finally { cloud.busy = false; paintCloudStatus(); }
   }
@@ -5170,21 +5226,21 @@
         if (r) { cloudApply(r); cloud.status = 'Conectado: configuración cargada de la nube'; }
         else { cloud.busy = false; await cloudPush(); cloud.status = 'Conectado: configuración de este PC subida a la nube'; }
       }
-      gmSet('nb_cloud_token', cloud.token); gmSet('nb_cloud_pass', cloud.pass); gmSet('nb_cloud_gist', cloud.gistId);
-      startCloudSync();
+      cloudSaveCreds(); gmSet(acctKey('nb_cloud_dirty_at'), 0);
+      startCloudSync(true);
     } catch (e) { cloud.error = e.message; cloud.status = ''; cloud.gistId = ''; }
     renderIfIdle('inicio'); paintCloudStatus();
   }
   function cloudDisconnect() {
     clearTimeout(cloud.pushTimer); clearInterval(cloud.pollTimer); cloud.pollTimer = null; cloud.started = false;
     cloud.token = cloud.pass = cloud.gistId = ''; cloud.status = ''; cloud.error = '';
-    gmSet('nb_cloud_token', ''); gmSet('nb_cloud_pass', ''); gmSet('nb_cloud_gist', '');
+    cloudSaveCreds();
     renderIfIdle('inicio');
   }
-  function startCloudSync() {
+  function startCloudSync(alreadySynced = false) {
     if (!cloudOn() || cloud.started) return;
     cloud.started = true;
-    cloudPull();
+    if (!alreadySynced) cloudPull();
     cloud.pollTimer = setInterval(() => cloudPull(), 60000);
     window.addEventListener('beforeunload', () => { if (cloud.dirty) cloudPush(); });
   }
@@ -5227,6 +5283,13 @@
 
   async function init() {
     await waitFor(() => !!document.body);
+    // Primero la cuenta (su configuración) y, si tiene nube, bajar de la nube ANTES de
+    // arrancar ningún módulo.
+    await waitFor(() => !!(UW.Game && UW.Game.player_id && UW.Game.world_id), 30000);
+    if (bindAccount()) {
+      cloudLoadCreds();
+      if (cloudOn()) await Promise.race([cloudBoot(), sleep(25000)]);
+    }
     buildUI();
     window.addEventListener('resize', () => { applyPanelSize(); applyPanelPosition(); applyFabPosition(); });
     startFarmEngine();
@@ -5238,7 +5301,7 @@
     startRecruitEngine();
     startAttackEngine();
     startFestivalEngine();
-    waitFor(() => !!(UW.Game && UW.Game.player_id)).then(startCloudSync);
+    if (cloudOn()) startCloudSync(true);
 
     // En cuanto el cliente del juego termine de cargar, refresca el nombre de ciudad.
     waitFor(() => !!(UW.Game && UW.ITowns)).then(() => {
