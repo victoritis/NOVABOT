@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.9.3
+// @version      1.9.4
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.9.3';
+  const VERSION = '1.9.4';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -177,7 +177,7 @@
       aldeas: {
         enabled: false,       // intercambio de recursos con las aldeas de la isla
         minRatio: 0.85,       // solo si por cada 1 que doy me dan al menos esto
-        excessPct: 80         // "sobra" lo que pasa de este % del almacén
+        excessPct: 70         // "sobra" lo que pasa de este % del almacén
       },
       comercio: {
         enabled: true,        // general, no por ciudad
@@ -236,6 +236,8 @@
     } catch {}
     state = loadState();
     if (state.layoutV !== 2) { state.size = null; state.pos = null; state.layoutV = 2; }
+    // v1.9.4: el % de "sobra" del intercambio con aldeas pasa de 80 a 70 (una vez).
+    if (!state.aldeas.v70) { if (+state.aldeas.excessPct === 80) state.aldeas.excessPct = 70; state.aldeas.v70 = true; saveState(); }
     return true;
   }
 
@@ -1451,7 +1453,7 @@
   function exPlanTown(townId, E, cfg = state.aldeas) {
     const c = E.ctx[townId];
     if (!c || !c.storage) return { why: 'almacén desconocido' };
-    const pct = clamp(+cfg.excessPct || 80, 10, 100) / 100;
+    const pct = clamp(+cfg.excessPct || 70, 10, 100) / 100;
     const minRatio = Math.max(0.1, +cfg.minRatio || 0.85);
     const line = c.storage * pct;
     const room = { wood: 0, stone: 0, iron: 0 }, excess = { wood: 0, stone: 0, iron: 0 };
@@ -1726,7 +1728,7 @@
     const ratioIn = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '0.5', max: '1.35', step: '0.05', value: cfg.minRatio });
     ratioIn.addEventListener('change', () => { cfg.minRatio = clamp(+ratioIn.value || 0.85, 0.5, 1.35); saveState(); renderBody(); });
     const pctIn = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '10', max: '100', step: '5', value: cfg.excessPct });
-    pctIn.addEventListener('change', () => { cfg.excessPct = clamp(pos(pctIn.value, 80), 10, 100); saveState(); renderBody(); });
+    pctIn.addEventListener('change', () => { cfg.excessPct = clamp(pos(pctIn.value, 70), 10, 100); saveState(); renderBody(); });
     // Vista previa de la ciudad abierta.
     let preview = null;
     const tid = +UW.Game?.townId;
