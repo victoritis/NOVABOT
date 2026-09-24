@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.12.5
+// @version      1.12.6
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.12.5';
+  const VERSION = '1.12.6';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -549,12 +549,179 @@
     updateCountdown();
   }
 
+  /* Vista general · Construcción del bot: por ciudad, qué edificios se piden, a qué
+     nivel van (barra), el siguiente nivel con sus recursos y la cola. Solo lectura.
+     "Lo que toca" se calcula como el motor: primer paso de cada edificio (cabezas),
+     y de ellas la que se construiría ahora; si ninguna, la que está reuniendo
+     recursos; si tampoco, la primera (bloqueada). Con orden estricto, siempre la primera. */
+  function buildOverviewOf(townId) {
+    const bd = buildDataFor(townId);
+    const limit = buildQueueLimit();
+    const orders = townBuildOrders(townId);
+    const full = !!bd?.is_building_order_queue_full || orders.length >= limit;
+    const heads = [], seen = new Set();
+    if (bd) for (const s of buildPlan(townId)) {
+      if (seen.has(s.id)) continue;
+      const info = bd.building_data?.[s.id];
+      if (s.level !== queuedLevel(townId, s.id, info) + (s.down ? -1 : 1)) { seen.add(s.id); continue; }
+      seen.add(s.id);
+      heads.push({ ...s, info, reason: s.down ? null : buildBlockReason(townId, info) });
+    }
+    const gathering = (h) => /faltan recursos|reservado/.test(h.reason || '');
+    const focus = !heads.length ? null : state.construccion.strictOrder ? heads[0]
+      : heads.find((h) => !h.reason) || heads.find(gathering) || heads[0];
+    return { bd, orders, limit, full, heads, focus, gathering };
+  }
+
+  function renderResumenBuild() {
+    for (const id of allTownIds()) pruneCompletedGoals(id);
+    const towns = allTownIds().filter((id) => townBuildCfg(id).goals.length)
+      .sort((a, b) => farmTownName(a).localeCompare(farmTownName(b), 'es'));
+    let pendingLv = 0, ready = 0, waiting = 0;
+    const cards = towns.map((id) => {
+      const cfg = townBuildCfg(id);
+      const o = buildOverviewOf(id);
+      const f = o.focus;
+      let st, cls;
+      if (!buildEnabledFor(id)) { st = 'Desactivado'; cls = 'off'; }
+      else if (!o.bd) { st = 'Sin datos de edificios'; cls = 'wait'; }
+      else if (!f) { st = 'Objetivos cumplidos'; cls = 'done'; }
+      else if (o.full) { st = 'Cola llena'; cls = 'wait'; }
+      else if (!f.reason) { st = f.down ? 'Derribo listo' : 'Listo para construir'; cls = 'ok'; ready++; }
+      else if (o.gathering(f)) { st = /reservado/.test(f.reason) ? f.reason[0].toUpperCase() + f.reason.slice(1) : 'Reuniendo recursos'; cls = 'run'; }
+      else { st = `${buildingName(f.id)}: ${f.reason}`; cls = 'wait'; }
+      if (cls === 'wait') waiting++;
+      // Objetivos (en orden de prioridad)
+      const rows = cfg.goals.map((g, gi) => {
+        const info = o.bd?.building_data?.[g.id];
+        const real = realBuildingLevel(id, g.id), q = queuedLevel(id, g.id, info);
+        // Si el edificio ya salió antes en la lista, este objetivo empieza donde acaba aquel.
+        const prev = cfg.goals.slice(0, gi).filter((x) => x.id === g.id).pop();
+        const from = !prev ? q : g.demolish ? Math.min(q, prev.target) : Math.max(q, prev.target);
+        const rem = Math.max(0, g.demolish ? from - g.target : g.target - from);
+        pendingLv += rem;
+        const head = o.heads.find((h) => h.id === g.id && h.gi === gi);
+        const sub = !rem ? 'completo'
+          : `${g.demolish ? 'derribar' : 'faltan'} ${rem} nivel${rem > 1 ? 'es' : ''}${f && head === f && !f.reason ? ' · siguiente' : head?.reason ? ` · ${head.reason}` : head ? '' : ' · tras el objetivo anterior'}`;
+        const pct = g.target ? Math.min(100, Math.round(q / g.target * 100)) : 100;
+        const pctHave = g.target ? Math.min(100, Math.round(real / g.target * 100)) : 100;
+        return el('div', { class: 'nb-rc-unit' }, [
+          buildingIcon(g.id, true),
+          el('div', { class: 'nb-rc-unit-main' }, [
+            el('div', { class: 'nb-rc-unit-top' }, [el('b', {}, [buildingName(g.id), g.demolish ? ' (derribo)' : '']), el('span', {}, `${real}${q !== real ? ` (${q} con cola)` : ''} → ${g.target}`)]),
+            g.demolish ? null : el('div', { class: 'nb-bar nb-rc-bar' }, [el('div', { class: 'nb-bar-fill nb-rc-q', style: `width:${pct}%` }), el('div', { class: 'nb-bar-fill', style: `width:${pctHave}%` })]),
+            el('div', { class: 'nb-rc-unit-sub' }, sub)
+          ])
+        ]);
+      });
+      // Siguiente nivel y sus recursos
+      let lot = null;
+      if (f && buildEnabledFor(id)) {
+        const cost = f.down ? {} : (f.info?.resources_for || {});
+        const cur = townResources(id);
+        const need = RES.filter((k) => (+cost[k] || 0) > 0);
+        const tot = need.length ? Math.min(...need.map((k) => Math.min(100, Math.floor(cur[k] / +cost[k] * 100)))) : 100;
+        lot = el('div', { class: 'nb-rc-lot' }, [
+          el('div', { class: 'nb-rc-lot-head' }, [el('span', {}, 'Siguiente'), el('b', {}, `${buildingName(f.id)} → ${f.level}${f.down ? ' (derribo)' : ''}`), need.length ? el('span', { class: 'nb-rc-pct' }, `${tot} %`) : null]),
+          need.length ? el('div', { class: 'nb-res-list' }, need.map((k) => el('span', { class: `nb-res${cur[k] >= +cost[k] ? ' nb-ok' : ''}` }, [resIcon(k), `${Math.floor(cur[k])}/${Math.ceil(+cost[k])}`]))) : null
+        ]);
+      }
+      // Cola del juego + modo
+      const bo = o.orders.slice().sort((a, b) => (+a.to_be_completed_at || 0) - (+b.to_be_completed_at || 0));
+      const qItem = el('span', { class: 'nb-rc-q-item' }, [buildingIcon('main', true), `${bo.length}/${o.limit}`,
+        bo[0] ? [' · ', buildingName(bo[0].building_type), ' ', el('b', { 'data-nb-until': Math.round(+bo[0].to_be_completed_at) }, formatLeft(+bo[0].to_be_completed_at))] : ' libre']);
+      const mode = el('span', { class: 'nb-rc-spells' }, [townInterleave(id) ? 'intercala' : 'en orden', state.construccion.strictOrder ? ' · estricto' : '']);
+      return el('div', { class: `nb-rc-card nb-rc-${cls}${+UW.Game?.townId === id ? ' nb-rc-current' : ''}` }, [
+        el('div', { class: 'nb-rc-head' }, [el('b', { class: 'nb-rc-town' }, farmTownName(id)), el('span', { class: `nb-rc-state nb-rc-state-${cls}` }, st)]),
+        el('div', { class: 'nb-rc-units' }, rows),
+        lot,
+        el('div', { class: 'nb-rc-foot' }, [qItem, mode])
+      ]);
+    });
+    bodyEl.appendChild(el('div', { class: 'nb-stats nb-rc-stats' }, [
+      el('div', { class: 'nb-stat' }, [el('span', {}, 'Ciudades construyendo'), el('b', {}, String(towns.length))]),
+      el('div', { class: 'nb-stat' }, [el('span', {}, 'Niveles por hacer'), el('b', {}, pendingLv.toLocaleString('es-ES'))]),
+      el('div', { class: 'nb-stat' }, [el('span', {}, 'Listas para construir'), el('b', {}, String(ready))]),
+      el('div', { class: 'nb-stat' }, [el('span', {}, 'En espera'), el('b', {}, String(waiting))])
+    ]));
+    bodyEl.appendChild(towns.length ? el('div', { class: 'nb-rc-grid' }, cards)
+      : el('div', { class: 'nb-card' }, [el('p', { class: 'nb-placeholder' }, 'Ninguna ciudad tiene edificios pedidos en el bot.')]));
+    updateCountdown();
+  }
+
+  /* Vista general · Investigación del bot: por ciudad, la cola del bot con el estado
+     de cada investigación, la siguiente con sus recursos, la cola de la Academia y
+     los puntos. Solo lectura. */
+  function renderResumenResearch() {
+    if (Date.now() - researchRuntime.ordersAt > 30000 && !researchRuntime.busy) refreshResearchOrders().then(() => renderIfIdle('resumen'));
+    for (const id of allTownIds()) pruneResearchQueue(id);
+    const towns = allTownIds().filter((id) => townResearchCfg(id).queue.length)
+      .sort((a, b) => farmTownName(a).localeCompare(farmTownName(b), 'es'));
+    const limit = buildQueueLimit();
+    const iconSm = (r) => { let c = r; try { c = UW.GameDataResearches?.getResearchCssClass?.(r) || r; } catch {} return el('span', { class: 'nb-icon-sm' }, [el('span', { class: `research_icon research40x40 ${c}` })]); };
+    let pending = 0, ready = 0, waiting = 0;
+    const cards = towns.map((id) => {
+      const plan = researchPlan(id);
+      const next = nextResearchFor(id);
+      pending += plan.length;
+      let st, cls;
+      if (!researchEnabledFor(id)) { st = 'Desactivado'; cls = 'off'; }
+      else if (!plan.length) { st = 'Cola completada'; cls = 'done'; }
+      else if (next.r) { st = 'Lista para investigar'; cls = 'ok'; ready++; }
+      else if (/faltan recursos/.test(next.reason)) { st = 'Reuniendo recursos'; cls = 'run'; }
+      else if (/reservado/.test(next.reason)) { st = next.reason; cls = 'run'; }
+      else { st = next.reason; cls = 'wait'; }
+      if (cls === 'wait') waiting++;
+      // La que toca: la que se lanzaría, o la primera sin bloqueo (esperando recursos).
+      const focus = plan.find((x) => x.r === next.r) || plan.find((x) => !x.block);
+      const rows = plan.map((x) => el('div', { class: 'nb-rc-unit' }, [
+        iconSm(x.r),
+        el('div', { class: 'nb-rc-unit-main' }, [
+          el('div', { class: 'nb-rc-unit-top' }, [el('b', {}, researchName(x.r)), el('span', {}, `${x.points} pts`)]),
+          el('div', { class: 'nb-rc-unit-sub' }, x === focus ? (next.r === x.r ? 'siguiente' : 'esperando recursos') : x.block || 'en espera de recursos')
+        ])
+      ]));
+      let lot = null;
+      if (focus && researchEnabledFor(id)) {
+        const cur = townResources(id), cost = focus.cost;
+        const need = RES.filter((k) => cost[k] > 0);
+        const tot = need.length ? Math.min(...need.map((k) => Math.min(100, Math.floor(cur[k] / cost[k] * 100)))) : 100;
+        lot = el('div', { class: 'nb-rc-lot' }, [
+          el('div', { class: 'nb-rc-lot-head' }, [el('span', {}, 'Siguiente'), el('b', {}, researchName(focus.r)), el('span', { class: 'nb-rc-pct' }, `${tot} %`)]),
+          el('div', { class: 'nb-res-list' }, need.map((k) => el('span', { class: `nb-res${cur[k] >= cost[k] ? ' nb-ok' : ''}` }, [resIcon(k), `${Math.floor(cur[k])}/${Math.ceil(cost[k])}`])))
+        ]);
+      }
+      const orders = researchOrdersOf(id);
+      const pts = researchPoints(id);
+      const qItem = el('span', { class: 'nb-rc-q-item' }, [buildingIcon('academy', true), `${orders.length}/${limit}`,
+        orders[0] ? [' · ', researchName(orders[0].research_type), ' ', el('b', { 'data-nb-until': Math.round(+orders[0].to_be_completed_at) }, formatLeft(+orders[0].to_be_completed_at))] : ' libre']);
+      return el('div', { class: `nb-rc-card nb-rc-${cls}${+UW.Game?.townId === id ? ' nb-rc-current' : ''}` }, [
+        el('div', { class: 'nb-rc-head' }, [el('b', { class: 'nb-rc-town' }, farmTownName(id)), el('span', { class: `nb-rc-state nb-rc-state-${cls}` }, st)]),
+        el('div', { class: 'nb-rc-units' }, rows),
+        lot,
+        el('div', { class: 'nb-rc-foot' }, [qItem, el('span', { class: 'nb-rc-spells', title: 'Puntos de investigación: libres · usados/total' }, `${pts.free} pts libres · ${pts.used}/${pts.total}`)])
+      ]);
+    });
+    bodyEl.appendChild(el('div', { class: 'nb-stats nb-rc-stats' }, [
+      el('div', { class: 'nb-stat' }, [el('span', {}, 'Ciudades investigando'), el('b', {}, String(towns.length))]),
+      el('div', { class: 'nb-stat' }, [el('span', {}, 'Investigaciones en cola'), el('b', {}, String(pending))]),
+      el('div', { class: 'nb-stat' }, [el('span', {}, 'Listas para investigar'), el('b', {}, String(ready))]),
+      el('div', { class: 'nb-stat' }, [el('span', {}, 'En espera'), el('b', {}, String(waiting))])
+    ]));
+    bodyEl.appendChild(towns.length ? el('div', { class: 'nb-rc-grid' }, cards)
+      : el('div', { class: 'nb-card' }, [el('p', { class: 'nb-placeholder' }, 'Ninguna ciudad tiene investigaciones en la cola del bot.')]));
+    updateCountdown();
+  }
+
   /* Vista general: una fila por ciudad con lo que está en curso (solo lectura). */
   function renderResumenTab() {
-    const view = state.resumenView === 'reclutamiento' ? 'reclutamiento' : 'ciudades';
-    bodyEl.appendChild(el('div', { class: 'nb-seg nb-seg-main' }, [['ciudades', 'Ciudades'], ['reclutamiento', 'Reclutamiento del bot']].map(([v, l]) =>
-      el('span', { class: `nb-seg-btn${view === v ? ' active' : ''}`, onclick: () => { state.resumenView = v; saveState(); renderBody(); } }, l))));
+    const VIEWS = [['ciudades', 'Ciudades'], ['construccion', 'Construcción'], ['investigacion', 'Investigación'], ['reclutamiento', 'Reclutamiento']];
+    const view = VIEWS.some(([v]) => v === state.resumenView) ? state.resumenView : 'ciudades';
+    bodyEl.appendChild(el('div', { class: 'nb-seg nb-seg-main nb-seg-wrap' }, VIEWS.map(([v, l]) =>
+      el('span', { class: `nb-seg-btn${view === v ? ' active' : ''}`, title: v === 'ciudades' ? 'Una fila por ciudad' : `${l} del bot, ciudad a ciudad`, onclick: () => { state.resumenView = v; saveState(); renderBody(); } }, l))));
     if (view === 'reclutamiento') { renderResumenRecruit(); return; }
+    if (view === 'construccion') { renderResumenBuild(); return; }
+    if (view === 'investigacion') { renderResumenResearch(); return; }
     const now = Date.now();
     const transit = (() => { try { return transitRows(); } catch { return []; } })();
     const cd = (ms) => el('b', { class: 'nb-ov-time', 'data-nb-until': Math.round(ms / 1000) }, formatLeft(Math.round(ms / 1000)));
@@ -6105,8 +6272,9 @@
 
     // ------------------------------------------------------------------ Vista general
     add('Vista general', 'resumen', [
-      { t: 'Vista general', find: () => TQ.tab('resumen'), before: () => { if (state.resumenView === 'reclutamiento') { state.resumenView = 'ciudades'; return true; } }, h: `
-        <p>Todo el imperio de un vistazo. <b>Solo lectura</b>: aquí no se cambia nada.</p>` },
+      { t: 'Vista general', find: () => TQ.tab('resumen'), before: () => { if ((state.resumenView || 'ciudades') !== 'ciudades') { state.resumenView = 'ciudades'; return true; } }, h: `
+        <p>Todo el imperio de un vistazo. <b>Solo lectura</b>: aquí no se cambia nada.</p>
+        <p>Arriba eliges la vista: <b>Ciudades</b> (una fila por ciudad) o lo que lleva el bot en <b>Construcción</b>, <b>Investigación</b> y <b>Reclutamiento</b>, ciudad a ciudad.</p>` },
       { t: 'Ciudades', find: () => TQ.card(/^Vista general/), wide: true, h: `
         <p>Una fila por ciudad (la tuya resaltada):</p>
         <ul><li><b>Construcción</b>: órdenes en la cola del juego / huecos y lo primero que termina; cuántos objetivos tiene el bot.</li>
@@ -6114,8 +6282,14 @@
         <li><b>Festival</b>: en curso (cuenta atrás) o si puede hacerlo.</li>
         <li><b>Llega (comercio)</b>: envíos en camino y cuándo llega el primero.</li>
         <li><b>Ataques del bot</b>: ataques programados que salen de ella.</li></ul>` },
+      { t: 'Construcción del bot', before: () => { if (state.resumenView !== 'construccion') { state.resumenView = 'construccion'; return true; } }, find: () => TQ.sel('.nb-rc-stats', bodyEl) || TQ.sel('.nb-seg-main', bodyEl), h: `
+        <p>Vista <b>Construcción</b>: una ficha por ciudad con objetivos en el bot. Cada edificio con su nivel → objetivo (barra: clara = con la cola del juego), cuántos niveles faltan y por qué espera.</p>
+        <p><b>Siguiente</b>: el nivel que toca y sus recursos (verde = ya los tiene). Abajo, la cola del juego (lo primero que termina) y si esa ciudad <b>intercala</b> o va <b>en orden</b>.</p>
+        <p>Colores del estado: <b>listo</b> para construir, reuniendo recursos, en espera (cola llena, falta población, requisitos…), desactivado o completo.</p>` },
+      { t: 'Investigación del bot', before: () => { if (state.resumenView !== 'investigacion') { state.resumenView = 'investigacion'; return true; } }, find: () => TQ.sel('.nb-rc-stats', bodyEl) || TQ.sel('.nb-seg-main', bodyEl), h: `
+        <p>Vista <b>Investigación</b>: por ciudad, la cola del bot con el estado de cada investigación (siguiente, requisitos, faltan puntos…), la <b>siguiente</b> con sus recursos, la cola de la Academia y los <b>puntos</b> libres.</p>` },
       { t: 'Reclutamiento del bot', before: () => { if (state.resumenView !== 'reclutamiento') { state.resumenView = 'reclutamiento'; return true; } }, find: () => TQ.sel('.nb-rc-stats', bodyEl) || TQ.sel('.nb-seg-main', bodyEl), h: `
-        <p>La otra vista: por ciudad, qué tropas le has pedido al bot, cuánto falta (barra), el <b>siguiente lote</b> con sus recursos, las colas y los hechizos.</p>
+        <p>Vista <b>Reclutamiento</b>: por ciudad, qué tropas le has pedido al bot, cuánto falta (barra), el <b>siguiente lote</b> con sus recursos, las colas y los hechizos.</p>
         <p>Colores del estado: <b>listo</b> para reclutar, reuniendo recursos, en espera (cola llena, programado, falta población…), desactivado o completo.</p>` }
     ]);
 
@@ -6378,6 +6552,10 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.12.6', items: [
+      { t: 'Vista general: Construcción e Investigación', tab: 'resumen', before: () => { if (state.resumenView !== 'construccion') { state.resumenView = 'construccion'; return true; } }, find: () => TQ.sel('.nb-seg-main', bodyEl), h: `
+        <p>Además de <b>Reclutamiento</b>, la Vista general tiene ahora <b>Construcción</b> e <b>Investigación</b>: una ficha por ciudad con lo que le has pedido al bot, lo siguiente que toca con sus recursos, por qué espera y la cola del juego.</p>` }
+    ] },
     { v: '1.12.5', items: [
       { t: 'Intercalar, por ciudad', tab: 'construccion', find: inCard(/^Construcción automática/, /^Intercalar/), h: `<p><b>Intercalar edificios</b> ya no es general: cada ciudad tiene el suyo. Las ciudades que no toques siguen como estaban. <b>Copiar a todas</b> también copia esta opción.</p>` }
     ] },
