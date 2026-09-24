@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.10.0
+// @version      1.11.0
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.10.0';
+  const VERSION = '1.11.0';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -185,7 +185,9 @@
         enabled: true,        // mover recursos entre ciudades con los comerciantes libres
         balance: true,        // además de evitar pérdidas, igualar ciudades
         tolPct: 20,           // tolerancia sobre la media del imperio (% del almacén)
-        maxCapPct: 60,        // % de comerciantes que puede usar para igualar
+        maxCapPct: 60,        // % de comerciantes que puede usar sin encargos pendientes ni a punto
+        busyCapPct: 20,       // % de comerciantes con encargos pendientes o a punto (el resto, libre)
+        horizonMin: 30,       // encargos "a punto": los que empiezan dentro de estos minutos
         maxTravelMin: 45,     // viaje máximo (evitar pérdida: el doble)
         minMove: 1000,        // envío mínimo al igualar
         maxMoves: 4           // envíos por vuelta
@@ -1623,6 +1625,12 @@
         const d = (t.lvl[X] - t.lvl[Y]) / S + (M.F[X] - M.F[Y]);
         if (d > 0.04) { mode = 'equilibrar'; rank = 1; pref = d; amount = Math.min(d * S / (1 + ratio), avail - others); }
       }
+      // Con ciudades esperando recursos, los cambios normales no gastan los comerciantes
+      // que el comercio puede necesitar (misma parte que el equilibrio).
+      if (mode && M.busy) {
+        const busyPct = clamp(+state.equilibrio?.busyCapPct || 20, 0, 100) / 100;
+        amount = Math.min(amount, cap - t.maxCap * (1 - busyPct));
+      }
     }
     if (!mode) return null;
     amount = Math.floor(Math.min(amount, cap, exMaxAmount(v.rel), roomY / ratio));
@@ -1682,6 +1690,7 @@
     const now = Date.now();
     exRuntime.feeds = exRuntime.feeds.filter((f) => f.expires > now);
     const M = resourceModel();
+    try { M.busy = tradeBusy(planTrades().needs); } catch {}
     const plan = exPlanAll(M, cfg, 3);
     for (const t of plan) {
       if (!state.aldeas.enabled) return;
@@ -3187,8 +3196,8 @@
      destino.
   --------------------------------------------------------------------------------- */
   const balRuntime = { nextAt: 0 };
-  const KIND_LABEL = { urgente: 'Evitar pérdida', aldea: 'Para cambiar en aldea', equilibrio: 'Equilibrio' };
-  const KIND_RANK = { urgente: 0, aldea: 1, equilibrio: 2 };
+  const KIND_LABEL = { urgente: 'Evitar pérdida', adelantar: 'Adelantar encargo', aldea: 'Para cambiar en aldea', equilibrio: 'Equilibrio' };
+  const KIND_RANK = { urgente: 0, adelantar: 1, aldea: 2, equilibrio: 3 };
 
   // Comerciantes totales: Mercado × 500 (× 1,5 con Oficina comercial) — comprobado en
   // las 22 ciudades el 24/09/2026. Por si acaso, nunca menos de lo visto libre.
@@ -3293,27 +3302,121 @@
 
   // Movimientos de equilibrio (agrupados por pareja origen → destino).
   // idle = el comercio no tiene encargos que enviar ahora (entonces también iguala).
-  function planBalance(M, idle = true) {
+  /* Modo del equilibrio — los encargos van SIEMPRE primero:
+       · 'encargos': alguna ciudad espera recursos ya. Solo se evita perder recursos, sin
+         tocar ningún recurso que alguien esté esperando.
+       · 'pronto':   nadie espera ahora, pero algún encargo empieza dentro del horizonte
+         (hueco en la cola de construcción, lote de tropas, inicio programado,
+         festival que termina). Se evita perder y se ADELANTA a esas ciudades lo que les
+         va a faltar, sacándolo de donde sobra.
+       · 'libre':    nada pendiente ni a punto: también se iguala y se alimentan aldeas.
+     En 'encargos' y 'pronto' cada ciudad deja libre el (100 − X) % de sus comerciantes
+     (por defecto el 80 %) y no se hacen viajes de más del máximo. */
+  function upcomingDemands(horizonMs = Math.max(1, +state.equilibrio.horizonMin || 30) * 60000) {
+    const now = Date.now(), until = now + horizonMs;
+    const out = new Map(); // townId -> { wood, stone, iron, labels[], at }
+    const addTo = (id, cost, label, at) => {
+      if (!cost || !sumRes(cost)) return;
+      let o = out.get(id);
+      if (!o) { o = { wood: 0, stone: 0, iron: 0, labels: [], at: Infinity }; out.set(id, o); }
+      for (const k of RES) o[k] += +cost[k] || 0;
+      o.labels.push(label); o.at = Math.min(o.at, at);
+    };
+    const inc = (m) => { try { return prioIncluded(m); } catch { return true; } };
+    for (const id of allTownIds()) {
+      // Construcción con la cola llena: el siguiente nivel cuando termine la primera orden.
+      try {
+        if (state.comercio.forBuild && inc('construccion') && buildEnabledFor(id) && townBuildCfg(id).goals.length) {
+          const orders = townBuildOrders(id);
+          if (orders.length >= buildQueueLimit()) {
+            const freeAt = Math.min(...orders.map((o) => +o.to_be_completed_at * 1000 || Infinity));
+            if (freeAt <= until) {
+              const bd = buildDataFor(id), skip = new Set();
+              for (const s of buildPlan(id)) {
+                if (s.down || skip.has(s.id)) continue;
+                const info = bd?.building_data?.[s.id];
+                if (buildHardBlock(info, id)) { skip.add(s.id); continue; }
+                addTo(id, levelCost(s.id, s.level, info), `${buildingName(s.id)} ${s.level}`, freeAt);
+                break;
+              }
+            }
+          }
+        }
+      } catch {}
+      // Reclutamiento: inicio programado dentro del horizonte, o cola llena que se libera.
+      try {
+        if (state.comercio.forRecruit && inc('reclutamiento') && recruitOnFor(id) && townRecruitCfg(id).goals.length) {
+          const t = state.reclutamiento.towns[id] || {};
+          const start = +t.startAt || 0;
+          if (!t.hold && start > now && start <= until) {
+            const b = recruitBatch(id, start);
+            if (b && !b.reason) addTo(id, b.cost, 'tropas (inicio programado)', start);
+          } else if (recruitEnabledFor(id)) {
+            const b = recruitBatch(id);
+            if (b?.queueFull && b.nextFree && b.nextFree <= until) {
+              const nb = recruitBatch(id, b.nextFree);
+              if (nb && !nb.reason) addTo(id, nb.cost, 'siguiente lote de tropas', b.nextFree);
+            }
+          }
+        }
+      } catch {}
+      // Festival que termina dentro del horizonte (se empieza otro en cuanto acabe).
+      try {
+        if (state.comercio.forFestival !== false && inc('festivales') && festCfg() && canFestival(id)) {
+          const end = festivalEnd(id);
+          if (end > now && end <= until) addTo(id, festCost(), 'festival', end);
+        }
+      } catch {}
+    }
+    return out;
+  }
+
+  // ¿Hay encargos esperando recursos de verdad? (lo que falta y no cubre la propia
+  // producción en unos minutos; "falta 18" se produce solo en segundos).
+  function tradeBusy(needs) {
+    return (needs || []).some((n) => RES.some((k) => (n.missInit[k] || 0) - (productionOf(n.townId)[k] || 0) * 0.1 > 0));
+  }
+  // Contexto del equilibrio: modo + lo que les va a faltar a las ciudades con encargos a punto.
+  function balanceContext(needs) {
+    let up = new Map();
+    try { up = upcomingDemands(); } catch (e) { console.warn('[NOVABOT][equilibrio] próximos encargos:', e); }
+    const mode = tradeBusy(needs) ? 'encargos' : up.size ? 'pronto' : 'libre';
+    return { mode, up };
+  }
+  const MODE_TEXT = {
+    encargos: 'Hay ciudades esperando recursos: el comercio va primero. Solo se evita perder recursos, con poca parte de los comerciantes y sin tocar lo que alguien espera.',
+    pronto: 'Hay encargos a punto de empezar: se evita perder recursos y se adelanta a esas ciudades lo que les va a faltar, con poca parte de los comerciantes.',
+    libre: 'Nada pendiente ni a punto: también se igualan ciudades y se alimentan aldeas.'
+  };
+
+  // Movimientos de equilibrio (agrupados por pareja origen → destino).
+  function planBalance(M, ctx = { mode: 'libre', up: new Map() }) {
     const cfg = state.equilibrio;
     const now = Date.now();
+    const free = ctx.mode === 'libre';
     const resList = caveOn() ? ['wood', 'stone'] : RES; // con Cueva la plata la gestiona la Cueva
     const tol = clamp(+cfg.tolPct || 20, 5, 60) / 100;
     const maxTravel = Math.max(1, +cfg.maxTravelMin || 45) * 60;
-    const capPct = clamp(+cfg.maxCapPct || 60, 10, 100) / 100;
+    // Parte de los comerciantes que puede usar cada ciudad (lo demás queda libre para encargos).
+    const capPct = clamp(free ? (+cfg.maxCapPct || 60) : (+cfg.busyCapPct || 20), 0, 100) / 100;
     const ids = M.towns;
     const moves = new Map();
-    // Comerciantes: para evitar pérdidas, todos los libres; para lo demás se deja
-    // libre el resto para los encargos.
-    const capAll = {}, capBal = {};
-    for (const id of ids) { const t = M.T[id]; capAll[id] = t.cap; capBal[id] = Math.max(0, t.cap - t.maxCap * (1 - capPct)); }
-    const giveable = (d, k) => (M.T[d].miss[k] > 0 ? 0 : Math.max(0, Math.floor(M.T[d].cur[k] - M.T[d].keep[k])));
+    const capLeft = {};
+    for (const id of ids) { const t = M.T[id]; capLeft[id] = Math.max(0, Math.min(t.cap, t.cap - t.maxCap * (1 - capPct))); }
+    // Lo que alguna ciudad espera ahora no lo mueve el equilibrio (lo reparte el comercio).
+    const waited = (k) => ctx.mode === 'encargos' && (M.globalMiss[k] || 0) > 0;
+    const giveable = (d, k) => (M.T[d].miss[k] > 0 ? 0 : Math.max(0, Math.floor(M.T[d].cur[k] - M.T[d].keep[k] - (ctx.up.get(d)?.[k] || 0))));
     const onCooldown = (a, b) => (tradeRuntime.pairCooldown.get(`${a}>${b}`) || 0) > now;
     const fill = (id, k) => M.T[id].lvl[k] / M.T[id].storage;
     const room = (r, k, eta) => { const t = M.T[r]; return t.over[k] > 0 ? 0 : Math.floor(t.safe[k] - t.lvl[k] - t.prod[k] * eta / 3600); };
-    // Destinos: primero los que menos tienen de ese recurso; cada 12 min de viaje cuenta como un 10 % más lleno.
+    // Lo que le faltará a una ciudad para sus encargos a punto (más los de ahora).
+    const lack = (r, k) => { const u = ctx.up.get(r); return u ? Math.max(0, Math.ceil((u[k] || 0) + M.T[r].total[k] - M.T[r].lvl[k])) : 0; };
+    // Destinos: primero los que van a necesitar ese recurso, luego los que menos tienen;
+    // cada 12 min de viaje cuenta como un 10 % más lleno.
+    const score = (d, r, k) => fill(r, k) + travelSec(d, r) / 7200 - (lack(r, k) > 0 ? 1 : 0);
     const receivers = (d, k, maxT, cond) => ids
       .filter((r) => r !== d && !onCooldown(d, r) && travelSec(d, r) <= maxT && cond(r))
-      .sort((a, b) => (fill(a, k) + travelSec(d, a) / 7200) - (fill(b, k) + travelSec(d, b) / 7200));
+      .sort((a, b) => score(d, a, k) - score(d, b, k));
     function add(d, r, k, x, kind, feed = null) {
       const key = `${d}>${r}`;
       let m = moves.get(key);
@@ -3323,33 +3426,56 @@
       const D = M.T[d], R = M.T[r];
       D.cur[k] -= x; D.lvl[k] -= x; D.over[k] = Math.max(0, D.over[k] - x);
       R.lvl[k] += x; R.inc[k] += x;
-      capAll[d] -= x; capBal[d] = Math.max(0, Math.min(capBal[d] - x, capAll[d]));
+      capLeft[d] = Math.max(0, capLeft[d] - x);
     }
 
     // 1) Evitar pérdida en la próxima recolección.
     const urgent = [];
-    for (const d of ids) for (const k of resList) if (M.T[d].over[k] > 0) urgent.push({ d, k, over: M.T[d].over[k] });
+    for (const d of ids) for (const k of resList) if (M.T[d].over[k] > 0 && !waited(k)) urgent.push({ d, k, over: M.T[d].over[k] });
     urgent.sort((a, b) => b.over - a.over);
     for (const u of urgent) {
       const D = M.T[u.d];
       let want = Math.min(giveable(u.d, u.k), Math.ceil(Math.max(D.over[u.k], D.lvl[u.k] - D.safe[u.k])));
       if (want < 100) continue;
-      for (const r of receivers(u.d, u.k, maxTravel * 2, (r) => room(r, u.k, travelSec(u.d, r)) >= 100)) {
-        if (want < 100 || capAll[u.d] < 100) break;
-        const x = Math.floor(Math.min(want, room(r, u.k, travelSec(u.d, r)), capAll[u.d]));
+      for (const r of receivers(u.d, u.k, free ? maxTravel * 2 : maxTravel, (r) => room(r, u.k, travelSec(u.d, r)) >= 100)) {
+        if (want < 100 || capLeft[u.d] < 100) break;
+        const x = Math.floor(Math.min(want, room(r, u.k, travelSec(u.d, r)), capLeft[u.d]));
         if (x < 100) continue;
         add(u.d, r, u.k, x, 'urgente');
         want -= x;
       }
     }
 
-    // 2) Alimentar aldeas con tasa alta.
-    if (state.aldeas.enabled && state.aldeas.feed) {
+    // 2) Adelantar a las ciudades con encargos a punto lo que les va a faltar, desde
+    //    las que tienen de sobra (por encima de la media del imperio + media tolerancia).
+    if (ctx.mode === 'pronto') {
+      const wants = [];
+      for (const [r, u] of ctx.up) for (const k of resList) { const l = lack(r, k); if (l >= 100) wants.push({ r, k, l, at: u.at }); }
+      wants.sort((a, b) => a.at - b.at || b.l - a.l);
+      for (const w of wants) {
+        let need = Math.min(lack(w.r, w.k), room(w.r, w.k, 0));
+        const donors = ids
+          .filter((d) => d !== w.r && !onCooldown(d, w.r) && travelSec(d, w.r) <= maxTravel && !ctx.up.has(d))
+          .map((d) => ({ d, x: Math.floor(Math.min(giveable(d, w.k), M.T[d].lvl[w.k] - (M.F[w.k] + tol / 2) * M.T[d].storage)) }))
+          .filter((o) => o.x >= 100)
+          .sort((a, b) => travelSec(a.d, w.r) - travelSec(b.d, w.r));
+        for (const o of donors) {
+          if (need < 100) break;
+          const x = Math.floor(Math.min(need, o.x, capLeft[o.d], room(w.r, w.k, travelSec(o.d, w.r))));
+          if (x < 100) continue;
+          add(o.d, w.r, w.k, x, 'adelantar');
+          need -= x;
+        }
+      }
+    }
+
+    // 3) Alimentar aldeas con tasa alta (solo en modo libre).
+    if (free && state.aldeas.enabled && state.aldeas.feed) {
       for (const w of exFeedWants(M)) {
         const X = w.give, e = w.townId;
         const donor = ids
           .filter((d) => d !== e && !onCooldown(d, e) && travelSec(d, e) <= maxTravel)
-          .map((d) => ({ d, x: Math.floor(Math.min(giveable(d, X), M.T[d].lvl[X] - M.F[X] * M.T[d].storage, capBal[d])) }))
+          .map((d) => ({ d, x: Math.floor(Math.min(giveable(d, X), M.T[d].lvl[X] - M.F[X] * M.T[d].storage, capLeft[d])) }))
           .filter((o) => o.x >= Math.max(500, w.amount * 0.5))
           .sort((a, b) => travelSec(a.d, e) - travelSec(b.d, e))[0];
         if (!donor) continue;
@@ -3364,8 +3490,8 @@
       }
     }
 
-    // 3) Igualar (solo con el comercio libre).
-    if (idle && cfg.balance !== false) {
+    // 4) Igualar (solo en modo libre).
+    if (free && cfg.balance !== false) {
       const donors = [];
       for (const d of ids) for (const k of resList) {
         const t = M.T[d];
@@ -3382,10 +3508,10 @@
         const tolDown = Math.min(tol, M.F[u.k] / 2);
         const below = (r) => M.T[r].lvl[u.k] < (M.F[u.k] - tolDown) * M.T[r].storage;
         for (const r of receivers(u.d, u.k, maxTravel, below)) {
-          if (want < 100 || capBal[u.d] < 100) break;
+          if (want < 100 || capLeft[u.d] < 100) break;
           const R = M.T[r];
           const take = Math.min((M.F[u.k] - tolDown / 2) * R.storage - R.lvl[u.k], room(r, u.k, travelSec(u.d, r)));
-          const x = Math.floor(Math.min(want, take, capBal[u.d]));
+          const x = Math.floor(Math.min(want, take, capLeft[u.d]));
           if (x < 100) continue;
           add(u.d, r, u.k, x, 'equilibrio');
           want -= x;
@@ -3398,16 +3524,18 @@
     for (const m of moves.values()) {
       const total = sumRes(m.ship);
       const kinds = [...m.kinds].sort((a, b) => KIND_RANK[a] - KIND_RANK[b]);
-      const min = kinds[0] === 'urgente' ? 300 : kinds[0] === 'aldea' ? 500 : minMove;
+      const min = kinds[0] === 'urgente' ? 300 : kinds[0] === 'equilibrio' ? minMove : 500;
       if (total < min) continue;
       out.push({ ...m, kind: kinds[0], kinds, total });
     }
     return out.sort((a, b) => (KIND_RANK[a.kind] - KIND_RANK[b.kind]) || (b.total - a.total));
   }
 
-  async function balanceTick() {
+  async function balanceTick(needs = []) {
     const cfg = state.equilibrio;
-    const moves = planBalance(resourceModel(), true);
+    const ctx = balanceContext(needs);
+    balRuntime.mode = ctx.mode;
+    const moves = planBalance(resourceModel(), ctx);
     const max = Math.max(1, +cfg.maxMoves || 4);
     let sent = 0;
     for (const m of moves) {
@@ -3423,7 +3551,8 @@
           exRuntime.feeds.push({ townId: m.to, relId: +f.rel.id, give: f.give, get: f.get, amount: f.amount, arrival: arrival + 10000, expires: arrival + 20 * 60000 });
         }
         const extra = m.feeds.length ? ` · para ${m.feeds.map((f) => `${f.farm.name} (${RES_ES[f.give]} → ${RES_ES[f.get]} a ${f.ratio.toFixed(2)})`).join(', ')}` : '';
-        tradeLog(`${label} · ${farmTownName(m.from)} → ${farmTownName(m.to)}: ${fmtRes(m.ship)} · ${Math.max(1, Math.round(m.eta / 60))} min${extra}`, 'ok');
+        const why = m.kind === 'adelantar' ? ` · para ${ctx.up.get(m.to)?.labels.join(', ') || 'su próximo encargo'}` : '';
+        tradeLog(`${label} · ${farmTownName(m.from)} → ${farmTownName(m.to)}: ${fmtRes(m.ship)} · ${Math.max(1, Math.round(m.eta / 60))} min${extra}${why}`, 'ok');
         sent += 1;
       } catch (e) {
         tradeRuntime.pairCooldown.set(`${m.from}>${m.to}`, Date.now() + 5 * 60000);
@@ -3442,16 +3571,25 @@
       return el('label', { class: 'nb-field' }, [label, i]);
     };
     const pct = (v) => `${Math.round(v * 100)}%`;
-    let M = null, risk = [], moves = [];
+    let M = null, risk = [], moves = [], ctx = { mode: 'libre', up: new Map() };
     try {
       M = resourceModel();
-      risk = M.towns.map((id) => ({ id, over: { ...M.T[id].over }, claimer: M.T[id].claimer })).filter((r) => sumRes(r.over) >= 1);
-      moves = planBalance(M, true);
+      risk = M.towns.map((id) => ({ id, over: { ...M.T[id].over } })).filter((r) => sumRes(r.over) >= 1);
+      let needs = []; try { needs = planTrades().needs; } catch {}
+      ctx = balanceContext(needs);
+      moves = planBalance(M, ctx);
     } catch (e) { console.warn('[NOVABOT][equilibrio]', e); }
     const riskEl = risk.length
       ? el('div', { class: 'nb-alert nb-alert-warn nb-mt' }, [el('span', {}, [el('b', {}, 'Rebosaría en la próxima recolección: '),
           ...risk.flatMap((r, i) => [i ? ' · ' : '', `${farmTownName(r.id)} `, fmtResEl(r.over)])])])
       : el('div', { class: 'nb-alert nb-alert-info nb-mt' }, 'Ninguna ciudad rebosa en la próxima recolección.');
+    const upList = [...ctx.up.entries()].sort((a, b) => a[1].at - b[1].at);
+    const upEl = upList.length
+      ? el('div', { class: 'nb-queue' }, upList.slice(0, 8).map(([id, u]) => el('div', { class: 'nb-queue-item' }, [
+          el('span', {}, [`${farmTownName(id)}: ${u.labels.join(', ')} `, fmtResEl(u)]),
+          el('span', { class: 'nb-queue-time', 'data-nb-until': Math.round(Math.max(u.at, Date.now()) / 1000) }, formatLeft(Math.round(Math.max(u.at, Date.now()) / 1000)))
+        ])))
+      : null;
     const movesEl = moves.length
       ? el('div', { class: 'nb-queue' }, moves.slice(0, 10).map((m) => el('div', { class: 'nb-queue-item' }, [
           el('span', {}, [el('span', { class: 'nb-pill' }, KIND_LABEL[m.kind]), ` ${farmTownName(m.from)} → ${farmTownName(m.to)} `, fmtResEl(m.ship)]),
@@ -3459,15 +3597,19 @@
         ])))
       : el('p', { class: 'nb-placeholder' }, 'Nada que mover ahora.');
     return el('div', { class: 'nb-card', 'data-nb-card': 'equilibrio' }, [
-      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, [el('b', {}, 'Equilibrio entre ciudades')]),
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, [el('b', {}, 'Equilibrio entre ciudades'), el('span', { class: 'nb-pill nb-ml' }, ctx.mode === 'encargos' ? 'encargos en curso' : ctx.mode === 'pronto' ? 'encargos a punto' : 'libre')]),
         switchEl(!!cfg.enabled, (v) => { cfg.enabled = v; saveState(); tradeLog(v ? 'Equilibrio activado.' : 'Equilibrio desactivado.'); renderBody(); }, false)]),
-      optionRow('Igualar ciudades', 'Si una ciudad tiene mucho de un recurso y otra poco, lo reparte (solo cuando el comercio no tiene encargos que enviar)', cfg.balance !== false, (v) => { cfg.balance = v; saveState(); renderBody(); }),
-      el('div', { class: 'nb-field-row' }, [num('tolPct', 'Tolerancia (% del almacén)', 5, 5, 60), num('maxCapPct', 'Comerciantes para igualar (%)', 10, 10, 100)]),
+      optionRow('Igualar ciudades', 'Si una ciudad tiene mucho de un recurso y otra poco, lo reparte (solo cuando no hay encargos pendientes ni a punto)', cfg.balance !== false, (v) => { cfg.balance = v; saveState(); renderBody(); }),
+      el('div', { class: 'nb-field-row' }, [num('busyCapPct', 'Comerciantes con encargos (%)', 5, 0, 100), num('maxCapPct', 'Comerciantes sin encargos (%)', 10, 10, 100)]),
+      el('div', { class: 'nb-field-row' }, [num('horizonMin', 'Encargos «a punto»: en (min)', 5, 5, 240), num('tolPct', 'Tolerancia al igualar (%)', 5, 5, 60)]),
       el('div', { class: 'nb-field-row' }, [num('maxTravelMin', 'Viaje máximo (min)', 5, 1, 600), num('minMove', 'Envío mínimo al igualar', 100, 100, 100000)]),
       el('div', { class: 'nb-field-row' }, [num('maxMoves', 'Envíos por vuelta', 1, 1, 20)]),
-      el('p', { class: 'nb-placeholder' }, 'Antes de cada recolección calcula el botín que va a recibir cada ciudad: lo que no cabría se manda a ciudades con sitio (primero a las que menos tienen). Si una aldea con buena tasa pide algo que su isla no tiene, lo trae de donde sobra. Y con el comercio libre, las que pasan de la media del imperio + tolerancia mandan a las que están por debajo. Nunca toca lo reservado para encargos.'),
+      el('p', { class: 'nb-placeholder' }, 'Solo actúa en las vueltas en que el comercio no tiene nada que enviar para encargos. Antes de cada recolección calcula el botín de cada ciudad y lo que no cabría lo manda a ciudades con sitio (primero a las que lo van a necesitar). Con encargos a punto, les adelanta lo que les faltará. Sin nada pendiente, iguala ciudades y trae recursos a las aldeas con buena tasa. Nunca toca lo reservado para encargos.'),
+      el('div', { class: 'nb-alert nb-alert-info nb-mt' }, MODE_TEXT[ctx.mode]),
       M ? el('p', { class: 'nb-placeholder' }, `Imperio: madera ${pct(M.F.wood)} · piedra ${pct(M.F.stone)} · plata ${pct(M.F.iron)} del almacén${M.dt !== null ? ` · próxima recolección en ${Math.max(0, Math.round(M.dt * 60))} min` : ''}.`) : null,
       riskEl,
+      upEl ? el('div', { class: 'nb-card-title nb-mt' }, `Encargos a punto (${upList.length})`) : null,
+      upEl,
       el('div', { class: 'nb-card-title nb-mt' }, `Ahora movería (${moves.length})`),
       movesEl
     ]);
@@ -3477,7 +3619,7 @@
     if (!state.comercio.enabled) return;
     if (!overviewReady()) return; // sin conocer TODOS los envíos en camino se enviaría de más
     calibrateTravel();
-    const { plan } = planTrades();
+    const { plan, needs } = planTrades();
     const maxPerTick = Math.max(1, +state.comercio.maxPerTick || 5);
     for (const p of plan.slice(0, maxPerTick)) {
       if (!state.comercio.enabled) return;
@@ -3501,7 +3643,7 @@
     // y con los datos ya al día tras el último envío (cada 30 s como mucho).
     if (!plan.length && state.equilibrio?.enabled && Date.now() >= balRuntime.nextAt && Date.now() - (tradeRuntime.lastSendAt || 0) > 15000) {
       balRuntime.nextAt = Date.now() + 30000;
-      await balanceTick();
+      await balanceTick(needs);
     }
   }
 
@@ -3536,7 +3678,8 @@
       optionRow('Abastecer construcción', 'Envía lo que falta para los edificios en cola', !!cfg.forBuild, (v) => { cfg.forBuild = v; saveState(); renderBody(); }),
       optionRow('Abastecer reclutamiento', 'Envía lo que falta para completar los lotes de tropas', !!cfg.forRecruit, (v) => { cfg.forRecruit = v; saveState(); renderBody(); }),
       optionRow('Abastecer investigación', 'Solo cuando la ciudad tiene puntos de investigación para esa investigación', cfg.forResearch !== false, (v) => { cfg.forResearch = v; saveState(); renderBody(); }),
-      el('p', { class: 'nb-placeholder' }, 'Revisa cada 10 s. Abastece todos los encargos que caben en la cola de cada ciudad. Nunca dona lo que la donante va a gastar y nunca hace que se pierda recurso al llegar.')
+      optionRow('Abastecer festivales', 'Envía justo lo que falta para el festival (Academia 30+)', cfg.forFestival !== false, (v) => { cfg.forFestival = v; saveState(); renderBody(); }),
+      el('p', { class: 'nb-placeholder' }, 'Aquí se elige a qué módulos manda recursos el comercio (es el único sitio). Revisa cada 10 s. Abastece todos los encargos que caben en la cola de cada ciudad. Nunca dona lo que la donante va a gastar y nunca hace que se pierda recurso al llegar.')
     ]));
 
     const num = (key, label, step, min) => {
@@ -4165,7 +4308,6 @@
       el('div', { class: 'nb-row nb-option' }, [el('div', { class: 'nb-option-text' }, [el('span', { class: 'nb-option-label' }, `Solo ${farmTownName(townId)}`),
         el('span', { class: `nb-option-hint${isExc ? ' nb-warn-txt' : ''}` }, isExc ? `Excepción: ${tcfg.enabled ? 'activado' : 'desactivado'} aunque el general esté ${cfg.enabled ? 'activado' : 'desactivado'}` : 'Sigue al general')]), townSw]),
       startBox,
-      optionRow('Pedir recursos al Comercio', 'Los lotes se completan con envíos de otras ciudades', !!state.comercio.forRecruit, (v) => { state.comercio.forRecruit = v; saveState(); }),
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Lote = % del almacén'), el('span', {}, [fillIn, ' %'])]),
       (() => { const inp = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '1', max: '4', value: String(clamp(+cfg.lotsAhead || 2, 1, 4)) });
         inp.addEventListener('change', () => { cfg.lotsAhead = clamp(pos(inp.value, 2), 1, 4); saveState(); renderBody(); });
@@ -5708,8 +5850,6 @@
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, [el('b', {}, 'Festivales automáticos')]),
         switchEl(!!cfg.enabled, (v) => { cfg.enabled = v; if (v) cfg.event = false; saveState(); renderBody(); festLog(v ? 'Festivales activados.' : 'Festivales desactivados.'); }, false)]),
-      optionRow('Pedir recursos al Comercio', 'Envía justo lo que falta para el festival', !!state.comercio.forFestival, (v) => { state.comercio.forFestival = v; saveState(); }),
-
       el('p', { class: 'nb-placeholder' }, `Solo ciudades con Academia ${FESTIVAL_ACADEMY}+ y sin festival en curso. Coste: 15 000 madera · 18 000 piedra · 15 000 plata.`)
     ]));
 
