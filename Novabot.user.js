@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.14.0
+// @version      1.14.1
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.14.0';
+  const VERSION = '1.14.1';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -4495,27 +4495,63 @@
     return end;
   }
   const spellActive = (townId, id) => spellEnd(townId, id) > Date.now() + 30000;
-  // Lanza los hechizos configurados para ese tipo de cola (tierra/mar) que no estén
-  // activos. Devuelve el motivo de espera si falta uno OBLIGATORIO.
-  async function ensureRecruitSpells(townId, kind) {
+  /* Los hechizos aceleran la cola MIENTRAS duran (texto del juego: «todas las órdenes
+     de reclutamiento … se aceleran … durante X horas»). Lanzarlo con los recursos aún
+     de camino es tirar su duración con la cola vacía. Por eso van en 3 pasos, pegados
+     a la orden:
+       1) planRecruitSpells: qué hechizos harían falta (sin lanzar nada).
+       2) lotReadyInGame: el JUEGO confirma que el lote se puede reclutar ya.
+       3) castRecruitSpells y, justo detrás, la orden de reclutamiento. */
+  // 1) Hechizos configurados para esas colas (tierra/mar) que no están activos y se
+  // pueden lanzar. wait = motivo si falta uno OBLIGATORIO (entonces no se recluta).
+  async function planRecruitSpells(townId, kinds) {
     const cfg = townRecruitCfg(townId).spells || {};
-    for (const sd of RECRUIT_SPELLS.filter((x) => x.kind === kind)) {
+    const want = RECRUIT_SPELLS.filter((x) => kinds.includes(x.kind) && cfg[x.id] && !spellActive(townId, x.id));
+    if (!want.length) return { cast: [], wait: null };
+    // Datos frescos (no lanzar uno que ya está activo).
+    if (Date.now() - spellInfo.at > 15000) await refreshCastedPowers();
+    const cast = [];
+    for (const sd of want) {
+      if (spellActive(townId, sd.id)) continue;
       const mode = cfg[sd.id];
-      if (!mode || spellActive(townId, sd.id)) continue;
-      // Antes de lanzar, datos frescos (no lanzar uno que ya está activo).
-      if (Date.now() - spellInfo.at > 15000) { await refreshCastedPowers(); if (spellActive(townId, sd.id)) continue; }
       const p = UW.GameData?.powers?.[sd.id]; if (!p) continue;
       const cost = +p.favor || 0, fav = godFavor(p.god_id);
       const key = `${townId}:${sd.id}`;
-      if ((recruitRuntime.cooldown.get(key) || 0) > Date.now()) { if (mode === 'required') return `${p.name}: reintentando en unos minutos`; continue; }
-      if (fav < cost) { if (mode === 'required') return `Esperando favor de ${UW.GameData?.gods?.[p.god_id]?.name || p.god_id} para ${p.name} (${Math.floor(fav)}/${cost})`; continue; }
+      if ((recruitRuntime.cooldown.get(key) || 0) > Date.now()) { if (mode === 'required') return { cast: [], wait: `${p.name}: reintentando en unos minutos` }; continue; }
+      if (fav < cost) { if (mode === 'required') return { cast: [], wait: `Esperando favor de ${UW.GameData?.gods?.[p.god_id]?.name || p.god_id} para ${p.name} (${Math.floor(fav)}/${cost})` }; continue; }
+      cast.push({ sd, p, mode, cost, key });
+    }
+    return { cast, wait: null };
+  }
+  // 2) Antes de gastar favor: la ventana del Cuartel/Puerto (GET …?action=index, lo
+  // mismo que abrirla) da max_build por tropa = lo que se puede reclutar AHORA con los
+  // recursos, población y favor que hay de verdad en la ciudad. Si el lote no cabe
+  // (recursos aún viajando), no se lanza nada. Si no se puede leer, se sigue con el
+  // cálculo propio (que ya dijo que sí) para no bloquear el reclutamiento.
+  async function lotReadyInGame(townId, units) {
+    const max = {};
+    for (const ctrl of new Set(Object.keys(units).map((u) => (isNavalUnit(u) ? 'building_docks' : 'building_barracks')))) {
+      try {
+        const d = await gpGetAs(townId, ctrl, 'index', { nl_init: true });
+        const u = parseUnitOrderInit(String(d?.html || ''));
+        if (u) for (const [id, v] of Object.entries(u)) if (Number.isFinite(+v?.max_build)) max[id] = +v.max_build;
+      } catch {}
+    }
+    for (const [u, n] of Object.entries(units)) if (n > 0 && u in max && max[u] < n) return { ok: false, unit: u, n, max: max[u] };
+    return { ok: true };
+  }
+  // 3) Lanza los hechizos del plan, uno detrás de otro (la orden va justo después).
+  // Devuelve el motivo si falla uno OBLIGATORIO (entonces no se recluta).
+  async function castRecruitSpells(townId, list) {
+    for (let i = 0; i < list.length; i++) {
+      const { sd, p, mode, cost, key } = list[i];
+      if (i) await sleep(400 + Math.random() * 400);
       try {
         await gpPostAs(townId, 'frontend_bridge', 'execute', { model_url: 'CastedPowers', action_name: 'cast', captcha: null, arguments: { power_id: sd.id, target_id: +townId }, nl_init: true });
         if (!spellInfo.active.has(+townId)) spellInfo.active.set(+townId, {});
         spellInfo.active.get(+townId)[sd.id] = Date.now() + (+p.lifetime || 3600) * 1000;
         recruitLog(`${farmTownName(townId)}: hechizo ${p.name} lanzado (${cost} favor).`, 'ok');
         setTimeout(refreshCastedPowers, 3000);
-        await sleep(600 + Math.random() * 600);
       } catch (e) {
         // Si el juego dice que ya está activo, se da por activo (no bloquea el reclutamiento).
         if (/activ|ya est|already|en curso|lanzad/i.test(e.message)) {
@@ -4559,9 +4595,8 @@
       if (!recruitEnabledFor(townId)) continue;
       const tc = townRecruitCfg(townId);
       if (tc.startAt && tc.startAt <= Date.now()) { delete tc.startAt; saveState(); recruitLog(`${farmTownName(townId)}: empieza el reclutamiento programado.`, 'ok'); }
-      // (Los hechizos NO se lanzan por lo que ya está en la cola del juego: solo
-      // afectan a lo que se recluta después, así que se lanzan justo antes de
-      // mandar un lote del bot — ver abajo.)
+      // (Los hechizos NO se lanzan por la cola ni mientras llegan los recursos: solo
+      // justo antes de mandar un lote del bot, ya confirmado por el juego — ver abajo.)
       if (!townRecruitCfg(townId).goals.length || !unitQueueFree(townId)) continue;
       if ((recruitRuntime.cooldown.get(townId) || 0) > Date.now()) continue;
       // (recruitBatch sin atMs = huecos de ahora mismo)
@@ -4572,11 +4607,27 @@
       const fr = reserveAbove(townId, 'reclutamiento');
       if (RES.some((k) => cur[k] - fr[k] < b.cost[k])) continue;
       if (b.favor && godFavor(townGod(townId)) < b.favor) continue;
-      // Hechizos del cuartel / puerto: los obligatorios deben estar activos antes de reclutar.
+      // Hechizos del cuartel / puerto: se lanzan pegados a la orden (los obligatorios
+      // deben estar activos antes de reclutar).
+      const setWait = (why) => { if (recruitRuntime.wait.get(townId) !== why) { recruitRuntime.wait.set(townId, why); renderIfIdle('reclutamiento'); } };
       const lotKinds = [...new Set(Object.entries(b.units).filter(([, n]) => n > 0).map(([u]) => (isNavalUnit(u) ? 'naval' : 'ground')))];
-      let waitSpell = null;
-      for (const kind of lotKinds) { waitSpell = await ensureRecruitSpells(townId, kind); if (waitSpell) break; }
-      if (waitSpell) { if (recruitRuntime.wait.get(townId) !== waitSpell) { recruitRuntime.wait.set(townId, waitSpell); renderIfIdle('reclutamiento'); } continue; }
+      const plan = await planRecruitSpells(townId, lotKinds);
+      if (plan.wait) { setWait(plan.wait); continue; }
+      if (plan.cast.length) {
+        // Hay que gastar favor: antes, el juego confirma que el lote entra YA (si los
+        // recursos aún vienen de camino, se espera sin lanzar nada).
+        const vKey = `${townId}:verify`;
+        if ((recruitRuntime.cooldown.get(vKey) || 0) > Date.now()) continue;
+        const ready = await lotReadyInGame(townId, b.units);
+        if (!ready.ok) {
+          recruitRuntime.cooldown.set(vKey, Date.now() + 45000);
+          setWait(`Recursos aún llegando (el juego deja ${ready.max}/${ready.n} ${unitName(ready.unit)}): el hechizo se lanzará al reclutar`);
+          continue;
+        }
+        const failed = await castRecruitSpells(townId, plan.cast);
+        if (failed) { setWait(failed); continue; }
+        await sleep(250 + Math.random() * 250);
+      }
       recruitRuntime.wait.delete(townId);
       for (const [unitId, amount] of Object.entries(b.units)) {
         if (!(amount > 0)) continue;
@@ -4708,7 +4759,7 @@
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
       el('div', { class: 'nb-card-title' }, `Hechizos de reclutamiento · ${farmTownName(townId)}`),
       ...spellRows,
-      el('p', { class: 'nb-placeholder nb-mt' }, 'Opcional: se lanza si hay favor. Obligatorio: no recluta hasta tenerlo activo (espera al favor y lo lanza solo). Mientras haya órdenes en cola se mantiene activo.')
+      el('p', { class: 'nb-placeholder nb-mt' }, 'Opcional: se lanza si hay favor. Obligatorio: no recluta hasta tenerlo activo (espera al favor y lo lanza solo). Se lanza justo antes de mandar la orden, nunca mientras los recursos vienen de camino.')
     ]));
 
     // Siguiente lote
@@ -6962,7 +7013,7 @@
       { t: 'Hechizos de reclutamiento', find: () => TQ.card(/^Hechizos de reclutamiento/), h: `
         <p>Por ciudad, para Entrenamiento espartano, Crecimiento de la población y La llamada del mar:</p>
         <ul><li><b>No</b>: no se usa.</li><li><b>Opcional</b>: se lanza si hay favor.</li><li><b>Obligatorio</b>: no recluta hasta tenerlo activo (espera al favor y lo lanza solo).</li></ul>
-        ${AUTO('Se lanzan justo antes de mandar un lote (a lo que ya está en cola no le afectan).')}` },
+        ${AUTO('Se lanzan <b>justo antes de mandar la orden</b>: primero el juego confirma que el lote ya se puede reclutar (recursos y población en la ciudad) y entonces van el hechizo y la orden seguidos. Mientras los recursos vienen de camino no se lanza, para no gastar su duración con la cola vacía.')}` },
       { t: 'Siguiente lote', find: () => TQ.card(/^Siguiente lote/), h: `
         <p>Qué tropa y cuántas, población y favor que usa, y barras con los recursos que tiene la ciudad frente a lo que cuesta.</p>
         <p>Si no hay lote, te dice por qué: cola llena (hasta qué hora), esperando investigación, sin población, en espera, reservado para otro módulo…</p>
@@ -7126,6 +7177,10 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.14.1', items: [
+      { t: 'Hechizos de reclutamiento, justo a tiempo', tab: 'reclutamiento', find: () => TQ.card(/^Hechizos de reclutamiento/) || TQ.tab('reclutamiento'), h: `
+        <p>Los hechizos <b>Opcional</b> y <b>Obligatorio</b> ya no se lanzan mientras los recursos del lote vienen de camino: el bot espera a que el juego confirme que el lote entra y lanza el hechizo justo antes de la orden, así aprovecha toda su duración.</p>` }
+    ] },
     { v: '1.14.0', items: [
       { t: 'Subir aldeas de nivel', tab: 'granjas', find: () => TQ.card(/^Subir aldeas/) || TQ.tab('granjas'), h: `
         <p>En Granjas, nueva tarjeta <b>Subir aldeas de nivel</b>: eliges nivel 1–6 y el bot sube todas las aldeas de tus islas que estén por debajo, con puntos de combate, empezando por las más bajas. Puedes guardar un mínimo de puntos.</p>` }
