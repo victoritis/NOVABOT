@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.14.2
+// @version      1.14.3
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.14.2';
+  const VERSION = '1.14.3';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -84,6 +84,17 @@
   const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
   const pos = (v, d = 0) => { const n = Math.round(+v); return Number.isFinite(n) && n >= 0 ? n : d; };
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const isPlainObj = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+  // Copia src dentro de dst sin cambiar dst de objeto (ni sus sub-objetos): quien tenga
+  // una referencia a dst o a uno de sus sub-objetos sigue viendo los datos buenos.
+  function reconcileInto(dst, src) {
+    for (const k of Object.keys(dst)) if (!(k in src)) delete dst[k];
+    for (const [k, v] of Object.entries(src)) {
+      if (isPlainObj(dst[k]) && isPlainObj(v)) reconcileInto(dst[k], v);
+      else dst[k] = v;
+    }
+    return dst;
+  }
   const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
   }[c]));
@@ -492,7 +503,7 @@
       const now = Date.now();
       let st, cls;
       if (!recruitOnFor(id)) { st = 'Desactivado'; cls = 'off'; }
-      else if (cfg.hold) { st = 'En espera (sin hora)'; cls = 'wait'; }
+      else if (cfg.hold) { st = 'En espera SIN hora (no empieza sola)'; cls = 'wait'; }
       else if (+cfg.startAt > now) { st = ['Empieza en ', el('b', { 'data-nb-until': Math.round(cfg.startAt / 1000) }, formatLeft(Math.round(cfg.startAt / 1000)))]; cls = 'wait'; }
       else if (recruitRuntime.wait.get(id)) { st = recruitRuntime.wait.get(id); cls = 'wait'; }
       else if (!b) { st = 'Objetivos cumplidos'; cls = 'done'; }
@@ -512,7 +523,7 @@
           el('div', { class: 'nb-rc-unit-main' }, [
             el('div', { class: 'nb-rc-unit-top' }, [el('b', {}, unitName(g.id)), el('span', {}, `${h}${q ? ` + ${q} en cola` : ''} / ${g.target}`)]),
             el('div', { class: 'nb-bar nb-rc-bar' }, [el('div', { class: 'nb-bar-fill nb-rc-q', style: `width:${pct}%` }), el('div', { class: 'nb-bar-fill', style: `width:${pctHave}%` })]),
-            el('div', { class: 'nb-rc-unit-sub' }, rem ? `faltan ${rem}${unitResearched(id, g.id) ? '' : ' · esperando investigación'}` : 'completo')
+            el('div', { class: 'nb-rc-unit-sub' }, rem ? `faltan ${rem}${unitResearched(id, g.id) ? '' : ' · esperando investigación'}` : goalMetOnlyByFlight(id, g, have, queued) ? `completo contando ${unitsInFlight(id).units[g.id]} que van atacando: se recuenta al llegar` : recruitWaiting(id) || +cfg.startAt > 0 ? 'completo ahora: se recuenta al empezar' : 'completo')
           ])
         ]);
       });
@@ -762,13 +773,22 @@
       // Ataques del bot que salen de esta ciudad
       const atks = atk.queue.filter((a) => +a.source === id && a.status === 'pending').sort((a, b) => a.executeAt - b.executeAt);
       const attacks = el('div', { class: 'nb-ov-cell' }, [atks.length ? el('div', {}, [el('span', { class: 'nb-ov-count' }, String(atks.length)), ' · sale ', el('b', { 'data-atk-at': atks[0].executeAt }, fmtCount(atks[0].executeAt - srvNow()))]) : dim('—')]);
+      // Recursos: % del almacén de cada uno (y la cantidad). ≥ 90 % en amarillo.
+      const rs = townResources(id), cap = townStorage(id) || 0;
+      const kfmt = (n) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(Math.floor(n)));
+      const resources = el('div', { class: 'nb-ov-cell' }, RES.map((k) => {
+        const pct = cap ? Math.min(100, Math.floor(rs[k] / cap * 100)) : null;
+        return el('div', { title: `${Math.floor(rs[k]).toLocaleString('es-ES')}${cap ? ` de ${cap.toLocaleString('es-ES')}` : ''}` }, [resIcon(k),
+          el('span', { class: `nb-ov-count${pct >= 90 ? ' nb-warn-txt' : ''}` }, pct == null ? '—' : `${pct} %`), dim(kfmt(rs[k]))]);
+      }));
       const cur = +UW.Game?.townId === id;
       return el('tr', { class: cur ? 'nb-ov-current' : '' }, [
         el('td', { class: 'nb-ov-town' }, farmTownName(id)),
+        el('td', {}, resources),
         el('td', {}, build), el('td', {}, recruit), el('td', {}, fest), el('td', {}, trade), el('td', {}, attacks)
       ]);
     });
-    const head = el('tr', {}, ['Ciudad', 'Construcción', 'Reclutamiento', 'Festival', 'Llega (comercio)', 'Ataques del bot'].map((h) => el('th', {}, h)));
+    const head = el('tr', {}, ['Ciudad', 'Recursos', 'Construcción', 'Reclutamiento', 'Festival', 'Llega (comercio)', 'Ataques del bot'].map((h) => el('th', {}, h)));
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
       el('div', { class: 'nb-card-title' }, `Vista general · ${towns.length} ciudades`),
       el('div', { class: 'nb-ov-wrap' }, [el('table', { class: 'nb-ov' }, [el('thead', {}, [head]), el('tbody', {}, rows)])]),
@@ -862,7 +882,7 @@
     bodyEl = el('div', { class: 'nb-body' });
 
     const footer = el('div', { class: 'nb-footer' }, [
-      el('span', {}, [el('b', {}, 'NOVABOT'), ' activo']),
+      el('span', {}, [el('b', {}, 'NOVABOT'), ' activo', el('span', { id: 'nb-runner-badge', class: 'nb-warn-txt', style: 'display:none;margin-left:8px' }, '')]),
       el('span', {}, `es147`)
     ]);
 
@@ -1488,6 +1508,7 @@
     // Revisa cada 5s qué ciudades ya cumplieron su espera; el retraso aleatorio
     // configurable se aplica DENTRO de farmTick, entre ciudad y ciudad.
     farmRuntime.timer = setInterval(() => {
+      if (!isRunner()) return;
       if (!state.granjas.enabled || farmRuntime.running) return;
       farmRuntime.running = true;
       farmTick()
@@ -2024,6 +2045,7 @@
   function startVillageLevelEngine() {
     if (vlRuntime.timer) return;
     vlRuntime.timer = setInterval(() => {
+      if (!isRunner()) return;
       if (!state.aldeasNivel?.enabled || vlRuntime.running) return;
       vlRuntime.running = true;
       villageLevelTick().catch((e) => farmLog(`Subir aldeas: ${e.message}`, 'error')).finally(() => { vlRuntime.running = false; });
@@ -2180,6 +2202,7 @@
   function startCaveEngine() {
     if (caveRuntime.timer) return;
     caveRuntime.timer = setInterval(() => {
+      if (!isRunner()) return;
       if (!caveOn() || caveRuntime.running) return;
       caveRuntime.running = true;
       caveTick().catch((e) => caveLog(`Error: ${e.message}`, 'error')).finally(() => { caveRuntime.running = false; });
@@ -2260,6 +2283,7 @@
   function startExchangeEngine() {
     if (exRuntime.timer) return;
     exRuntime.timer = setInterval(() => {
+      if (!isRunner()) return;
       if (!state.aldeas.enabled || exRuntime.running) return;
       exRuntime.running = true;
       exchangeTick().catch((e) => farmLog(`Intercambio: ${e.message}`, 'error')).finally(() => { exRuntime.running = false; });
@@ -2555,6 +2579,7 @@
   function startBuildEngine() {
     if (buildRuntime.timer) return;
     buildRuntime.timer = setInterval(() => {
+      if (!isRunner()) return;
       if (!anyBuildEnabled() || buildRuntime.running) return;
       buildRuntime.running = true;
       buildTick().catch((e) => buildLog(`Error: ${e.message}`, 'error'))
@@ -3049,8 +3074,14 @@
     try { return +JSON.parse(atob(m[1])).id || 0; } catch { return 0; }
   }
 
-  async function refreshOverviews() {
-    if (overview.busy) return;
+  // Si ya hay una lectura en marcha, se devuelve esa (quien necesite datos frescos puede
+  // esperarla con await; antes volvía al instante sin esperar).
+  function refreshOverviews() {
+    if (overview.inflight) return overview.inflight;
+    overview.inflight = refreshOverviewsImpl().finally(() => { overview.inflight = null; });
+    return overview.inflight;
+  }
+  async function refreshOverviewsImpl() {
     overview.busy = true;
     try {
       const [tr, rc] = await Promise.all([
@@ -3383,9 +3414,17 @@
     return txt.length > 3 ? `${txt.slice(0, 3).join(', ')} y ${txt.length - 3} más` : txt.join(', ');
   }
 
+  /* El juego no deja comerciar entre ciudades con el almacén por debajo de nivel 5 (aviso
+     del juego al intentarlo). Por si acaso, el bot deja fuera del comercio entre ciudades
+     (encargos, equilibrio y alimentar aldeas) las que lo tienen por debajo de nivel 6: ni
+     donan ni reciben. (El intercambio con las aldeas de su isla no cambia.) */
+  const TRADE_MIN_STORAGE_LEVEL = 6;
+  function storageLevel(id) { try { return +UW.ITowns.getTown(+id)?.getBuildings?.()?.attributes?.storage || 0; } catch { return 0; } }
+  const tradeTownOk = (id) => { const l = storageLevel(id); return !l || l >= TRADE_MIN_STORAGE_LEVEL; };
+
   function planTrades() {
     const cfg = state.comercio;
-    const towns = allTownIds();
+    const towns = allTownIds().filter(tradeTownOk);
     const transit = transitRows();
     const demands = collectDemands();
     const now = Date.now();
@@ -3758,7 +3797,7 @@
     const maxTravel = Math.max(1, +cfg.maxTravelMin || 45) * 60;
     // Parte de los comerciantes que puede usar cada ciudad (lo demás queda libre para encargos).
     const capPct = clamp(free ? (+cfg.maxCapPct || 60) : (+cfg.busyCapPct || 20), 0, 100) / 100;
-    const ids = M.towns;
+    const ids = M.towns.filter(tradeTownOk); // almacén < nivel 6: fuera del comercio entre ciudades
     const moves = new Map();
     const capLeft = {};
     for (const id of ids) { const t = M.T[id]; capLeft[id] = Math.max(0, Math.min(t.cap, t.cap - t.maxCap * (1 - capPct))); }
@@ -3812,6 +3851,7 @@
       for (const [r, u] of ctx.up) for (const k of resList) { const l = lack(r, k); if (l >= 100) wants.push({ r, k, l, at: u.at }); }
       wants.sort((a, b) => a.at - b.at || b.l - a.l);
       for (const w of wants) {
+        if (!tradeTownOk(w.r)) continue;
         let need = Math.min(lack(w.r, w.k), room(w.r, w.k, 0));
         const donors = ids
           .filter((d) => d !== w.r && !onCooldown(d, w.r) && travelSec(d, w.r) <= maxTravel && !ctx.up.has(d))
@@ -3832,6 +3872,7 @@
     if (free && state.aldeas.enabled && state.aldeas.feed) {
       for (const w of exFeedWants(M)) {
         const X = w.give, e = w.townId;
+        if (!tradeTownOk(e)) continue;
         const donor = ids
           .filter((d) => d !== e && !onCooldown(d, e) && travelSec(d, e) <= maxTravel)
           .map((d) => ({ d, x: Math.floor(Math.min(giveable(d, X), M.T[d].lvl[X] - M.F[X] * M.T[d].storage, capLeft[d])) }))
@@ -4015,6 +4056,7 @@
   function startTradeEngine() {
     if (tradeRuntime.timer) return;
     tradeRuntime.timer = setInterval(() => {
+      if (!isRunner()) return;
       if (!state.comercio.enabled || tradeRuntime.running) return;
       tradeRuntime.running = true;
       tradeTick().catch((e) => tradeLog(`Error: ${e.message}`, 'error')).finally(() => { tradeRuntime.running = false; });
@@ -4044,6 +4086,7 @@
       optionRow('Abastecer reclutamiento', 'Envía lo que falta para completar los lotes de tropas', !!cfg.forRecruit, (v) => { cfg.forRecruit = v; saveState(); renderBody(); }),
       optionRow('Abastecer investigación', 'Solo cuando la ciudad tiene puntos de investigación para esa investigación', cfg.forResearch !== false, (v) => { cfg.forResearch = v; saveState(); renderBody(); }),
       optionRow('Abastecer festivales', 'Envía justo lo que falta para el festival (Academia 30+)', cfg.forFestival !== false, (v) => { cfg.forFestival = v; saveState(); renderBody(); }),
+      (() => { const low = allTownIds().filter((id) => !tradeTownOk(id)); return low.length ? el('div', { class: 'nb-alert nb-alert-warn' }, `Fuera del comercio entre ciudades (almacén por debajo de nivel ${TRADE_MIN_STORAGE_LEVEL}, el juego no deja): ${low.map((id) => `${farmTownName(id)} (nv ${storageLevel(id)})`).join(', ')}. Ni donan ni reciben hasta subirlo.`) : null; })(),
       el('p', { class: 'nb-placeholder' }, 'Aquí se elige a qué módulos manda recursos el comercio (es el único sitio). Revisa cada 10 s. Abastece todos los encargos que caben en la cola de cada ciudad. Nunca dona lo que la donante va a gastar y nunca hace que se pierda recurso al llegar.')
     ]));
 
@@ -4110,14 +4153,19 @@
   const recruitOnFor = (townId) => { const v = state.reclutamiento.towns[townId]?.enabled; return typeof v === 'boolean' ? v : !!state.reclutamiento.enabled; };
   // En espera: "Empezar más tarde" activado (aún sin hora) o con la hora sin llegar.
   // Mientras tanto la ciudad no pide ni reserva nada (y puede donar).
-  const recruitWaiting = (townId) => { const t = state.reclutamiento.towns[townId]; return !!t && (!!t.hold || (+t.startAt || 0) > Date.now()); };
+  const recruitWaiting = (townId) => { const t = state.reclutamiento.towns[townId]; return !!t && ((!!t.hold && !(+t.startAt > 0)) || (+t.startAt || 0) > Date.now()); };
   const recruitEnabledFor = (townId) => recruitOnFor(townId) && !recruitWaiting(townId);
   const anyRecruitOn = () => allTownIds().some(recruitOnFor);
 
   function townRecruitCfg(townId) {
     const all = state.reclutamiento.towns;
     if (!all[townId]) all[townId] = { goals: [] };
-    return all[townId];
+    const t = all[townId];
+    if (!Array.isArray(t.goals)) t.goals = [];
+    // Con hora puesta, la espera "sin hora" sobra (si no, al llegar la hora seguiría en
+    // espera para siempre, sin cuenta atrás).
+    if (t.hold && +t.startAt > 0) delete t.hold;
+    return t;
   }
 
   function unitName(id) { const u = UW.GameData?.units?.[id]; return u?.name_plural || u?.name || id; }
@@ -4569,15 +4617,86 @@
     return null;
   }
 
+  /* Tropas de cada ciudad que van en un ATAQUE que aún no ha llegado (Vista general de
+     órdenes del juego: órdenes de ida que salen de tus ciudades, sin contar apoyos).
+     Cuentan como "las tienes" (están fuera), pero pueden morir en el combate: un objetivo
+     que solo está cumplido gracias a ellas NO se quita hasta que lleguen. Al llegar se
+     vuelve a contar: si murieron, se reclutan; si vuelven, se quita. */
+  const recruitFlight = { at: 0, busy: null, byTown: new Map(), timers: new Set() }; // townId -> [{ arr (ms servidor), units }]
+  function refreshRecruitFlight(force = false) {
+    if (recruitFlight.busy) return recruitFlight.busy;
+    if (!force && Date.now() - recruitFlight.at < 60000) return Promise.resolve();
+    recruitFlight.busy = (async () => {
+      try {
+        const list = await fetchCommandOverview();
+        if (!Array.isArray(list)) return;
+        const own = new Set(allTownIds().map(Number)), unitIds = Object.keys(UW.GameData?.units || {});
+        const now = srvNow(), map = new Map();
+        for (const c of list) {
+          if (!/^\d+$/.test(String(c.id)) || c.return || c.cmd_return || c.type === 'support') continue;
+          const o = +c.origin_town_id, arr = +c.arrival_at * 1000;
+          if (!own.has(o) || !(arr > now)) continue;
+          const units = {};
+          for (const u of unitIds) { const n = +c[u] || 0; if (n > 0) units[u] = n; }
+          if (!Object.keys(units).length) continue;
+          if (!map.has(o)) map.set(o, []);
+          map.get(o).push({ arr, units });
+          // Tras el combate, leer enseguida cuántas quedan (vista de reclutamiento del juego).
+          const key = Math.round(arr / 1000);
+          if (!recruitFlight.timers.has(key)) {
+            recruitFlight.timers.add(key);
+            setTimeout(() => { recruitFlight.timers.delete(key); refreshOverviews(); }, Math.max(0, arr - now) + 6000);
+          }
+        }
+        // Se conservan los que ya llegaron pero aún no se han vuelto a contar.
+        for (const [o, cmds] of recruitFlight.byTown) for (const c of cmds) if (c.arr <= now && !flightSettled(c)) { if (!map.has(o)) map.set(o, []); if (!map.get(o).some((x) => x.arr === c.arr)) map.get(o).push(c); }
+        recruitFlight.byTown = map; recruitFlight.at = Date.now();
+      } catch {} finally { recruitFlight.busy = null; }
+    })();
+    return recruitFlight.busy;
+  }
+  // Un ataque deja de ser "dudoso" cuando ya llegó Y la vista de reclutamiento del juego
+  // se ha leído después del combate (así las muertas ya no cuentan).
+  const flightSettled = (c) => c.arr <= srvNow() && overview.recruitAt + clockOffset().off >= c.arr + 5000;
+  function unitsInFlight(townId) {
+    const units = {}; let until = 0;
+    for (const c of recruitFlight.byTown.get(+townId) || []) {
+      if (flightSettled(c)) continue;
+      for (const [u, n] of Object.entries(c.units)) units[u] = (units[u] || 0) + n;
+      until = Math.max(until, c.arr);
+    }
+    return { units, until };
+  }
+  // Texto bajo cada tropa pedida (pestaña Reclutamiento).
+  function goalSubText(townId, g, have, queued) {
+    const hv = +have[g.id] || 0, q = +queued[g.id] || 0, h = hv + q;
+    const fl = unitsInFlight(townId), fly = +fl.units[g.id] || 0;
+    const parts = [`tienes ${hv}${q ? ` + ${q} en cola` : ''}`];
+    if (fly) parts.push(`${fly} van atacando (llegan ${fmtClock(fl.until)})`);
+    if (h < g.target) parts.push(`faltan ${g.target - h}`);
+    else if (goalMetOnlyByFlight(townId, g, have, queued)) parts.push('cumplido contando las que van atacando: se recuenta al llegar (si mueren, se reclutan)');
+    else if (recruitWaiting(townId) || +townRecruitCfg(townId).startAt > 0) parts.push('cumplido ahora: se recuenta al empezar');
+    if (!unitResearched(townId, g.id)) parts.push('esperando a que se investigue');
+    return parts.join(' · ');
+  }
+  // ¿Está cumplido este objetivo solo gracias a tropas que van atacando? (→ no se quita aún)
+  function goalMetOnlyByFlight(townId, g, have, queued) {
+    const fly = +unitsInFlight(townId).units[g.id] || 0;
+    const h = (+have[g.id] || 0) + (+queued[g.id] || 0);
+    return fly > 0 && h >= g.target && h - fly < g.target;
+  }
+
   // Objetivos cumplidos: en cuanto todo lo que faltaba está ya en la cola del juego (o
   // hecho), el bot no tiene nada más que hacer → se quitan (como en Construcción).
   // En espera NO se quitan: se decide al empezar (si para entonces se perdieron tropas,
   // p. ej. atacando, se reclutan; si siguen todas, se quita sin reclutar nada).
   function pruneRecruitGoals(townId) {
     const cfg = townRecruitCfg(townId);
-    if (!cfg.goals.length || recruitWaiting(townId)) return;
+    // (con hora de inicio aún puesta tampoco: al llegar la hora, el motor lee datos frescos
+    // antes de decidir; el panel no se adelanta con datos viejos)
+    if (!cfg.goals.length || recruitWaiting(townId) || +cfg.startAt > 0) return;
     const have = townUnitsHave(townId), queued = queuedUnits(townId);
-    const done = cfg.goals.filter((g) => (+have[g.id] || 0) + (+queued[g.id] || 0) >= g.target);
+    const done = cfg.goals.filter((g) => (+have[g.id] || 0) + (+queued[g.id] || 0) >= g.target && !goalMetOnlyByFlight(townId, g, have, queued));
     if (!done.length) return;
     cfg.goals = cfg.goals.filter((g) => !done.includes(g));
     saveState();
@@ -4590,13 +4709,19 @@
     // Coste real (héroes, investigaciones…): refrescar las ciudades con tropas pedidas.
     const stale = allTownIds().filter((id) => recruitOnFor(id) && townRecruitCfg(id).goals.length && realCostsStale(id));
     for (const id of stale.slice(0, 3)) await refreshRealCosts(id);
+    // Ciudades a las que les llega AHORA su hora de empezar: antes de decidir nada (quitar
+    // objetivos ya cumplidos o reclutar), datos frescos del juego: tropas que tienes, colas y
+    // ataques aún en camino (si en la espera atacaste y perdiste tropas, se ve aquí).
+    const starting = allTownIds().filter((id) => { const t = state.reclutamiento.towns[id]; return t && +t.startAt > 0 && +t.startAt <= Date.now() && recruitOnFor(id); });
+    if (starting.length) { await refreshOverviews(); await refreshRecruitFlight(true); }
+    else if (allTownIds().some((id) => recruitOnFor(id) && townRecruitCfg(id).goals.length)) await refreshRecruitFlight(false);
     for (const id of allTownIds()) pruneRecruitGoals(id);
     const anySpells = allTownIds().some((id) => recruitEnabledFor(id) && Object.values(townRecruitCfg(id).spells || {}).some(Boolean));
     if (anySpells && Date.now() - spellInfo.at > 60000) await refreshCastedPowers();
     for (const townId of allTownIds()) {
       if (!recruitEnabledFor(townId)) continue;
       const tc = townRecruitCfg(townId);
-      if (tc.startAt && tc.startAt <= Date.now()) { delete tc.startAt; saveState(); recruitLog(`${farmTownName(townId)}: empieza el reclutamiento programado.`, 'ok'); }
+      if (tc.startAt && tc.startAt <= Date.now()) { delete tc.startAt; delete tc.hold; saveState(); recruitLog(`${farmTownName(townId)}: empieza el reclutamiento programado.`, 'ok'); renderIfIdle('reclutamiento'); renderIfIdle('resumen'); }
       // (Los hechizos NO se lanzan por la cola ni mientras llegan los recursos: solo
       // justo antes de mandar un lote del bot, ya confirmado por el juego — ver abajo.)
       if (!townRecruitCfg(townId).goals.length || !unitQueueFree(townId)) continue;
@@ -4622,7 +4747,7 @@
         if ((recruitRuntime.cooldown.get(vKey) || 0) > Date.now()) continue;
         const ready = await lotReadyInGame(townId, b.units);
         if (!ready.ok) {
-          recruitRuntime.cooldown.set(vKey, Date.now() + 45000);
+          recruitRuntime.cooldown.set(vKey, Date.now() + 20000);
           setWait(`Recursos aún llegando (el juego deja ${ready.max}/${ready.n} ${unitName(ready.unit)}): el hechizo se lanzará al reclutar`);
           continue;
         }
@@ -4651,6 +4776,7 @@
   function startRecruitEngine() {
     if (recruitRuntime.timer) return;
     recruitRuntime.timer = setInterval(() => {
+      if (!isRunner()) return;
       if (!anyRecruitOn() || recruitRuntime.running) return;
       recruitRuntime.running = true;
       recruitTick().catch((e) => recruitLog(`Error: ${e.message}`, 'error')).finally(() => { recruitRuntime.running = false; });
@@ -4676,47 +4802,59 @@
     const tcfg = townRecruitCfg(townId);
     if (realCostsStale(townId) && !renderReclutamientoTab.loading) {
       renderReclutamientoTab.loading = true;
-      refreshRealCosts(townId).finally(() => { renderReclutamientoTab.loading = false; if (state.activeTab === 'reclutamiento' && +UW.Game?.townId === townId) renderBody(); });
+      // (renderIfIdle: si estás escribiendo, p. ej. los minutos de "Empezar dentro de", no se
+      // repinta y no se pierde lo escrito)
+      refreshRealCosts(townId).finally(() => { renderReclutamientoTab.loading = false; if (+UW.Game?.townId === townId) renderIfIdle('reclutamiento'); });
     }
 
     const sw = switchEl(!!cfg.enabled, (v) => { setModuleGlobal('reclutamiento', v); renderBody(); recruitLog(v ? 'Reclutamiento activado en todas las ciudades.' : 'Reclutamiento desactivado en todas las ciudades.'); }, false);
     const isExc = typeof tcfg.enabled === 'boolean' && tcfg.enabled !== !!cfg.enabled;
+    // (Los botones leen la configuración de la ciudad AL PULSAR, no la de cuando se pintó
+    // el panel: así nunca se pierde un clic aunque la configuración se haya recargado.)
+    const T = () => townRecruitCfg(townId);
     const townSw = switchEl(recruitOnFor(townId), (v) => {
-      if (v === !!cfg.enabled) delete tcfg.enabled; else tcfg.enabled = v;
-      if (!v) { delete tcfg.startAt; delete tcfg.hold; }
+      const t = T();
+      if (v === !!state.reclutamiento.enabled) delete t.enabled; else t.enabled = v;
+      if (!v) { delete t.startAt; delete t.hold; }
       saveState(); renderBody();
       recruitLog(`${farmTownName(townId)}: reclutamiento ${v ? 'activado' : 'desactivado'} solo en esta ciudad.`);
     });
     // Inicio programado (solo esta ciudad) — desactivado por defecto
     // Al activar el interruptor la ciudad queda YA en espera (no pide ni reserva
     // recursos) aunque todavía no se haya puesto la hora.
-    const delayIn = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '1', value: '', placeholder: 'min' });
-    const scheduled = tcfg.startAt && tcfg.startAt > Date.now();
+    // Los minutos que escribes se guardan (por ciudad) aunque el panel se repinte.
+    const startDrafts = (renderReclutamientoTab.startDrafts ||= {});
+    const delayIn = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '1', value: startDrafts[townId] || '', placeholder: 'min' });
+    delayIn.addEventListener('input', () => { if (delayIn.value) startDrafts[townId] = delayIn.value; else delete startDrafts[townId]; });
+    const scheduled = +tcfg.startAt > Date.now();
     const program = () => {
-      const min = pos(delayIn.value, 0);
-      if (!min) { delayIn.focus(); return; }
-      tcfg.startAt = Date.now() + min * 60000; delete tcfg.hold;
-      if (!recruitOnFor(townId)) tcfg.enabled = true;
+      const min = pos(delayIn.value || startDrafts[townId], 0);
+      if (!min) { delayIn.focus(); delayIn.style.outline = '1px solid #e06c6c'; delayIn.placeholder = '¿min?'; return; }
+      const t = T();
+      t.startAt = Date.now() + min * 60000; delete t.hold;
+      if (!recruitOnFor(townId)) t.enabled = true;
+      delete startDrafts[townId];
       saveState(); renderBody();
-      recruitLog(`${farmTownName(townId)}: reclutamiento programado para dentro de ${min} min.`, 'ok');
+      recruitLog(`${farmTownName(townId)}: reclutamiento programado para dentro de ${min} min (${new Date(t.startAt).toLocaleTimeString('es-ES')}).`, 'ok');
     };
     delayIn.addEventListener('keydown', (e) => { if (e.key === 'Enter') program(); });
     const startBox = scheduled
       ? el('div', { class: 'nb-alert nb-alert-info' }, [
           el('span', {}, ['Empieza en ', el('b', { 'data-nb-until': Math.round(tcfg.startAt / 1000) }, formatLeft(Math.round(tcfg.startAt / 1000))), ` (${new Date(tcfg.startAt).toLocaleTimeString('es-ES')})`]),
-          el('span', { class: 'nb-btn nb-btn-sm', onclick: () => { delete tcfg.startAt; delete tcfg.hold; saveState(); renderBody(); recruitLog(`${farmTownName(townId)}: inicio programado cancelado.`); } }, 'Cancelar')
+          el('span', { class: 'nb-btn nb-btn-sm', onclick: () => { const t = T(); delete t.startAt; delete t.hold; saveState(); renderBody(); recruitLog(`${farmTownName(townId)}: inicio programado cancelado (recluta ya).`); } }, 'Cancelar')
         ])
       : tcfg.hold
       ? el('div', { class: 'nb-row' }, [
-          el('div', { class: 'nb-option-text' }, [el('span', { class: 'nb-option-label' }, 'Empezar dentro de'), el('span', { class: 'nb-option-hint nb-warn-txt' }, 'En espera: no recibe ni reserva recursos hasta que empiece')]),
+          el('div', { class: 'nb-option-text' }, [el('span', { class: 'nb-option-label' }, 'Empezar dentro de'), el('span', { class: 'nb-option-hint nb-warn-txt' }, 'En espera SIN hora: no empieza sola. Pon los minutos y pulsa Programar (✕ = empezar ya)')]),
           el('span', { class: 'nb-stepper' }, [delayIn, el('span', { class: 'nb-add-level' }, 'min'),
-            el('span', { class: 'nb-mini', title: 'Quitar la espera', onclick: () => { delete tcfg.hold; saveState(); renderBody(); recruitLog(`${farmTownName(townId)}: espera quitada.`); } }, '✕'),
+            el('span', { class: 'nb-mini', title: 'Quitar la espera (empieza ya)', onclick: () => { const t = T(); delete t.hold; delete t.startAt; delete startDrafts[townId]; saveState(); renderBody(); recruitLog(`${farmTownName(townId)}: espera quitada.`); } }, '✕'),
             el('span', { class: 'nb-btn nb-btn-sm', onclick: program }, 'Programar')])
         ])
       : optionRow('Empezar más tarde', 'Solo en esta ciudad. Desde que lo activas no recibe ni reserva recursos (puede donar)', false, (v) => {
           if (!v) return;
-          tcfg.hold = true; saveState(); renderBody();
+          const t = T(); t.hold = true; delete t.startAt; saveState(); renderBody();
           recruitLog(`${farmTownName(townId)}: en espera, sin pedir recursos hasta que se programe.`);
+          setTimeout(() => { try { document.querySelector('#novabot-panel .nb-stepper input[placeholder="min"]')?.focus(); } catch {} }, 50);
         });
 
     const fillIn = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '10', max: '100', value: cfg.fillPct });
@@ -4743,7 +4881,7 @@
       const p = UW.GameData?.powers?.[sd.id]; if (!p) return null;
       const mode = tcfg.spells?.[sd.id] || '';
       const fav = Math.floor(godFavor(p.god_id)), end = spellEnd(townId, sd.id);
-      const setMode = (m) => { tcfg.spells = { ...(tcfg.spells || {}) }; if (m) tcfg.spells[sd.id] = m; else delete tcfg.spells[sd.id]; if (!Object.keys(tcfg.spells).length) delete tcfg.spells; saveState(); renderBody(); };
+      const setMode = (m) => { const t = T(); t.spells = { ...(t.spells || {}) }; if (m) t.spells[sd.id] = m; else delete t.spells[sd.id]; if (!Object.keys(t.spells).length) delete t.spells; saveState(); renderBody(); };
       const seg = el('div', { class: 'nb-seg nb-seg-sm' }, [['', 'No'], ['optional', 'Opcional'], ['required', 'Obligatorio']].map(([v, l]) =>
         el('span', { class: `nb-seg-btn${mode === v ? ' active' : ''}`, onclick: () => setMode(v) }, l)));
       return el('div', { class: 'nb-spell-row' }, [
@@ -4816,11 +4954,12 @@
     // Objetivos
     const have = townUnitsHave(townId), queued = queuedUnits(townId);
     const setTarget = (id, v) => {
-      const i = tcfg.goals.findIndex((g) => g.id === id);
+      const t = T();
+      const i = t.goals.findIndex((g) => g.id === id);
       v = Math.max(0, Math.round(v));
-      if (!v) { if (i >= 0) tcfg.goals.splice(i, 1); }
-      else if (i >= 0) tcfg.goals[i].target = v;
-      else tcfg.goals.push({ id, target: v });
+      if (!v) { if (i >= 0) t.goals.splice(i, 1); }
+      else if (i >= 0) t.goals[i].target = v;
+      else t.goals.push({ id, target: v });
       saveState(); renderBody();
     };
     const goalsBox = el('div', { class: 'nb-goals' });
@@ -4833,7 +4972,7 @@
         unitIcon(g.id),
         el('div', { class: 'nb-goal-main' }, [
           el('div', { class: 'nb-goal-name' }, unitName(g.id)),
-          el('div', { class: 'nb-goal-sub' }, `tienes ${+have[g.id] || 0}${queued[g.id] ? ` + ${queued[g.id]} en cola` : ''} · ${h >= g.target && recruitWaiting(townId) ? 'cumplido ahora: se vuelve a mirar al empezar' : `faltan ${Math.max(0, g.target - h)}`}${unitResearched(townId, g.id) ? '' : ' · esperando a que se investigue'}`)
+          el('div', { class: 'nb-goal-sub' }, goalSubText(townId, g, have, queued))
         ]),
         el('div', { class: 'nb-stepper' }, [
           el('span', { class: 'nb-mini', onclick: () => setTarget(g.id, g.target - 50) }, '−50'),
@@ -5454,6 +5593,8 @@
     }
     return null;
   }
+  // Historial de intentos (se guarda con el ataque: sirve para revisar qué pasó).
+  function atkTry(a, o) { a.tries = [...(a.tries || []), { n: a.attempts, sent: a.sentSrv || 0, ...o }].slice(-30); }
   const atkInWindow = (a, t) => (a.accepted ? a.accepted.includes(Math.floor(t / 1000) * 1000) : (!a.windowEnd || (t >= a.wantAt && t < a.windowEnd + 1000)));
 
   // Seguimiento de lo ya enviado con las Órdenes del juego: por su id (nunca por la hora,
@@ -5477,7 +5618,7 @@
           a.commandId = hit.id; atkClaimed.add(hit.id); changed = true;
         }
         const c = byId.get(+a.commandId);
-        if (!c || c.ret) {
+        if (!c || c.ret || (a.realArrival && Math.abs(c.arr - a.realArrival) > 60000)) { // (llegada muy distinta = va de vuelta)
           a.status = 'cancelled'; a.note = 'Ya no está en las Órdenes del juego: cancelada (o devuelta) en el juego.';
           atkLog(`${farmTownName(a.source)} → ${a.targetName}: ya no está en las Órdenes del juego → cancelada.`, 'info');
           changed = true; continue;
@@ -5510,12 +5651,15 @@
      calculada. Con Ultra/Humano se prueba en una ventana de envío de ±N s (3–15, lo eliges):
      el primer intento sale N s ANTES de lo ideal y se sigue probando hasta N s DESPUÉS,
      aunque un intento llegue tarde (el siguiente puede caer dentro). */
+  // Nube en 2 PCs: cada ataque lo envía solo el PC donde se programó (si no, salía dos veces).
+  const atkOtherPc = (a) => { try { return !!a.pc && cloudOn() && a.pc !== cloud.pcId; } catch { return false; } };
   const atkIsRetry = (a) => !!a.windowEnd && (a.method === 'ultra' || a.method === 'human');
   const atkJitterMs = (a) => (atkIsRetry(a) ? clamp(Math.round(+a.jitter || 0), 0, 15) * 1000 : 0);
   const atkLastSend = (a) => (a.windowEnd ? a.windowEnd + 999 - a.duration + atkJitterMs(a) : a.executeAt + ATK_MISS_TOLERANCE_MS);
 
   async function atkFire(a) {
-    if (a.status !== 'pending') return;
+    if (a.status !== 'pending' || atkOtherPc(a)) return;
+    if (!isRunnerNow()) return; // otra pestaña manda: ella lo envía
     // El temporizador puede dispararse tarde (PC en reposo, pestaña congelada): no se envía tarde.
     const late = srvNow() - a.executeAt;
     if (srvNow() > atkLastSend(a)) {
@@ -5523,15 +5667,15 @@
       atkLog(`${farmTownName(a.source)} → ${a.targetName}: perdido (no se envía tarde).`, 'error');
       delete a._pre; delete a._armed; atkSave(); atkRefreshQueue(); return;
     }
-    a.status = 'sending'; atkRefreshQueue();
+    a.status = 'sending'; atkSave(); atkRefreshQueue(); // guardado ya: otra pestaña no lo reenviará
     const retry = atkIsRetry(a);
     const inWindow = (t) => atkInWindow(a, t);
     const who = () => `${farmTownName(a.source)} → ${a.targetName}`;
     // Con reintentos el hechizo NO va con el envío (se perdería al cancelar): se lanza sobre
     // la orden que se queda, en cuanto el bot sabe que ya no la va a cancelar.
     const lateSpell = retry && !!a.spell;
-    a.attempts = 0;
-    let lastUsed = null; // tropas del intento anterior (cancelado): deben haber vuelto
+    a.attempts = 0; a.tries = [];
+    let lastUsed = null, lastHero = ''; // tropas (y héroe) del intento anterior (cancelado): deben haber vuelto
     try {
       for (;;) {
         a.attempts += 1;
@@ -5541,16 +5685,20 @@
           // Reintento: esperar a que vuelvan TODAS las tropas del intento cancelado (si no,
           // saldría un ataque con menos tropas de las que pediste).
           const back = (inf) => !lastUsed || Object.entries(lastUsed).every(([u, n]) => (+inf?.units?.[u]?.count || 0) >= n);
+          const heroBack = () => !lastHero || heroesIn(a.source).some((h) => h.id === String(lastHero));
           for (let k = 0; k < 10 && !back(info) && srvNow() + 700 < atkLastSend(a); k++) { await sleep(500); info = await attackInfo(a.source, a.target, 0); }
-          if (!back(info)) throw new Error('Las tropas del intento cancelado aún no habían vuelto a tiempo para otro intento.');
+          // El héroe vuelve con ellas; su dato del juego puede tardar un poco (máx. ~1,2 s).
+          for (let k = 0; k < 3 && back(info) && !heroBack(); k++) await sleep(400);
+          if (!back(info)) throw new Error('Las tropas del intento anterior no habían vuelto a tiempo para otro intento: revisa en el juego si quedó alguno en marcha.');
           pre = { at: Date.now(), ...buildPayload(a, info) };
         }
+        if (!isRunnerNow()) throw new Error('Otra pestaña tomó el mando del bot a mitad de los intentos: revisa en el juego.');
         delete a._away;
         const sentLocal = Date.now();
         const payload = { ...pre.payload };
         if (lateSpell) delete payload.power_id;
         await gpPostAs(a.source, 'town_info', 'send_units', payload);
-        a._away = true; lastUsed = pre.used;
+        a._away = true; lastUsed = pre.used; lastHero = pre.payload.heroes || '';
         const expected = a.executeAt + a.duration;
         const sentSrv = sentLocal + clockOffset().off;
         a.sentSrv = sentSrv;
@@ -5561,6 +5709,7 @@
         if (cmdFound) a.commandId = cmdFound;
         if (!retry || !real || inWindow(real)) {
           a.status = 'sent'; a.sentAt = srvNow();
+          atkTry(a, { cmd: cmdFound, arr: real, act: 'se queda' });
           const less = [pre.missing.length ? `faltaban ${pre.missing.join(', ')}` : '', pre.left?.length ? `sin sitio en los barcos se quedaron ${pre.left.join(', ')}` : ''].filter(Boolean);
           if (less.length) a.note = `Enviado con menos tropas: ${less.join(' · ')}`;
           if (real) {
@@ -5596,41 +5745,54 @@
           break;
         }
         // Fuera del rango: cancelar ESA orden (la identificada, nunca otra) y reintentar.
-        try {
-          await gpPostAs(a.source, 'command_info', 'cancel_command', { id: cmdFound });
-        } catch (e) {
+        const keepOut = (why) => { // la orden sigue en marcha: se queda como enviada, con aviso
           a.status = 'sent'; a.sentAt = srvNow(); a.realArrival = real;
           a.arrivalErr = Math.round((real - a.wantAt) / 1000) || -1;
-          a.note = `Llega ${fmtClock(real)}, fuera ${a.accepted ? 'de las horas aceptadas' : 'del rango'}, y el juego no dejó cancelarla: ${e.message}`;
-          atkLog(`${who()}: llega ${fmtClock(real)}, fuera del rango, y no se pudo cancelar (${e.message}).`, 'error');
-          break;
+          a.note = `Llega ${fmtClock(real)}, fuera ${a.accepted ? 'de las horas aceptadas' : 'del rango'}, y ${why}.`;
+          atkTry(a, { cmd: cmdFound, arr: real, act: 'no se pudo cancelar' });
+          atkLog(`${who()}: llega ${fmtClock(real)}, fuera del rango, y ${why}.`, 'error');
+        };
+        try {
+          await gpPostAs(a.source, 'command_info', 'cancel_command', { id: cmdFound });
+        } catch (e) { keepOut(`el juego no dejó cancelarla (${e.message})`); break; }
+        const cancelAt = Date.now();
+        const away = cancelAt - sentLocal; // las tropas tardan lo mismo en volver
+        // Comprobar en las Órdenes del juego que de verdad se canceló (se hace mientras
+        // vuelven las tropas, no retrasa nada). Si sigue de ida: otro intento de cancelar.
+        let cancelled = null;
+        for (let k = 0; k < 2 && cancelled !== true; k++) {
+          try {
+            const cmds = await ownCommands();
+            const c = cmds && cmds.find((x) => x.id === +cmdFound);
+            // Cancelada = ya no está, va de vuelta o su llegada cambió (vuelve a casa).
+            cancelled = cmds ? (!c || c.ret || Math.abs(c.arr - real) > 2000) : null;
+          } catch { cancelled = null; }
+          if (cancelled === false && k === 0) { try { await gpPostAs(a.source, 'command_info', 'cancel_command', { id: cmdFound }); } catch {} }
         }
+        if (cancelled === false) { keepOut('el juego no la canceló'); break; }
         atkClaimed.add(cmdFound);
-        const away = Date.now() - sentLocal; // las tropas tardan lo mismo en volver
+        atkTry(a, { cmd: cmdFound, arr: real, act: 'cancelado' });
         atkLog(`${who()}: intento ${a.attempts} llegaba ${fmtClock(real)} → cancelado.`, 'info');
         const jit = atkJitterMs(a);
-        if (!jit && real >= a.windowEnd + 1000) throw new Error(`Llegaba ${fmtClock(real)}, después ${a.accepted ? 'de la última hora aceptada' : 'del rango'}: ya no se puede acertar.`);
-        if (a.attempts >= 80) throw new Error('Demasiados intentos sin acertar el rango.');
-        // Espera: hasta que vuelvan las tropas (tardan lo mismo que estuvieron fuera) y, en
-        // Humano, como mínimo los segundos que elegiste entre un intento y el siguiente.
-        let wait = away + 300 + (a.method === 'human' ? 0 : 100 + Math.random() * 200);
-        if (a.method === 'human') wait = Math.max(wait, clamp(+a.humanDelay || 2, 1, 120) * 1000 - (Date.now() - sentLocal));
+        if (!jit && real >= a.windowEnd + 1000) throw new Error(`Llegaba ${fmtClock(real)}, después ${a.accepted ? 'de la última hora aceptada' : 'del rango'}: ya no se puede acertar (no ha salido nada).`);
+        if (a.attempts >= 80) throw new Error('Demasiados intentos sin acertar el rango (no ha salido nada).');
+        // Siguiente intento (hora local): cuando vuelvan las tropas (tardan lo mismo que
+        // estuvieron fuera) y, en Humano, como mínimo los segundos que elegiste.
+        let nextAt = cancelAt + away + 300 + (a.method === 'human' ? 0 : 100 + Math.random() * 200);
+        if (a.method === 'human') nextAt = Math.max(nextAt, sentLocal + clamp(+a.humanDelay || 2, 1, 120) * 1000);
         // Apuntar a la primera hora aceptada que aún se pueda alcanzar (con lista, saltando
         // los segundos que no quieres); si llegaba antes del rango, esperar a ese momento.
         let goal = a.wantAt;
         if (jit) goal = null; // con aleatoriedad no se apunta: se sigue probando en toda la ventana
         else if (a.accepted) {
-          const earliest = srvNow() + wait + a.duration;
+          const earliest = srvNow() + (nextAt - Date.now()) + a.duration;
           goal = a.accepted.find((x) => x + 999 >= earliest);
-          if (!goal) throw new Error('Ya no da tiempo a acertar ninguna de las horas aceptadas.');
+          if (!goal) throw new Error('Ya no da tiempo a acertar ninguna de las horas aceptadas (no ha salido nada).');
         }
-        if (goal) {
-          const ideal = goal - a.duration + ATK_INTO_SECOND_MS - clockOffset().off - latencyOneWay();
-          wait = Math.max(wait, ideal - Date.now());
-        }
-        if (srvNow() + wait > atkLastSend(a)) throw new Error(jit ? `No acertó en ${a.attempts} intento(s) dentro de la ventana de ±${jit / 1000} s.` : 'Ya no da tiempo a acertar el rango.');
-        atkRefreshQueue();
-        await sleep(wait);
+        if (goal) nextAt = Math.max(nextAt, goal - a.duration + ATK_INTO_SECOND_MS - clockOffset().off - latencyOneWay());
+        if (srvNow() + (nextAt - Date.now()) > atkLastSend(a)) throw new Error(jit ? `No acertó en ${a.attempts} intento(s) dentro de la ventana de ±${jit / 1000} s (no ha salido nada).` : 'Ya no da tiempo a acertar el rango (no ha salido nada).');
+        atkSave(); atkRefreshQueue();
+        await sleep(Math.max(0, nextAt - Date.now()));
       }
     } catch (e) {
       a.status = /configurado para no enviar/.test(e.message) ? 'skipped' : 'error';
@@ -5669,9 +5831,11 @@
 
   // Latido (cada 200 ms, desde el Worker): recálculos, precarga, armado y perdidos.
   function atkHeartbeat() {
+    runnerTick();                // renueva el mando (este latido no se frena en segundo plano)
+    if (!isRunner()) return;     // otra pestaña manda: aquí no se envía nada
     const now = srvNow();
     for (const a of atk.queue) {
-      if (a.status !== 'pending') continue;
+      if (a.status !== 'pending' || atkOtherPc(a)) continue;
       const left = a.executeAt - now;
       if (now > atkLastSend(a)) {
         a.status = 'missed'; a.error = `No se envió: la hora de salida pasó hace ${fmtDur(-left)} (¿página cerrada o PC en reposo?).`;
@@ -5780,11 +5944,9 @@
     if (atk.started) return;
     atk.started = true;
     setInterval(() => { try { hookGameAttackWindows(); } catch {} }, 700);
-    setInterval(() => { atkSyncWithGame(); }, 5000);
+    setInterval(() => { if (isRunner()) atkSyncWithGame(); }, 5000);
     if (!state.ataques) state.ataques = { correctionMs: 0 };
-    atkLoad();
-    for (const a of atk.queue) if (a.status === 'sending') { a.status = 'error'; a.error = 'La página se recargó mientras se enviaba: revisa en el juego si salió.'; }
-    atkSave();
+    atkLoad(); // (lo de "se estaba enviando" lo revisa la pestaña que toma el mando: runnerTakeOver)
     installClockSync();
     const w = atkWorker();
     if (w) w.postMessage({ cmd: 'every', ms: 200 });
@@ -5826,17 +5988,20 @@
     for (const a of list) {
       const units = Object.entries(a.units).map(([k, n]) => `${n} ${atkUnitName(k)}`).join(' · ');
       const actions = [];
+      // (por id: se actúa sobre el ataque que hay AHORA en la lista, no sobre una copia vieja)
+      const live = () => atk.queue.find((x) => x.id === a.id) || null;
+      const drop = () => { atkTimerClear(a.id); atk.queue = atk.queue.filter((x) => x.id !== a.id); atkSave(); atkRefreshQueue(); };
       if (a.status === 'pending') {
-        actions.push(el('span', { class: 'nb-mini', title: 'Duplicar llegando 1 s después (tren)', onclick: () => atkDuplicate(a) }, '+1s'));
-        actions.push(el('span', { class: 'nb-mini', title: 'Editar', onclick: () => atkEdit(a) }, '✎'));
-        actions.push(el('span', { class: 'nb-mini nb-mini-danger', title: 'Cancelar', onclick: () => { atkTimerClear(a.id); atk.queue = atk.queue.filter((x) => x !== a); atkSave(); atkRefreshQueue(); } }, '✕'));
+        actions.push(el('span', { class: 'nb-mini', title: 'Duplicar llegando 1 s después (tren)', onclick: () => { const x = live(); if (x) atkDuplicate(x); } }, '+1s'));
+        actions.push(el('span', { class: 'nb-mini', title: 'Editar', onclick: () => { const x = live(); if (x && x.status === 'pending') atkEdit(x); else atkRefreshQueue(); } }, '✎'));
+        actions.push(el('span', { class: 'nb-mini nb-mini-danger', title: 'Cancelar', onclick: () => { const x = live(); if (x && x.status === 'sending') { atkRefreshQueue(); return; } drop(); } }, '✕'));
       } else if (a.status === 'editing') {
-        actions.push(el('span', { class: 'nb-mini', title: 'Reanudar sin cambios', onclick: () => { a.status = 'pending'; if (atk.form.replaceId === a.id) atk.form.replaceId = null; atkSave(); atkRefreshQueue(); } }, '▶'));
-        actions.push(el('span', { class: 'nb-mini', title: 'Editar', onclick: () => atkEdit(a) }, '✎'));
-        actions.push(el('span', { class: 'nb-mini nb-mini-danger', title: 'Cancelar', onclick: () => { atk.queue = atk.queue.filter((x) => x !== a); atkSave(); atkRefreshQueue(); } }, '✕'));
+        actions.push(el('span', { class: 'nb-mini', title: 'Reanudar sin cambios', onclick: () => { const x = live(); if (x && x.status === 'editing') x.status = 'pending'; if (atk.form.replaceId === a.id) atk.form.replaceId = null; atkSave(); atkRefreshQueue(); } }, '▶'));
+        actions.push(el('span', { class: 'nb-mini', title: 'Editar', onclick: () => { const x = live(); if (x) atkEdit(x); } }, '✎'));
+        actions.push(el('span', { class: 'nb-mini nb-mini-danger', title: 'Cancelar', onclick: drop }, '✕'));
       } else {
-        if (a.status === 'missed' || a.status === 'error') actions.push(el('span', { class: 'nb-mini', title: 'Volver a programar (editar)', onclick: () => atkEdit(a) }, '✎'));
-        actions.push(el('span', { class: 'nb-mini', title: 'Quitar de la lista', onclick: () => { atk.queue = atk.queue.filter((x) => x !== a); atkSave(); atkRefreshQueue(); } }, '✕'));
+        if (a.status === 'missed' || a.status === 'error') actions.push(el('span', { class: 'nb-mini', title: 'Volver a programar (editar)', onclick: () => { const x = live(); if (x) atkEdit(x); } }, '✎'));
+        if (a.status !== 'sending') actions.push(el('span', { class: 'nb-mini', title: 'Quitar de la lista', onclick: drop }, '✕')); // (mientras se envía, no)
       }
       const cssSt = a.status === 'cancelled' ? 'skipped' : a.status;
       atkQueueEl.appendChild(el('div', { class: `nb-atk-item nb-atk-${cssSt}` }, [
@@ -5846,7 +6011,7 @@
           el('span', { class: `nb-tag nb-tag-${cssSt}` }, label[a.status] || a.status)
         ]),
         el('div', { class: 'nb-atk-times' }, [
-          el('div', {}, [el('span', {}, 'Sale'), el('b', {}, fmtWhen(a.executeAt))]),
+          el('div', {}, [el('span', {}, 'Sale'), el('b', {}, fmtWhen(a.status === 'sent' && a.sentSrv ? a.sentSrv : a.executeAt))]),
           el('div', {}, [el('span', {}, 'Llega'), el('b', {}, fmtWhen(a.realArrival || a.arrivalAt))]),
           a.status === 'pending' || a.status === 'sending'
             ? el('div', { class: 'nb-atk-count' }, [el('span', {}, 'Falta'), el('b', { 'data-atk-at': a.executeAt }, fmtCount(a.executeAt - srvNow()))])
@@ -5859,7 +6024,8 @@
           a.hero ? el('span', { class: 'nb-res', title: heroName(a.hero) }, [heroIcon(a.hero), heroName(a.hero)]) : null,
           a.spell ? el('span', { class: 'nb-res' }, [el('span', { class: `nb-icon nb-icon-25 power_icon30x30 ${a.spell}` }), 'hechizo']) : null
         ]),
-        a.windowEnd ? el('div', { class: 'nb-goal-sub' }, `Acepta: ${a.accepted ? acceptSummary(a.accepted) : `${fmtClock(a.wantAt)} – ${fmtClock(a.windowEnd)}`} · ${({ exact: 'preciso', ultra: 'ultra', human: 'humano' })[a.method] || 'preciso'}`) : null,
+        a.windowEnd ? el('div', { class: 'nb-goal-sub' }, `Acepta: ${a.accepted ? acceptSummary(a.accepted) : `${fmtClock(a.wantAt)} – ${fmtClock(a.windowEnd)}`} · ${({ exact: 'preciso', ultra: 'ultra', human: 'humano' })[a.method] || 'preciso'}${a.attempts > 1 ? ` · ${a.attempts} intentos` : ''}`) : null,
+        atkOtherPc(a) && (a.status === 'pending' || a.status === 'editing') ? el('div', { class: 'nb-goal-sub nb-warn-txt' }, 'Lo envía el otro PC (donde se programó). Para que salga desde este, edítalo y guárdalo aquí.') : null,
         a.error ? el('div', { class: 'nb-goal-sub nb-err' }, a.error) : a.note ? el('div', { class: 'nb-goal-sub' }, a.note) : null,
         el('div', { class: 'nb-atk-actions' }, actions)
       ]));
@@ -5899,8 +6065,9 @@
   }
 
   function atkDuplicate(a) {
-    const b = { ...a, id: `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`, status: 'pending', note: '', error: '' };
-    delete b._pre; delete b._armed; delete b._rechecked; delete b.realArrival; delete b.arrivalErr;
+    const b = { ...a, id: `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`, status: 'pending', note: '', error: '', pc: cloud.pcId };
+    for (const k of Object.keys(b)) if (k.startsWith('_')) delete b[k];
+    for (const k of ['realArrival', 'arrivalErr', 'commandId', 'sentSrv', 'sentAt', 'attempts', 'tries', 'spellCast']) delete b[k];
     b.wantAt = a.wantAt + 1000; b.executeAt = a.executeAt + 1000; b.arrivalAt = a.arrivalAt + 1000;
     if (a.windowEnd) b.windowEnd = a.windowEnd + 1000;
     if (a.accepted) { b.accepted = a.accepted.map((x) => x + 1000); b.acceptText = b.accepted.map((x) => fmtClock(x)).join(', '); }
@@ -6044,7 +6211,8 @@
       jitter: plan.firstTry ? clamp(Math.round(+f.jitter || 10), 3, 15) : 0, humanDelay: clamp(+f.humanDelay || 2, 1, 120),
       accepted: plan.accepted && plan.accepted.length > 1 ? plan.accepted : null, rangeKind: f.rangeKind === 'list' ? 'list' : 'range', acceptText: f.accept || '',
       executeAt: plan.executeAt, arrivalAt: plan.arrivalAt, onMissing: f.onMissing, status: 'pending', future: !!f.future,
-      note: plan.note || '', error: '', createdAt: Date.now()
+      note: plan.note || '', error: '', createdAt: Date.now(),
+      pc: cloud.pcId // con la nube en 2 PCs, solo lo envía el PC donde lo programaste
     };
     const danger = atkWarnings(item, info, plan.arrivalAt).filter((w) => w.lvl === 'danger');
     if (danger.length && !confirm(`Atención:\n· ${danger.map((w) => w.txt).join('\n· ')}\n\n¿Programar igualmente?`)) return;
@@ -6085,7 +6253,7 @@
       bodyEl.appendChild(el('div', { class: 'nb-card' }, [
         el('div', { class: 'nb-card-head' }, [
           el('div', { class: 'nb-card-title' }, 'Programados'),
-          el('span', { class: 'nb-btn nb-btn-sm', onclick: () => { atk.queue = atk.queue.filter((a) => a.status === 'pending' || a.status === 'sending'); atkSave(); atkRefreshQueue(); } }, 'Limpiar terminados')
+          el('span', { class: 'nb-btn nb-btn-sm', onclick: () => { atk.queue = atk.queue.filter((a) => ['pending', 'sending', 'editing'].includes(a.status)); atkSave(); atkRefreshQueue(); } }, 'Limpiar terminados')
         ]),
         atkQueueEl
       ]));
@@ -6498,6 +6666,7 @@
   function startResearchEngine() {
     if (researchRuntime.timer) return;
     researchRuntime.timer = setInterval(() => {
+      if (!isRunner()) return;
       if (!anyResearchOn() || researchRuntime.running) return;
       researchRuntime.running = true;
       researchTick().catch((e) => researchLog(`Error: ${e.message}`, 'error')).finally(() => { researchRuntime.running = false; });
@@ -6706,6 +6875,7 @@
   function startFestivalEngine() {
     if (festRuntime.timer) return;
     festRuntime.timer = setInterval(() => {
+      if (!isRunner()) return;
       if (!festCfg() || festRuntime.running) return;
       festRuntime.running = true;
       festTick().catch((e) => festLog(`Error: ${e.message}`, 'error')).finally(() => { festRuntime.running = false; });
@@ -6879,7 +7049,8 @@
         <ul><li><kbd>→</kbd> o <kbd>Intro</kbd>: siguiente · <kbd>←</kbd>: anterior · <kbd>Esc</kbd>: salir.</li>
         <li>Con <b>Índice</b> saltas a un apartado concreto.</li>
         <li>El tour <b>no cambia ninguna opción</b>: puedes seguirlo tranquilo.</li></ul>
-        ${WARN('El bot funciona dentro de esta pestaña del navegador: <b>si cierras el juego o el PC se duerme, se para</b>. Úsalo en un solo PC a la vez.')}` }
+        ${WARN('El bot funciona dentro de esta pestaña del navegador: <b>si cierras el juego o el PC se duerme, se para</b>. Úsalo en un solo PC a la vez.')}
+        ${AUTO('Con el juego abierto en <b>varias pestañas</b>, solo una ejecuta el bot (las demás ponen abajo «Solo lectura»); lo que cambies en cualquiera llega a la que manda. Si cierras la que manda, otra toma el mando en unos segundos.')}` }
     ]);
 
     // ------------------------------------------------------------------ Panel
@@ -6917,7 +7088,8 @@
         <ul><li>Necesitas un token de GitHub con permiso <b>solo de Gists</b> y una contraseña (8+ caracteres, la misma en todos tus PC).</li>
         <li>Al conectar: si ya hay datos en la nube se cargan; si no, se suben los de este PC.</li></ul>
         ${AUTO('Cada cambio se sube a los 8 s y cada 60 s baja lo del otro PC. Al arrancar, primero sincroniza y después empieza a trabajar.')}
-        ${WARN('Aun con la nube, usa el bot en <b>un solo PC a la vez</b>: si está abierto en dos, los dos enviarían recursos y ataques.')}` },
+        ${WARN('Aun con la nube, usa el bot en <b>un solo PC a la vez</b>: si está abierto en dos, los dos enviarían recursos.')}
+        ${AUTO('Los <b>ataques</b> programados solo los envía el PC donde los programaste (en el otro salen con el aviso «Lo envía el otro PC»); para que salga desde otro, edítalo y guárdalo allí.')}` },
       { t: 'Módulos', find: () => TQ.sel('.nb-tiles', bodyEl), h: `
         <p>Una ficha por módulo con su dato principal. El interruptor lo activa o desactiva para <b>todas</b> las ciudades; pulsa la ficha para ir a su pestaña.</p>` }
     ]);
@@ -6929,7 +7101,8 @@
         <p>Arriba eliges la vista: <b>Ciudades</b> (una fila por ciudad) o lo que lleva el bot en <b>Construcción</b>, <b>Investigación</b> y <b>Reclutamiento</b>, ciudad a ciudad.</p>` },
       { t: 'Ciudades', find: () => TQ.card(/^Vista general/), wide: true, h: `
         <p>Una fila por ciudad (la tuya resaltada):</p>
-        <ul><li><b>Construcción</b>: órdenes en la cola del juego / huecos y lo primero que termina; cuántos objetivos tiene el bot.</li>
+        <ul><li><b>Recursos</b>: madera, piedra y plata en <b>% del almacén</b> (en amarillo desde el 90 %) y la cantidad.</li>
+        <li><b>Construcción</b>: órdenes en la cola del juego / huecos y lo primero que termina; cuántos objetivos tiene el bot.</li>
         <li><b>Reclutamiento</b>: cola del Cuartel y del Puerto y el estado del bot en esa ciudad.</li>
         <li><b>Festival</b>: en curso (cuenta atrás) o si puede hacerlo.</li>
         <li><b>Llega (comercio)</b>: envíos en camino y cuándo llega el primero.</li>
@@ -7045,7 +7218,10 @@
       { t: 'Empezar más tarde / programar', find: () => TQ.txt('.nb-alert, .nb-row', /^Empezar más tarde|^Empieza en|^Empezar dentro/) || TQ.card(/^Reclutamiento automático/), h: `
         <p><b>Empezar más tarde</b>: la ciudad queda <b>en espera</b>: no recluta, no pide ni reserva recursos (hasta puede donar a otras). Luego pones los minutos y <b>Programar</b>: empezará a esa hora.</p>
         <p>Útil para esperar a un <b>héroe</b> que abarata tropas: el bot te avisa si llega antes o después de empezar.</p>
-        <p>También para <b>reponer después de un ataque</b>: en espera puedes pedir un total que ya tienes. Al empezar se vuelve a contar: si perdiste tropas, recluta las que falten; si siguen todas, se quita sin reclutar nada.</p>` },
+        <p>También para <b>reponer después de un ataque</b>: en espera puedes pedir un total que ya tienes. Al empezar se vuelve a contar: si perdiste tropas, recluta las que falten; si siguen todas, se quita sin reclutar nada.</p>
+        ${AUTO(`<ul><li>Al llegar la hora, antes de decidir nada, vuelve a leer del juego las tropas y las colas (por si el combate fue justo antes).</li>
+        <li>Si a esa hora todavía van tropas <b>atacando</b> (sin llegar), no decide aún: espera a que lleguen, recuenta y entonces recluta las que murieron (o quita el objetivo si volvieron todas).</li>
+        <li>Con los minutos puestos manda la hora (la espera «sin hora» se quita sola). Sin minutos, la ciudad <b>no empieza sola</b>: pulsa Programar o ✕.</li></ul>`)}` },
       { t: 'Tamaño del lote', find: inCard(/^Reclutamiento automático/, /^Lote = /), h: `
         <p>Un lote es lo máximo de <b>una sola tropa</b> que cabe en ese % del almacén (cada tropa distinta ocupa un hueco de la cola, por eso no se mezclan).</p>
         ${AUTO(`<ul><li>Primero las tropas a las que les falta al menos un lote completo, en el orden de la lista; los restos, al final.</li>
@@ -7082,7 +7258,8 @@
         <li>Nunca dona lo que la ciudad donante va a gastar; una ciudad que espera recursos solo da los que ella no necesita.</li>
         <li>Reparto justo: las ciudades lejanas no se quedan olvidadas (cuanto más esperan, más prioridad).</li>
         <li>Simula el almacén de destino: puede mandar más de lo que cabe si se va a gastar antes de llegar, pero <b>nunca</b> hace que se pierda nada. Descuenta lo que la ciudad producirá mientras viaja el envío.</li>
-        <li>Aprende la velocidad real de los comerciantes con cada envío.</li></ul>`)}` },
+        <li>Aprende la velocidad real de los comerciantes con cada envío.</li>
+        <li>Las ciudades con el <b>almacén por debajo de nivel 6</b> quedan fuera del comercio entre ciudades (el juego no deja comerciar por debajo de nivel 5): ni donan ni reciben, y te lo avisa aquí.</li></ul>`)}` },
       { t: 'Ajustes', find: () => TQ.card(/^Ajustes/), h: `
         <ul><li><b>Envío mínimo</b>: no manda envíos más pequeños (salvo que completen lo que falta).</li>
         <li><b>Margen almacén %</b>: hueco que deja libre en el almacén de destino.</li>
@@ -7183,7 +7360,8 @@
         <p>Cada orden con su estado (programado, enviando, enviado con el error de llegada, perdido, no enviado…).</p>
         <ul><li><b>+1s</b>: duplica llegando 1 s después (para trenes). <b>✎</b>: editar. <b>✕</b>: cancelar/quitar.</li>
         <li><b>Limpiar terminados</b>: quita los ya enviados.</li>
-        <li>Los enviados se comparan con las <b>Órdenes</b> del juego: si cancelas uno en el juego, aquí pasa a <b>cancelado</b>.</li></ul>
+        <li>Los enviados se comparan con las <b>Órdenes</b> del juego por el número de la orden: si cancelas uno en el juego, aquí pasa a <b>cancelado</b>; si su llegada real es otra, se corrige y te avisa si cae fuera del rango.</li>
+        <li>En los enviados, <b>Sale</b> es la salida del intento que se quedó y se ve cuántos intentos hizo.</li></ul>
         ${AUTO(`<ul><li>Los temporizadores van en un proceso aparte: funcionan aunque la pestaña esté en segundo plano.</li>
         <li>35 s antes mira qué va a salir de verdad (tropas que haya, lo que quepa en los barcos, el héroe) y recalcula el viaje con eso, para que la llegada siga siendo exacta; si falta algo, lo avisa en la orden.</li>
         <li>6 s antes precarga las tropas disponibles; después de enviar lee la llegada real y corrige el desfase para los siguientes.</li>
@@ -7221,6 +7399,22 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.14.3', items: [
+      { t: 'Empezar más tarde: arreglado', tab: 'reclutamiento', find: () => TQ.card(/^Cuartel · tropas objetivo/) || TQ.tab('reclutamiento'), h: `
+        <p>A veces se quedaba <b>en espera sin cuenta atrás</b> y no empezaba nunca: los minutos escritos se borraban al repintarse el panel y «Programar» no hacía nada. Ahora lo que escribes no se pierde, si falta el número te lo marca, y con hora puesta siempre empieza a su hora.</p>
+        <ul><li>Al llegar la hora vuelve a leer del juego las tropas antes de decidir (por si el combate fue justo antes).</li>
+        <li>Si a esa hora aún van tropas <b>atacando</b>, espera a que lleguen: recluta las que murieron o quita el objetivo si volvieron todas. Debajo de cada tropa ves cuántas van atacando y cuándo llegan.</li></ul>` },
+      { t: 'Una sola pestaña ejecuta el bot', tab: 'ataques', find: () => TQ.tab('ataques'), h: `
+        <p>Con el juego abierto en <b>varias pestañas</b>, solo una ejecuta el bot (las demás ponen abajo «Solo lectura»); lo que cambies en cualquiera llega a la que manda. Antes cada pestaña enviaba y cancelaba ataques, comerciaba y reclutaba por su cuenta. Con la nube en 2 PCs, cada ataque lo envía solo el PC donde lo programaste.</p>` },
+      { t: 'Ultra/Humano, más seguro', tab: 'ataques', before: () => { if (atk.view !== 'queue') { atk.view = 'queue'; return true; } }, find: () => TQ.card(/^Programados/) || TQ.tab('ataques'), h: `
+        <ul><li>Tras cancelar un intento comprueba en el juego que se canceló de verdad.</li>
+        <li>Antes de reintentar espera también al héroe.</li>
+        <li>En Programados, <b>Sale</b> es la salida del intento que se quedó y se ve cuántos intentos hizo.</li></ul>` },
+      { t: 'Comercio: almacén pequeño fuera', tab: 'comercio', find: () => TQ.card(/^Comercio automático/) || TQ.tab('comercio'), h: `
+        <p>Las ciudades con el <b>almacén por debajo de nivel 6</b> ya no mandan ni reciben recursos de otras ciudades (el juego no deja comerciar por debajo de nivel 5 y daba error). Salen avisadas en Comercio.</p>` },
+      { t: 'Vista general: % de recursos', tab: 'resumen', before: () => { if ((state.resumenView || 'ciudades') !== 'ciudades') { state.resumenView = 'ciudades'; return true; } }, find: () => TQ.card(/^Vista general/) || TQ.tab('resumen'), h: `
+        <p>Nueva columna <b>Recursos</b> en Vista general → Ciudades: madera, piedra y plata de cada ciudad en <b>% del almacén</b> (amarillo desde el 90 %) y la cantidad.</p>` }
+    ] },
     { v: '1.14.2', items: [
       { t: 'Ultra/Humano: la llegada se comprueba de verdad', tab: 'ataques', before: () => { if (atk.view !== 'queue') { atk.view = 'queue'; return true; } }, find: () => TQ.card(/^Programados/) || TQ.tab('ataques'), h: `
         <p>Enviando desde una ciudad que no era la abierta, el bot no encontraba la orden: daba por bueno el <b>primer intento</b> (que sale unos segundos antes a propósito) y luego lo marcaba como <b>cancelado</b>. Ahora cada intento se busca en la <b>Vista general de órdenes</b> del juego (todas las ciudades): se mira su llegada real y, si cae fuera, se cancela <b>esa</b> orden y se vuelve a intentar.</p>
@@ -7735,15 +7929,13 @@
       for (const [k, v] of Object.entries(r.state)) {
         if (CLOUD_LOCAL_ONLY.has(k) || !(k in def)) continue;          // solo claves conocidas
         if (typeof v !== typeof def[k] && def[k] !== null) continue;    // y del tipo esperado
-        state[k] = (v && typeof v === 'object' && !Array.isArray(v) && def[k] && typeof def[k] === 'object') ? { ...def[k], ...v } : v;
+        const nv = (v && typeof v === 'object' && !Array.isArray(v) && def[k] && typeof def[k] === 'object') ? { ...def[k], ...v } : v;
+        // En el MISMO objeto (no uno nuevo): el panel y los módulos guardan referencias a él
+        // y, si se cambiara por otro, lo que pulsaras después se perdería.
+        if (isPlainObj(state[k]) && isPlainObj(nv)) reconcileInto(state[k], nv); else state[k] = nv;
       }
       saveState();
-      if (Array.isArray(r.attacks)) {
-        const sending = atk.queue.filter((a) => a.status === 'sending');
-        for (const a of atk.queue) atkTimerClear(a.id);
-        atk.queue = [...r.attacks.filter((a) => a && typeof a === 'object' && a.id && !sending.some((x) => x.id === a.id)), ...sending];
-        atkSave();
-      }
+      if (Array.isArray(r.attacks)) { atkMergeList(r.attacks); atkSave(); }
       cloud.remoteAt = +r.updatedAt || Date.now();
     } finally { cloud.applying = false; }
     if (bodyEl) renderIfIdle();
@@ -7897,6 +8089,105 @@
     ]);
   }
 
+  /* ---------------------------------------------------------------------------------
+     UNA SOLA PESTAÑA AL MANDO
+     Con el juego abierto en 2 pestañas/ventanas del mismo navegador, cada una ejecutaba
+     el bot entero: ataques enviados DOS veces (y cada pestaña cancelando las órdenes de
+     la otra), comercio y reclutamiento dobles… Ahora solo la pestaña "al mando" ejecuta;
+     las demás solo muestran (y lo que cambies en ellas le llega a la que manda). Si la
+     que manda se cierra o se cuelga, otra toma el mando en unos segundos.
+     El mando se renueva desde el latido de los ataques (un Worker: sigue aunque la
+     pestaña esté en segundo plano).
+  --------------------------------------------------------------------------------- */
+  const runner = { id: Math.random().toString(36).slice(2, 10), mine: false, since: 0, checkedAt: 0 };
+  const RUNNER_TTL = 6000;
+  const runnerKey = () => acctKey('novabot_runner');
+  function runnerRead() { try { return JSON.parse(localStorage.getItem(runnerKey()) || 'null'); } catch { return null; } }
+  function runnerTick(force = false) {
+    const now = Date.now();
+    if (!force && now - runner.checkedAt < 1000) return;
+    runner.checkedAt = now;
+    const cur = runnerRead();
+    const free = !cur || !cur.id || cur.id === runner.id || now - (+cur.at || 0) > RUNNER_TTL;
+    if (free) { try { localStorage.setItem(runnerKey(), JSON.stringify({ id: runner.id, at: now })); } catch {} }
+    const held = runnerRead()?.id === runner.id;
+    if (held && !runner.mine) { runner.mine = true; runner.since = now; runnerTakeOver(); }
+    else if (!held && runner.mine) { runner.mine = false; runner.since = 0; }
+    paintRunnerBadge();
+  }
+  // Al mando solo tras sostenerlo ~1,5 s (si dos pestañas lo cogen a la vez, en el
+  // siguiente latido una de las dos lo pierde antes de hacer nada).
+  const isRunner = () => runner.mine && Date.now() - runner.since >= 1500;
+  // Justo antes de enviar/cancelar: se vuelve a mirar (por si otra pestaña tomó el mando).
+  function isRunnerNow() { const c = runnerRead(); return isRunner() && !!c && c.id === runner.id && Date.now() - (+c.at || 0) <= RUNNER_TTL; }
+  function runnerTakeOver() {
+    // Lo último que guardó la otra pestaña (configuración y ataques).
+    runnerReloadState();
+    atkLoad();
+    for (const a of atk.queue) if (a.status === 'sending') { a.status = 'error'; a.error = 'Se cerró la pestaña que lo estaba enviando: revisa en el juego si salió.'; }
+    atkSave();
+    try { atkRefreshQueue(); } catch {}
+  }
+  function runnerReloadState() {
+    const fresh = loadState();
+    for (const k of ['open', 'activeTab', 'pos', 'fabPos', 'size', 'layoutV', 'resumenView']) if (k in state) fresh[k] = state[k];
+    if (!fresh.ataques) fresh.ataques = { correctionMs: 0 };
+    reconcileInto(state, fresh); // en el mismo objeto: nada del panel se queda "suelto"
+  }
+  // Ataques guardados por OTRA pestaña → fusionar sin perder lo que esta ya hizo:
+  // un ataque que aquí ya salió (o se está enviando) nunca vuelve a "pendiente".
+  const ATK_DONE = new Set(['sending', 'sent', 'error', 'missed', 'skipped', 'cancelled']);
+  function atkMergeFromStorage() {
+    let stored = null; try { stored = JSON.parse(localStorage.getItem(acctKey(ATK_KEY)) || '[]'); } catch {}
+    if (Array.isArray(stored)) atkMergeList(stored);
+  }
+  // Fusiona una lista de ataques (de otra pestaña o de la nube) conservando los objetos
+  // de aquí (mismas referencias) y sin que nada ya enviado vuelva a "pendiente".
+  function atkMergeList(stored) {
+    const mem = new Map(atk.queue.map((a) => [a.id, a]));
+    const out = [];
+    for (const s of stored) {
+      if (!s || !s.id) continue;
+      const m = mem.get(s.id); mem.delete(s.id);
+      if (!m) { out.push(s); continue; }
+      if (ATK_DONE.has(m.status) && !ATK_DONE.has(s.status)) { out.push(m); continue; }
+      if (m.status === 'sending') { out.push(m); continue; }
+      const sameRun = m.status === s.status && m.executeAt === s.executeAt;
+      const keep = sameRun ? Object.fromEntries(Object.entries(m).filter(([k]) => k.startsWith('_'))) : {};
+      if (!sameRun) atkTimerClear(m.id);
+      for (const k of Object.keys(m)) delete m[k];
+      Object.assign(m, s, keep);
+      out.push(m);
+    }
+    for (const m of mem.values()) { if (m.status === 'sending') out.push(m); else atkTimerClear(m.id); } // borrados en la otra pestaña
+    atk.queue = out;
+  }
+  function onOtherTabSaved(e) {
+    if (!e || !e.key || !ACCOUNT) return;
+    if (e.key === acctKey(ATK_KEY)) {
+      if (runner.mine) atkMergeFromStorage(); else atkLoad();
+      try { atkRefreshQueue(); } catch {}
+      if (state.activeTab === 'resumen') renderIfIdle('resumen');
+    } else if (e.key === acctKey(STORAGE_KEY)) {
+      runnerReloadState();
+      renderIfIdle();
+    }
+  }
+  function paintRunnerBadge() {
+    const b = document.getElementById('nb-runner-badge');
+    if (!b) return;
+    const on = isRunner();
+    b.textContent = on ? '' : 'Solo lectura: el bot lo ejecuta otra pestaña';
+    b.style.display = on ? 'none' : '';
+  }
+  function startRunner() {
+    runnerTick(true);
+    setInterval(() => runnerTick(), 1000);
+    window.addEventListener('storage', onOtherTabSaved);
+    // Al cerrar: soltar el mando para que otra pestaña lo tome ya.
+    window.addEventListener('pagehide', () => { try { if (runnerRead()?.id === runner.id) localStorage.removeItem(runnerKey()); } catch {} });
+  }
+
   async function init() {
     await waitFor(() => !!document.body);
     // Primero la cuenta (su configuración) y, si tiene nube, bajar de la nube ANTES de
@@ -7906,6 +8197,7 @@
       cloudLoadCreds();
       if (cloudOn()) await Promise.race([cloudBoot(), sleep(25000)]);
     }
+    startRunner();
     buildUI();
     window.addEventListener('resize', () => { applyPanelSize(); applyPanelPosition(); applyFabPosition(); });
     setTimeout(tourAutoOffer, 2500);
