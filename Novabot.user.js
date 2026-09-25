@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.13.4
+// @version      1.14.0
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.13.4';
+  const VERSION = '1.14.0';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -186,6 +186,11 @@
         bulkPct: 85,          // "sobra mucho": la ciudad pasa de este % del almacén…
         bulkRatio: 0.6        // …y se acepta hasta esta tasa
       },
+      aldeasNivel: {
+        enabled: false,       // subir las aldeas (de todas tus islas) hasta un nivel con puntos de combate
+        target: 6,            // nivel objetivo 1..6
+        keepBp: 0             // puntos de combate que nunca se gastan
+      },
       equilibrio: {
         enabled: true,        // mover recursos entre ciudades con los comerciantes libres
         balance: true,        // además de evitar pérdidas, igualar ciudades
@@ -220,7 +225,7 @@
       if (raw && typeof raw === 'object') {
         const def = defaultState();
         const out = { ...def, ...raw };
-        for (const k of ['granjas', 'aldeas', 'equilibrio', 'cueva', 'construccion', 'comercio', 'reclutamiento', 'ataques', 'festivales', 'prioridad', 'investigacion']) out[k] = { ...def[k], ...(raw[k] || {}) };
+        for (const k of ['granjas', 'aldeas', 'aldeasNivel', 'equilibrio', 'cueva', 'construccion', 'comercio', 'reclutamiento', 'ataques', 'festivales', 'prioridad', 'investigacion']) out[k] = { ...def[k], ...(raw[k] || {}) };
         // Prioridad guardada con el formato antiguo (preset): que prioMode() la convierta.
         if (raw.prioridad && !raw.prioridad.mode) delete out.prioridad.mode;
         return out;
@@ -1628,6 +1633,7 @@
     ]));
 
     bodyEl.appendChild(renderExchangeCard());
+    bodyEl.appendChild(renderVillageLevelCard());
 
     const logBox = el('div', { class: 'nb-log' });
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
@@ -1916,6 +1922,148 @@
     if (plan.length) renderIfIdle('granjas');
   }
   const RES_ES = { wood: 'madera', stone: 'piedra', iron: 'plata' };
+
+  /* ---------------------------------------------------------------------------------
+     8a-quater) SUBIR ALDEAS — lleva todas las aldeas de tus islas hasta un nivel (1–6)
+     gastando puntos de combate.
+     -----------------------------------------------------------------------------
+     Leído del juego (25/09/2026, modelo FarmTownPlayerRelation):
+       POST frontend_bridge?action=execute {model_url:"FarmTownPlayerRelation/<id>",
+            action_name:"upgrade" | "unlock", arguments:{ farm_town_id }}
+       Nivel = expansion_stage (relation_status 1 = tuya; 0 = sin liberar → "unlock").
+       Subida en curso: expansion_at (hora de fin). upgrade_cost = puntos de combate que
+       cuesta el siguiente nivel (en es147: 2→3 = 5, 3→4 = 25, 4→5 = 50, 5→6 = 100) y
+       upgrade_time su duración. Varias aldeas pueden subir a la vez.
+       Puntos de combate libres = PlayerKillpoints.att + def − used.
+     Orden: primero las de nivel más bajo (se igualan) y, a igual nivel, la más barata.
+     Solo aldeas de islas donde tienes ciudad (las de islas que ya no son tuyas no).
+  --------------------------------------------------------------------------------- */
+  const vlRuntime = { timer: null, running: false, cooldown: new Map() };
+  function battlePoints() {
+    try {
+      const m = Object.values(UW.MM.getModels()?.PlayerKillpoints || {})[0]?.attributes;
+      if (!m) return null;
+      return Math.max(0, (+m.att || 0) + (+m.def || 0) - (+m.used || 0));
+    } catch { return null; }
+  }
+  // Aldeas de tus islas: { rel, farm, level, busyUntil, cost, townId }.
+  function ownIslandVillages() {
+    const farms = new Map(exCollection('FarmTown').map((f) => [+f.id, f]));
+    const townByIsland = new Map();
+    for (const id of allTownIds()) { const k = islandKey(id); if (!townByIsland.has(k)) townByIsland.set(k, id); }
+    const nowS = serverNow();
+    const out = [];
+    for (const rel of exCollection('FarmTownPlayerRelation')) {
+      const f = farms.get(+rel.farm_town_id);
+      if (!f) continue;
+      const townId = townByIsland.get(`${+f.island_x}_${+f.island_y}`);
+      if (!townId) continue;
+      const st = +rel.relation_status;
+      if (st !== 1 && st !== 0) continue;
+      const level = st === 1 ? +rel.expansion_stage || 1 : 0;
+      const busyUntil = +rel.expansion_at > nowS ? +rel.expansion_at * 1000 : 0;
+      out.push({ rel, farm: f, level, busyUntil, cost: +rel.upgrade_cost || 0, time: +rel.upgrade_time || 0, townId });
+    }
+    return out;
+  }
+  // Coste de cada nivel (el que se ve en las aldeas), para estimar lo que falta.
+  function villageStageCosts() {
+    // (de todas las aldeas que ve el juego, también las de islas que ya no son tuyas)
+    const c = {};
+    for (const r of exCollection('FarmTownPlayerRelation')) { const l = +r.expansion_stage, k = +r.upgrade_cost; if (l >= 1 && k > 0 && !(l in c)) c[l] = k; }
+    return c;
+  }
+  function villagePlanSummary(target) {
+    const list = ownIslandVillages();
+    const costs = villageStageCosts();
+    let steps = 0, bp = 0, unknown = 0;
+    const below = list.filter((v) => v.level < target);
+    for (const v of below) {
+      for (let l = Math.max(v.level, 0); l < target; l++) {
+        if (v.busyUntil && l === v.level) continue; // ya subiendo este nivel
+        steps++;
+        const k = l === v.level ? v.cost : costs[l];
+        if (k > 0) bp += k; else unknown++;
+      }
+    }
+    return { list, below, steps, bp, unknown, busy: list.filter((v) => v.busyUntil).length };
+  }
+
+  async function villageLevelTick() {
+    const cfg = state.aldeasNivel;
+    if (!cfg?.enabled) return;
+    const target = clamp(+cfg.target || 6, 1, 6);
+    let bp = battlePoints();
+    if (bp === null) return;
+    const keep = Math.max(0, +cfg.keepBp || 0);
+    const now = Date.now();
+    const cand = ownIslandVillages()
+      .filter((v) => v.level < target && !v.busyUntil && (vlRuntime.cooldown.get(+v.rel.id) || 0) <= now)
+      .sort((a, b) => a.level - b.level || a.cost - b.cost);
+    for (const v of cand) {
+      if (!state.aldeasNivel.enabled) return;
+      const cost = v.cost || 0;
+      if (bp - cost < keep) continue; // no llega (puede que una más barata sí)
+      const action = v.level === 0 ? 'unlock' : 'upgrade';
+      try {
+        await gpPostAs(v.townId, 'frontend_bridge', 'execute', {
+          model_url: `FarmTownPlayerRelation/${v.rel.id}`, action_name: action, captcha: null,
+          arguments: { farm_town_id: +v.farm.id }, nl_init: true
+        });
+        bp -= cost;
+        vlRuntime.cooldown.set(+v.rel.id, Date.now() + Math.max(120, v.time || 0) * 1000);
+        farmLog(`Aldea ${v.farm.name} (${farmTownName(v.townId)}): ${action === 'unlock' ? 'liberada' : `nivel ${v.level} → ${v.level + 1}`}${cost ? ` · ${cost} puntos de combate` : ''}.`, 'ok');
+      } catch (e) {
+        vlRuntime.cooldown.set(+v.rel.id, Date.now() + 10 * 60000);
+        farmLog(`Aldea ${v.farm.name}: no se pudo subir (${e.message}).`, 'error');
+      }
+      await sleep(700 + Math.random() * 800);
+    }
+    renderIfIdle('granjas');
+  }
+  function startVillageLevelEngine() {
+    if (vlRuntime.timer) return;
+    vlRuntime.timer = setInterval(() => {
+      if (!state.aldeasNivel?.enabled || vlRuntime.running) return;
+      vlRuntime.running = true;
+      villageLevelTick().catch((e) => farmLog(`Subir aldeas: ${e.message}`, 'error')).finally(() => { vlRuntime.running = false; });
+    }, 60000);
+  }
+  function runVillageLevelNow() {
+    if (vlRuntime.running) return;
+    vlRuntime.running = true;
+    villageLevelTick().catch((e) => farmLog(`Subir aldeas: ${e.message}`, 'error')).finally(() => { vlRuntime.running = false; });
+  }
+
+  function renderVillageLevelCard() {
+    const cfg = state.aldeasNivel;
+    const target = clamp(+cfg.target || 6, 1, 6);
+    let sum = null; try { sum = villagePlanSummary(target); } catch {}
+    const bp = battlePoints();
+    const lvlSeg = el('div', { class: 'nb-seg nb-seg-sm' }, [1, 2, 3, 4, 5, 6].map((n) =>
+      el('span', { class: `nb-seg-btn${target === n ? ' active' : ''}`, onclick: () => { cfg.target = n; saveState(); renderBody(); if (cfg.enabled) runVillageLevelNow(); } }, `Nivel ${n}`)));
+    const keepIn = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '0', step: '50', value: String(cfg.keepBp || 0) });
+    keepIn.addEventListener('change', () => { cfg.keepBp = Math.max(0, pos(keepIn.value, 0)); saveState(); renderBody(); });
+    // Reparto actual por nivel
+    const byLevel = {};
+    for (const v of sum?.list || []) byLevel[v.level] = (byLevel[v.level] || 0) + 1;
+    const levels = Object.keys(byLevel).map(Number).sort((a, b) => a - b);
+    return el('div', { class: 'nb-card', 'data-nb-card': 'aldeasNivel' }, [
+      el('div', { class: 'nb-row' }, [
+        el('span', { class: 'nb-row-label' }, [el('b', {}, 'Subir aldeas de nivel')]),
+        switchEl(!!cfg.enabled, (v) => { cfg.enabled = v; saveState(); farmLog(v ? `Subir aldeas activado: todas a nivel ${target}.` : 'Subir aldeas desactivado.', 'info'); renderBody(); if (v) runVillageLevelNow(); }, false)
+      ]),
+      el('p', { class: 'nb-placeholder' }, 'Sube las aldeas de todas tus islas hasta el nivel elegido, gastando puntos de combate. Primero las de nivel más bajo; varias a la vez.'),
+      lvlSeg,
+      el('div', { class: 'nb-row nb-mt' }, [el('span', { class: 'nb-row-label' }, 'Puntos de combate libres'), el('b', {}, bp === null ? '—' : bp.toLocaleString('es-ES'))]),
+      el('div', { class: 'nb-row' }, [el('div', { class: 'nb-option-text' }, [el('span', { class: 'nb-option-label' }, 'No gastar por debajo de'), el('span', { class: 'nb-option-hint' }, 'Puntos de combate que siempre se guardan')]), keepIn]),
+      sum ? el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Tus aldeas por nivel'), el('span', { class: 'nb-row-value' }, levels.map((l) => `${l ? `nv ${l}` : 'sin liberar'}: ${byLevel[l]}`).join(' · ') || '—')]) : null,
+      sum ? el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, `Para llegar a nivel ${target}`), el('span', { class: 'nb-row-value' },
+        sum.steps ? `${sum.below.length} aldea(s) · ${sum.steps} subida(s) · ~${sum.bp.toLocaleString('es-ES')} puntos${sum.unknown ? ` (+${sum.unknown} de coste aún desconocido)` : ''}` : 'todas llegan ya')]) : null,
+      sum?.busy ? el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Subiendo ahora'), el('span', { class: 'nb-row-value' }, `${sum.busy} aldea(s)`)]) : null
+    ]);
+  }
+
 
   /* ---------------------------------------------------------------------------------
      8a-ter) CUEVA — meter plata en las cuevas
@@ -6744,7 +6892,12 @@
         <p>Las aldeas de tu ciudad actual con <b>su tasa para esta ciudad</b> (atenuadas si no llegan a la tasa para equilibrar) y los <b>próximos cambios</b> que haría en todo el imperio, con su tipo:</p>
         <ul><li><b>equilibrar</b>: cambio normal con tasa alta.</li><li><b>exceso</b>: sobra muchísimo de ese recurso; se cambia aunque la tasa sea baja.</li><li><b>rescate</b>: el recurso iba a rebosar.</li><li><b>alimentar</b>: cambia lo que el comercio trajo para esa aldea.</li></ul>
         <p>Si la <b>Cueva</b> está activa, solo se cambia por plata (para guardarla) y aparece el ajuste «Con Cueva: cambiar por plata lo que pase de…».</p>` },
-      { t: 'Actividad', find: () => TQ.lastCard(/^Actividad/), h: `<p>Lo último que ha hecho: recolecciones, cambios con aldeas, errores. Cada pestaña tiene la suya.</p>` }
+      { t: 'Subir aldeas de nivel', find: () => TQ.card(/^Subir aldeas/), wide: true, h: `
+        <p>Elige un <b>nivel (1–6)</b> y actívalo: el bot sube todas las aldeas de todas tus islas que estén por debajo, gastando <b>puntos de combate</b>. Primero las de nivel más bajo (se igualan); varias pueden subir a la vez.</p>
+        <ul><li>Ves tus puntos de combate libres, cuántas aldeas hay en cada nivel y lo que costaría llegar al nivel elegido (en este mundo: 2→3 = 5, 3→4 = 25, 4→5 = 50, 5→6 = 100 puntos).</li>
+        <li><b>No gastar por debajo de</b>: puntos de combate que siempre se guardan.</li></ul>
+        ${AUTO('Lo mira cada minuto: si hay puntos, lanza la siguiente subida de cada aldea en cuanto termina la anterior.')}` },
+      { t: 'Actividad', find: () => TQ.lastCard(/^Actividad/), h: `<p>Lo último que ha hecho: recolecciones, cambios con aldeas, subidas de aldeas, errores. Cada pestaña tiene la suya.</p>` }
     ]);
 
     // ------------------------------------------------------------------ Construcción
@@ -6973,6 +7126,10 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.14.0', items: [
+      { t: 'Subir aldeas de nivel', tab: 'granjas', find: () => TQ.card(/^Subir aldeas/) || TQ.tab('granjas'), h: `
+        <p>En Granjas, nueva tarjeta <b>Subir aldeas de nivel</b>: eliges nivel 1–6 y el bot sube todas las aldeas de tus islas que estén por debajo, con puntos de combate, empezando por las más bajas. Puedes guardar un mínimo de puntos.</p>` }
+    ] },
     { v: '1.13.4', items: [
       { t: 'Reintentos con el azar del juego', tab: 'ataques', before: () => { if (atk.view !== 'new') { atk.view = 'new'; return true; } }, find: () => TQ.step(5) || TQ.tab('ataques'), h: `
         <ul><li>Ultra/Humano: nuevo <b>Aleatoriedad (± s)</b>, de 3 a 15. Empieza a probar antes de la hora ideal y sigue probando después, aunque un intento haya llegado tarde.</li>
@@ -7651,6 +7808,7 @@
     startResearchEngine();
     startTradeEngine();
     startExchangeEngine();
+    startVillageLevelEngine();
     startCaveEngine();
     startRecruitEngine();
     startAttackEngine();
