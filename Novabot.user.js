@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.14.1
+// @version      1.14.2
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.14.1';
+  const VERSION = '1.14.2';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -4571,9 +4571,11 @@
 
   // Objetivos cumplidos: en cuanto todo lo que faltaba está ya en la cola del juego (o
   // hecho), el bot no tiene nada más que hacer → se quitan (como en Construcción).
+  // En espera NO se quitan: se decide al empezar (si para entonces se perdieron tropas,
+  // p. ej. atacando, se reclutan; si siguen todas, se quita sin reclutar nada).
   function pruneRecruitGoals(townId) {
     const cfg = townRecruitCfg(townId);
-    if (!cfg.goals.length) return;
+    if (!cfg.goals.length || recruitWaiting(townId)) return;
     const have = townUnitsHave(townId), queued = queuedUnits(townId);
     const done = cfg.goals.filter((g) => (+have[g.id] || 0) + (+queued[g.id] || 0) >= g.target);
     if (!done.length) return;
@@ -4831,7 +4833,7 @@
         unitIcon(g.id),
         el('div', { class: 'nb-goal-main' }, [
           el('div', { class: 'nb-goal-name' }, unitName(g.id)),
-          el('div', { class: 'nb-goal-sub' }, `tienes ${+have[g.id] || 0}${queued[g.id] ? ` + ${queued[g.id]} en cola` : ''} · faltan ${Math.max(0, g.target - h)}${unitResearched(townId, g.id) ? '' : ' · esperando a que se investigue'}`)
+          el('div', { class: 'nb-goal-sub' }, `tienes ${+have[g.id] || 0}${queued[g.id] ? ` + ${queued[g.id]} en cola` : ''} · ${h >= g.target && recruitWaiting(townId) ? 'cumplido ahora: se vuelve a mirar al empezar' : `faltan ${Math.max(0, g.target - h)}`}${unitResearched(townId, g.id) ? '' : ' · esperando a que se investigue'}`)
         ]),
         el('div', { class: 'nb-stepper' }, [
           el('span', { class: 'nb-mini', onclick: () => setTarget(g.id, g.target - 50) }, '−50'),
@@ -4865,7 +4867,8 @@
       input.addEventListener('input', () => { if (input.value) drafts[draftKey(id)] = input.value; else delete drafts[draftKey(id)]; });
       const add = () => {
         const v = pos(input.value, 0);
-        if (!v || v <= h) { input.focus(); input.select?.(); return; }
+        // En espera se puede pedir un total que ya tienes: se comprueba al empezar.
+        if (!v || (v <= h && !recruitWaiting(townId))) { input.focus(); input.select?.(); return; }
         delete drafts[draftKey(id)];
         setTarget(id, v);
       };
@@ -5373,6 +5376,7 @@
     const before = {};
     for (const o of atk.queue) {
       if (o === a || +o.source !== +a.source || !['pending', 'sending'].includes(o.status) || o.executeAt > a.executeAt) continue;
+      if (o.status === 'sending' && o._away) continue; // sus tropas ya están fuera (no están en info.units)
       if (o.executeAt === a.executeAt && String(o.id) > String(a.id)) continue;
       for (const [k, v] of Object.entries(o.units || {})) before[k] = (before[k] || 0) + Math.max(0, Math.floor(+v || 0));
     }
@@ -5399,48 +5403,15 @@
     return { payload: p, used, missing, left };
   }
 
-  // Llegada real que devuelve el juego (arrival_at en las notificaciones).
-  function arrivalFromResponse(res, expectedMs) {
-    let txt = ''; try { txt = JSON.stringify(res); } catch {}
-    const vals = [...txt.matchAll(/arrival_at\\*"?\s*:\s*\\*"?(\d{10})/g)].map((m) => +m[1] * 1000);
-    if (!vals.length) return null;
-    vals.sort((a, b) => Math.abs(a - expectedMs) - Math.abs(b - expectedMs));
-    return Math.abs(vals[0] - expectedMs) < 6 * 3600000 ? vals[0] : null;
-  }
-
-  // Id de la orden creada (para poder cancelarla): el objeto de la respuesta que
-  // trae esa llegada y su command_id / id.
-  function commandIdFromResponse(res, arrivalMs) {
-    let txt = ''; try { txt = JSON.stringify(res).replace(/\\/g, ''); } catch {}
-    const want = Math.round(arrivalMs / 1000);
-    for (const m of txt.matchAll(/\{[^{}]*"arrival_at"\s*:\s*"?(\d{10})"?[^{}]*\}/g)) {
-      if (Math.abs(+m[1] - want) > 1) continue;
-      const id = /"command_id"\s*:\s*"?(\d+)/.exec(m[0]) || /"id"\s*:\s*"?(\d+)/.exec(m[0]);
-      if (id) return +id[1];
-    }
-    return null;
-  }
-  // Orden recién enviada, buscada en los movimientos del juego (por si la respuesta no trae su id).
-  async function findSentCommand(a, arrivalMs) { return (await findSentMovement(a, arrivalMs))?.cmd || null; }
-  // La orden recién enviada en los movimientos del juego → { cmd, arrival } (arrival en ms).
-  // Sin llegada conocida: la más reciente de ese origen → destino (salida ≥ la hora de envío).
-  async function findSentMovement(a, arrivalMs, sentAfterMs = 0) {
-    for (let i = 0; i < 5; i++) {
-      try {
-        const list = [].concat(UW.MM.getCollections()?.MovementsUnits || []).flatMap((c) => c?.models || []).map((m) => m.attributes);
-        const hit = list.filter((m) => +m.home_town_id === +a.source && +m.target_town_id === +a.target && m.command_id
-            && (arrivalMs ? Math.abs(+m.arrival_at * 1000 - arrivalMs) <= 1500 : +m.started_at * 1000 >= sentAfterMs - 3000))
-          .sort((x, y) => +y.started_at - +x.started_at)[0];
-        if (hit) return { cmd: +hit.command_id, arrival: +hit.arrival_at * 1000 };
-      } catch {}
-      await sleep(600);
-    }
-    return null;
-  }
-
   /* Órdenes del juego (Vista general → Órdenes): GET town_overviews?action=command_overview
-     → data.commands (de TODAS las ciudades). Sirve para ver si una orden enviada por el bot
-     sigue en marcha o la cancelaste en el juego. */
+     → data.commands de TODAS las ciudades: id, origin_town_id, destination_town_id,
+     started_at, arrival_at, return… (solo lectura, lo mismo que abrir esa vista).
+     ES LA ÚNICA FUENTE FIABLE para saber qué orden acaba de enviar el bot:
+       · MovementsUnits (movimientos del juego) solo trae los de la ciudad ABIERTA;
+       · la respuesta del envío no trae la orden (el juego se queda las notificaciones).
+     Antes se usaban esas dos: enviando desde otra ciudad no se encontraba la orden, el
+     intento se daba por bueno SIN mirar la llegada (se quedaba el primero, que sale antes
+     a propósito) y luego, al no encontrarla por su hora, salía como «cancelado». */
   async function fetchCommandOverview() {
     const r = await gpGet('town_overviews', 'command_overview', { nl_init: true });
     let x = r?.json !== undefined ? r.json : r;
@@ -5448,6 +5419,46 @@
     const list = x?.data?.commands;
     return Array.isArray(list) ? list : null;
   }
+  // Órdenes con id numérico (las revueltas "revolt_…" no son órdenes cancelables).
+  async function ownCommands() {
+    const list = await fetchCommandOverview();
+    if (!list) return null;
+    return list.filter((c) => /^\d+$/.test(String(c.id))).map((c) => ({
+      id: +c.id, o: +c.origin_town_id, d: +c.destination_town_id,
+      st: +c.started_at * 1000 || 0, arr: +c.arrival_at * 1000 || 0, ret: !!(c.return || c.cmd_return)
+    }));
+  }
+  // Ids ya asignados a ataques del bot (así nunca se confunde con la orden de otro ataque
+  // del mismo tren ni con un intento anterior).
+  const atkClaimed = new Set();
+  const atkClaimedIds = () => { const s = new Set(atkClaimed); for (const x of atk.queue) if (x.commandId) s.add(+x.commandId); return s; };
+  // La orden de ESTE envío: mismo origen → destino, de ida, no asignada a otro ataque,
+  // salida en este envío y llegada coherente con el viaje.
+  function pickSentCommand(cmds, a, sentSrv, exclude) {
+    const center = sentSrv + (+a.duration || 0);
+    const c = cmds.filter((x) => x.o === +a.source && x.d === +a.target && !x.ret && !exclude.has(x.id)
+      && (!x.st || (x.st >= sentSrv - 5000 && x.st <= sentSrv + 20000))
+      && x.arr > 0 && Math.abs(x.arr - center) <= Math.max(60000, 0.5 * (+a.duration || 0)));
+    c.sort((x, y) => (Math.abs((x.st || 1e15) - sentSrv) - Math.abs((y.st || 1e15) - sentSrv)) || (Math.abs(x.arr - center) - Math.abs(y.arr - center)) || (y.id - x.id));
+    return c[0] || null;
+  }
+  // → { cmd, arrival (ms) } de la orden recién enviada, o null si no aparece.
+  async function identifySent(a, sentSrv) {
+    for (let i = 0; i < 4; i++) {
+      try {
+        const cmds = await ownCommands();
+        const hit = cmds && pickSentCommand(cmds, a, sentSrv, atkClaimedIds());
+        if (hit) { atkClaimed.add(hit.id); return { cmd: hit.id, arrival: hit.arr }; }
+      } catch {}
+      await sleep(300 + i * 300);
+    }
+    return null;
+  }
+  const atkInWindow = (a, t) => (a.accepted ? a.accepted.includes(Math.floor(t / 1000) * 1000) : (!a.windowEnd || (t >= a.wantAt && t < a.windowEnd + 1000)));
+
+  // Seguimiento de lo ya enviado con las Órdenes del juego: por su id (nunca por la hora,
+  // que con la aleatoriedad del juego no sirve). Corrige la llegada si el juego dice otra y
+  // avisa si cae fuera del rango. Si no se sabe cuál es la orden, NO se marca nada.
   let atkSyncBusy = false, atkSyncAt = 0;
   async function atkSyncWithGame(force = false) {
     const now = srvNow();
@@ -5455,18 +5466,32 @@
     if (!watch.length || atkSyncBusy || (!force && Date.now() - atkSyncAt < 20000)) return;
     atkSyncBusy = true; atkSyncAt = Date.now();
     try {
-      const cmds = await fetchCommandOverview();
+      const cmds = await ownCommands();
       if (!cmds) return;
-      const txt = cmds.map((c) => { try { return JSON.stringify(c); } catch { return ''; } });
+      const byId = new Map(cmds.map((c) => [c.id, c]));
       let changed = false;
       for (const a of watch) {
-        const arr = Math.round((a.realArrival || a.arrivalAt) / 1000);
-        const alive = txt.some((t) => (a.commandId && new RegExp(`\\b${a.commandId}\\b`).test(t))
-          || (new RegExp(`\\b${a.target}\\b`).test(t) && [arr - 1, arr, arr + 1].some((v) => t.includes(String(v)))));
-        if (!alive) {
+        if (!a.commandId) {
+          const hit = a.sentSrv ? pickSentCommand(cmds, a, a.sentSrv, atkClaimedIds()) : null;
+          if (!hit) continue;
+          a.commandId = hit.id; atkClaimed.add(hit.id); changed = true;
+        }
+        const c = byId.get(+a.commandId);
+        if (!c || c.ret) {
           a.status = 'cancelled'; a.note = 'Ya no está en las Órdenes del juego: cancelada (o devuelta) en el juego.';
           atkLog(`${farmTownName(a.source)} → ${a.targetName}: ya no está en las Órdenes del juego → cancelada.`, 'info');
-          changed = true;
+          changed = true; continue;
+        }
+        if (c.arr && Math.abs(c.arr - (+a.realArrival || 0)) >= 1000) {
+          a.realArrival = c.arr; changed = true;
+          if (a.windowEnd) {
+            const ok = atkInWindow(a, c.arr);
+            a.arrivalErr = ok ? 0 : Math.round((c.arr - a.wantAt) / 1000) || -1;
+            if (!ok) {
+              a.note = `Según las Órdenes del juego llega ${fmtClock(c.arr)}: FUERA ${a.accepted ? 'de las horas aceptadas' : 'del rango'}.`;
+              atkLog(`${farmTownName(a.source)} → ${a.targetName}: llega ${fmtClock(c.arr)}, fuera ${a.accepted ? 'de las horas aceptadas' : 'del rango'} (visto en las Órdenes del juego).`, 'error');
+            }
+          } else a.arrivalErr = Math.round((c.arr - (a.executeAt + a.duration)) / 1000);
         }
       }
       if (changed) { atkSave(); atkRefreshQueue(); }
@@ -5499,29 +5524,40 @@
       delete a._pre; delete a._armed; atkSave(); atkRefreshQueue(); return;
     }
     a.status = 'sending'; atkRefreshQueue();
-    const retry = !!a.windowEnd && (a.method === 'ultra' || a.method === 'human');
-    const inWindow = (t) => a.accepted ? a.accepted.includes(Math.floor(t / 1000) * 1000) : (!a.windowEnd || (t >= a.wantAt && t < a.windowEnd + 1000));
+    const retry = atkIsRetry(a);
+    const inWindow = (t) => atkInWindow(a, t);
+    const who = () => `${farmTownName(a.source)} → ${a.targetName}`;
     // Con reintentos el hechizo NO va con el envío (se perdería al cancelar): se lanza sobre
     // la orden que se queda, en cuanto el bot sabe que ya no la va a cancelar.
     const lateSpell = retry && !!a.spell;
     a.attempts = 0;
+    let lastUsed = null; // tropas del intento anterior (cancelado): deben haber vuelto
     try {
       for (;;) {
         a.attempts += 1;
         let pre = a.attempts === 1 ? a._pre : null;
         if (!pre || Date.now() - pre.at > 20000) {
-          const info = await attackInfo(a.source, a.target, 0);
+          let info = await attackInfo(a.source, a.target, 0);
+          // Reintento: esperar a que vuelvan TODAS las tropas del intento cancelado (si no,
+          // saldría un ataque con menos tropas de las que pediste).
+          const back = (inf) => !lastUsed || Object.entries(lastUsed).every(([u, n]) => (+inf?.units?.[u]?.count || 0) >= n);
+          for (let k = 0; k < 10 && !back(info) && srvNow() + 700 < atkLastSend(a); k++) { await sleep(500); info = await attackInfo(a.source, a.target, 0); }
+          if (!back(info)) throw new Error('Las tropas del intento cancelado aún no habían vuelto a tiempo para otro intento.');
           pre = { at: Date.now(), ...buildPayload(a, info) };
         }
+        delete a._away;
         const sentLocal = Date.now();
         const payload = { ...pre.payload };
         if (lateSpell) delete payload.power_id;
-        const res = await gpPostAs(a.source, 'town_info', 'send_units', payload);
+        await gpPostAs(a.source, 'town_info', 'send_units', payload);
+        a._away = true; lastUsed = pre.used;
         const expected = a.executeAt + a.duration;
-        let real = arrivalFromResponse(res, expected);
-        let cmdFound = real ? commandIdFromResponse(res, real) : null;
-        // La respuesta no siempre trae la llegada: se lee de los movimientos del juego.
-        if (!real) { const mv = await findSentMovement(a, null, sentLocal + clockOffset().off); if (mv) { real = mv.arrival; cmdFound = mv.cmd; } }
+        const sentSrv = sentLocal + clockOffset().off;
+        a.sentSrv = sentSrv;
+        // Cuál es la orden nueva y cuándo llega DE VERDAD: Órdenes del juego (todas las ciudades).
+        const got = await identifySent(a, sentSrv);
+        const real = got?.arrival || null;
+        const cmdFound = got?.cmd || null;
         if (cmdFound) a.commandId = cmdFound;
         if (!retry || !real || inWindow(real)) {
           a.status = 'sent'; a.sentAt = srvNow();
@@ -5536,36 +5572,42 @@
               state.ataques.correctionMs = clamp(atkCorrection() + (errS > 0 ? 250 : -250), -1500, 1500);
               saveState();
             }
+          } else {
+            // No debería pasar (la orden sale en las Órdenes del juego). Si pasa, se avisa
+            // claro y el seguimiento la vuelve a buscar y corrige la llegada.
+            a.note = [a.note, `No se pudo leer la llegada real${retry ? ': no se pudo comprobar el rango, revísalo en el juego' : ''}.`].filter(Boolean).join(' · ');
+            atkLog(`${who()}: enviado, pero no se pudo leer su llegada en las Órdenes del juego${retry ? ' (rango SIN comprobar)' : ''}.`, 'error');
           }
           if (lateSpell) {
             // Ya no se cancela: ahora sí, el hechizo.
             const spellName = UW.GameData?.powers?.[a.spell]?.name || a.spell;
             try {
-              const cmd = cmdFound || (real && commandIdFromResponse(res, real)) || await findSentCommand(a, real);
-              if (!cmd) throw new Error('no se encontró la orden enviada');
-              await castSpellOnCommand(a, cmd);
+              if (!cmdFound) throw new Error('no se encontró la orden enviada');
+              await castSpellOnCommand(a, cmdFound);
               a.spellCast = true;
-              atkLog(`${farmTownName(a.source)} → ${a.targetName}: ${spellName} lanzado sobre la orden.`, 'ok');
+              atkLog(`${who()}: ${spellName} lanzado sobre la orden.`, 'ok');
             } catch (e) {
               a.note = [a.note, `No se pudo lanzar ${spellName}: ${e.message}`].filter(Boolean).join(' · ');
-              atkLog(`${farmTownName(a.source)} → ${a.targetName}: no se pudo lanzar ${spellName} (${e.message}).`, 'error');
+              atkLog(`${who()}: no se pudo lanzar ${spellName} (${e.message}).`, 'error');
             }
           }
           const tries = a.attempts > 1 ? ` · ${a.attempts} intentos` : '';
-          atkLog(`${farmTownName(a.source)} → ${a.targetName}: ${a.type === 'support' ? 'apoyo' : 'ataque'} enviado${real ? ` · llega ${fmtClock(real)}${a.windowEnd ? (inWindow(real) ? ` ✓ ${a.accepted ? 'hora aceptada' : 'dentro del rango'}` : ` (${a.accepted ? 'no es una hora aceptada' : 'fuera del rango'})`) : a.arrivalErr ? ` (${a.arrivalErr > 0 ? '+' : ''}${a.arrivalErr} s)` : ' ✓ exacto'}` : ''}${tries}.`, 'ok');
+          if (real) atkLog(`${who()}: ${a.type === 'support' ? 'apoyo' : 'ataque'} enviado · llega ${fmtClock(real)}${a.windowEnd ? (inWindow(real) ? ` ✓ ${a.accepted ? 'hora aceptada' : 'dentro del rango'}` : ` (${a.accepted ? 'no es una hora aceptada' : 'fuera del rango'})`) : a.arrivalErr ? ` (${a.arrivalErr > 0 ? '+' : ''}${a.arrivalErr} s)` : ' ✓ exacto'}${tries}.`, 'ok');
           break;
         }
-        // Fuera del rango: cancelar y reintentar si aún da tiempo.
-        const cmd = cmdFound || commandIdFromResponse(res, real);
-        if (!cmd) {
+        // Fuera del rango: cancelar ESA orden (la identificada, nunca otra) y reintentar.
+        try {
+          await gpPostAs(a.source, 'command_info', 'cancel_command', { id: cmdFound });
+        } catch (e) {
           a.status = 'sent'; a.sentAt = srvNow(); a.realArrival = real;
-          a.note = 'Llegada fuera del rango y no se pudo identificar la orden para cancelarla.';
-          atkLog(`${farmTownName(a.source)} → ${a.targetName}: llega ${fmtClock(real)}, fuera del rango (no se pudo cancelar).`, 'error');
+          a.arrivalErr = Math.round((real - a.wantAt) / 1000) || -1;
+          a.note = `Llega ${fmtClock(real)}, fuera ${a.accepted ? 'de las horas aceptadas' : 'del rango'}, y el juego no dejó cancelarla: ${e.message}`;
+          atkLog(`${who()}: llega ${fmtClock(real)}, fuera del rango, y no se pudo cancelar (${e.message}).`, 'error');
           break;
         }
-        await gpPostAs(a.source, 'command_info', 'cancel_command', { id: cmd });
+        atkClaimed.add(cmdFound);
         const away = Date.now() - sentLocal; // las tropas tardan lo mismo en volver
-        atkLog(`${farmTownName(a.source)} → ${a.targetName}: intento ${a.attempts} llegaba ${fmtClock(real)} → cancelado.`, 'info');
+        atkLog(`${who()}: intento ${a.attempts} llegaba ${fmtClock(real)} → cancelado.`, 'info');
         const jit = atkJitterMs(a);
         if (!jit && real >= a.windowEnd + 1000) throw new Error(`Llegaba ${fmtClock(real)}, después ${a.accepted ? 'de la última hora aceptada' : 'del rango'}: ya no se puede acertar.`);
         if (a.attempts >= 80) throw new Error('Demasiados intentos sin acertar el rango.');
@@ -5593,9 +5635,9 @@
     } catch (e) {
       a.status = /configurado para no enviar/.test(e.message) ? 'skipped' : 'error';
       a.error = e.message;
-      atkLog(`${farmTownName(a.source)} → ${a.targetName}: ${e.message}`, 'error');
+      atkLog(`${who()}: ${e.message}`, 'error');
     }
-    delete a._pre; delete a._armed;
+    delete a._pre; delete a._armed; delete a._away;
     atkSave(); atkRefreshQueue();
   }
 
@@ -7002,7 +7044,8 @@
       { t: 'Activar', find: () => TQ.card(/^Reclutamiento automático/), h: `<p>Interruptor general + excepción para la ciudad actual (igual que en Construcción).</p>` },
       { t: 'Empezar más tarde / programar', find: () => TQ.txt('.nb-alert, .nb-row', /^Empezar más tarde|^Empieza en|^Empezar dentro/) || TQ.card(/^Reclutamiento automático/), h: `
         <p><b>Empezar más tarde</b>: la ciudad queda <b>en espera</b>: no recluta, no pide ni reserva recursos (hasta puede donar a otras). Luego pones los minutos y <b>Programar</b>: empezará a esa hora.</p>
-        <p>Útil para esperar a un <b>héroe</b> que abarata tropas: el bot te avisa si llega antes o después de empezar.</p>` },
+        <p>Útil para esperar a un <b>héroe</b> que abarata tropas: el bot te avisa si llega antes o después de empezar.</p>
+        <p>También para <b>reponer después de un ataque</b>: en espera puedes pedir un total que ya tienes. Al empezar se vuelve a contar: si perdiste tropas, recluta las que falten; si siguen todas, se quita sin reclutar nada.</p>` },
       { t: 'Tamaño del lote', find: inCard(/^Reclutamiento automático/, /^Lote = /), h: `
         <p>Un lote es lo máximo de <b>una sola tropa</b> que cabe en ese % del almacén (cada tropa distinta ocupa un hueco de la cola, por eso no se mezclan).</p>
         ${AUTO(`<ul><li>Primero las tropas a las que les falta al menos un lote completo, en el orden de la lista; los restos, al final.</li>
@@ -7020,9 +7063,9 @@
         ${AUTO('El coste es el <b>real</b> que muestra el Cuartel/Puerto (con héroes e investigaciones); se relee cada 5 min y al llegar un héroe.')}` },
       { t: 'Tropas y barcos objetivo', find: () => TQ.card(/^Cuartel · tropas objetivo/), h: `
         <p>Lo que has pedido: <b>total</b> que quieres tener. Cambia con <b>−50 / +50</b> o escribiendo; <b>✕</b> lo quita. Debajo está la tarjeta del <b>Puerto</b> con los barcos.</p>
-        ${AUTO('Cuenta las tropas en casa, las que están fuera (atacando o apoyando) y las de la cola del juego. Cuando llegas al total, se quita sola de la lista.')}` },
+        ${AUTO('Cuenta las tropas en casa, las que están fuera (atacando o apoyando) y las de la cola del juego. Cuando llegas al total, se quita sola de la lista (en espera no: se decide al empezar).')}` },
       { t: 'Añadir tropa o barco', find: () => TQ.card(/^Cuartel · añadir/), h: `
-        <p>Escribe el <b>total</b> que quieres (no cuántas más) y pulsa <b>✓</b>. Ves cuántas tienes y su coste. Abajo, lo mismo para barcos.</p>
+        <p>Escribe el <b>total</b> que quieres (no cuántas más) y pulsa <b>✓</b>. Ves cuántas tienes y su coste. Abajo, lo mismo para barcos. Con la ciudad <b>en espera</b> vale un total que ya tienes (se comprueba al empezar).</p>
         ${TIP('Lo que escribes no se borra aunque el panel se repinte.')}` },
       { t: 'Qué hace solo', find: () => TQ.lastCard(/^Actividad/), h: `
         ${AUTO(`<ul><li>Cada 15 s revisa todas las ciudades y recluta el lote en cuanto lo tiene (respetando la prioridad).</li>
@@ -7125,7 +7168,8 @@
         <li><b>Hoy / Mañana / Pasado mañana</b>: el día de esa hora. Si la hora ya pasó (o no da tiempo a llegar), <b>no se programa</b> y te lo dice: nunca se pasa solo al día siguiente. Para un ataque a la 1:00 programado a las 23:00, elige <b>Mañana</b>. Los botones de ±tiempo cambian el día solos si cruzas la medianoche.</li>
         <li><b>Rango</b> (solo llegar): acepta llegadas entre la hora y el «hasta».</li>
         <li><b>Horas a mano</b> (solo llegar): escribe las horas de llegada que valen, sueltas o por rangos (<code>22:00:01, 22:00:03-22:00:05</code>). Las que no pongas no valen, así puedes saltarte un segundo del medio. La primera pasa a ser la hora de arriba.</li>
-        <li><b>Preciso</b>: un envío calculado al milisegundo. <b>Ultra</b> y <b>Humano</b>: envía y, si la llegada cae fuera del rango (o, sin «hasta», no es justo esa hora), cancela y reintenta hasta acertar.</li>
+        <li><b>Preciso</b>: un envío calculado al milisegundo. <b>Ultra</b> y <b>Humano</b>: envía y, si la llegada cae fuera del rango (o, sin «hasta», no es justo esa hora), cancela y reintenta hasta acertar.
+        ${AUTO('Cada intento se busca en la <b>Vista general de órdenes</b> del juego (sirve desde cualquier ciudad): se mira su llegada real y solo se cancela <b>esa</b> orden, nunca la de otro ataque del tren. Antes de reintentar espera a que vuelvan <b>todas</b> las tropas. Después, la llegada de lo enviado se sigue comprobando con esa vista.')}</li>
         <li><b>Aleatoriedad (± s, 3–15)</b>: el juego mete unos segundos de azar en la llegada. Con Ultra/Humano el primer intento sale esos segundos <b>antes</b> de lo ideal y se sigue probando hasta esos segundos <b>después</b>, aunque un intento llegue tarde.</li>
         <li><b>Espera entre intentos</b> (solo Humano): tras cancelar, cuántos segundos espera antes de volver a lanzar (y siempre a que vuelvan las tropas). Ultra reintenta en cuanto vuelven.</li></ul>` },
       { t: 'Plan y avisos', find: () => TQ.sel('.nb-plan', bodyEl), h: `
@@ -7177,6 +7221,14 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.14.2', items: [
+      { t: 'Ultra/Humano: la llegada se comprueba de verdad', tab: 'ataques', before: () => { if (atk.view !== 'queue') { atk.view = 'queue'; return true; } }, find: () => TQ.card(/^Programados/) || TQ.tab('ataques'), h: `
+        <p>Enviando desde una ciudad que no era la abierta, el bot no encontraba la orden: daba por bueno el <b>primer intento</b> (que sale unos segundos antes a propósito) y luego lo marcaba como <b>cancelado</b>. Ahora cada intento se busca en la <b>Vista general de órdenes</b> del juego (todas las ciudades): se mira su llegada real y, si cae fuera, se cancela <b>esa</b> orden y se vuelve a intentar.</p>
+        <ul><li>Antes de reintentar espera a que hayan vuelto todas las tropas del intento cancelado (nunca sale con menos).</li>
+        <li>En Programados, la llegada se corrige con la del juego y te avisa si alguna cae fuera del rango.</li></ul>` },
+      { t: 'Reponer tropas tras un ataque', tab: 'reclutamiento', find: () => TQ.card(/^Cuartel · tropas objetivo/) || TQ.tab('reclutamiento'), h: `
+        <p>Con <b>Empezar más tarde</b> puedes pedir un total que ya tienes: el objetivo no se quita mientras espera. Al empezar se vuelve a contar: si perdiste tropas (por ejemplo atacando), recluta las que falten; si siguen todas, se quita sin reclutar nada.</p>` }
+    ] },
     { v: '1.14.1', items: [
       { t: 'Hechizos de reclutamiento, justo a tiempo', tab: 'reclutamiento', find: () => TQ.card(/^Hechizos de reclutamiento/) || TQ.tab('reclutamiento'), h: `
         <p>Los hechizos <b>Opcional</b> y <b>Obligatorio</b> ya no se lanzan mientras los recursos del lote vienen de camino: el bot espera a que el juego confirme que el lote entra y lanza el hechizo justo antes de la orden, así aprovecha toda su duración.</p>` }
