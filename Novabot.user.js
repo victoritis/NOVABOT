@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.12.6
+// @version      1.13.0
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.12.6';
+  const VERSION = '1.13.0';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -5034,6 +5034,38 @@
     return out;
   }
 
+  /* Otra isla: la tropa de tierra que no cabe en los barcos que salen se deja en la
+     ciudad, a partes iguales (el mismo % de cada tipo), hasta que quepa.
+     Hueco de cada barco = capacidad del juego (Bote de transporte 26, Bote rápido 10)
+     + Literas (info.researches.berth: +6 por barco si está investigada). Cada tropa
+     ocupa su población; las voladoras y el héroe no ocupan. */
+  function fitToShips(units, info) {
+    const none = { units, left: {}, cap: 0, need: 0 };
+    if (!info || info.same_island) return none;
+    const berth = +info.researches?.berth || 0;
+    const pop = (k) => +U(k).population || 1;
+    let cap = 0, need = 0;
+    const ground = [];
+    for (const [k, n] of Object.entries(units)) {
+      if (!(+n > 0)) continue;
+      if (U(k).is_naval) { if (isTransport(k)) cap += (+U(k).capacity + berth) * n; }
+      else if (!isFlying(k)) { need += pop(k) * n; ground.push(k); }
+    }
+    if (need <= cap) return { ...none, cap, need };
+    const out = { ...units }, left = {};
+    const f = cap / need;
+    let used = 0;
+    for (const k of ground) { out[k] = Math.floor(units[k] * f); used += out[k] * pop(k); }
+    // El hueco que queda se rellena una a una con la tropa que más se ha quedado por debajo de su parte.
+    for (;;) {
+      const k = ground.filter((x) => out[x] < units[x] && used + pop(x) <= cap).sort((a, b) => out[a] / units[a] - out[b] / units[b])[0];
+      if (!k) break;
+      out[k] += 1; used += pop(k);
+    }
+    for (const k of ground) { if (out[k] < units[k]) left[k] = units[k] - out[k]; if (!out[k]) delete out[k]; }
+    return { units: out, left, cap, need };
+  }
+
   // Avisos de Grepolis para un plan concreto.
   function atkWarnings(item, info, arrivalAt) {
     const w = [];
@@ -5049,7 +5081,12 @@
     }
     if (type !== 'support' && info.morale_activated && +info.morale < 100) w.push({ lvl: 'info', txt: `Moral ${Math.round(+info.morale)} %: tu ataque rinde a ese porcentaje.` });
     const tr = transportCheck(item.source, info, item.units);
-    if (tr && !tr.ok) w.push({ lvl: 'danger', txt: `Faltan barcos: capacidad ${tr.have}/${tr.need}.`, fix: 'transport' });
+    if (tr && !tr.ok) w.push({ lvl: 'danger', fix: 'transport', txt: `No caben en los barcos: hueco ${tr.have} para ${tr.need} de población.${item.onMissing === 'skip'
+      ? ' Así, al salir NO se enviará (configurado para no enviar si faltan tropas).'
+      : ' Así, al salir se dejará en la ciudad tropa de tierra (el mismo % de cada una) hasta que quepa.'}` });
+    // Tropas que aún no hay en la ciudad (ataque futuro).
+    const notYet = Object.entries(item.units).filter(([k, n]) => +n > (+info.units?.[k]?.count || 0));
+    if (notYet.length) w.push({ lvl: 'info', txt: `Aún no tienes todas: ${notYet.map(([k, n]) => `${atkUnitName(k)} ${+info.units?.[k]?.count || 0}/${n}`).join(', ')}. Al salir se ${item.onMissing === 'skip' ? 'cancelará si siguen faltando' : 'enviará lo que haya'}.` });
     // Tropas ya comprometidas en otros ataques programados desde la misma ciudad.
     const committed = {};
     for (const a of atk.queue) {
@@ -5092,10 +5129,18 @@
     }
     if (!total) throw new Error('No queda ninguna de las tropas elegidas en la ciudad.');
     if (missing.length && a.onMissing === 'skip') throw new Error(`Faltan tropas (${missing.join(', ')}); configurado para no enviar.`);
+    // Otra isla: lo que no cabe en los barcos que salen se queda (mismo % de cada tropa).
+    const fit = fitToShips(used, info);
+    const left = Object.entries(fit.left).map(([k, n]) => `${n} ${atkUnitName(k)}`);
+    if (left.length) {
+      if (a.onMissing === 'skip') throw new Error(`No caben en los barcos (hueco ${fit.cap} para ${fit.need}); configurado para no enviar.`);
+      for (const k of Object.keys(fit.left)) { if (fit.units[k]) { p[k] = fit.units[k]; used[k] = fit.units[k]; } else { delete p[k]; delete used[k]; } }
+      if (!Object.values(used).some((n) => n > 0)) throw new Error(`Ninguna tropa de tierra cabe en los barcos (hueco ${fit.cap}).`);
+    }
     if (a.type === 'attack' && a.strategy) p.attacking_strategy = [a.strategy];
     if (a.spell) p.power_id = a.spell;
     if (a.hero && heroesIn(a.source).some((h) => h.id === String(a.hero))) p.heroes = a.hero;
-    return { payload: p, used, missing };
+    return { payload: p, used, missing, left };
   }
 
   // Llegada real que devuelve el juego (arrival_at en las notificaciones).
@@ -5119,6 +5164,27 @@
     }
     return null;
   }
+  // Orden recién enviada, buscada en los movimientos del juego (por si la respuesta no trae su id).
+  async function findSentCommand(a, arrivalMs) {
+    for (let i = 0; i < 4; i++) {
+      try {
+        const list = [].concat(UW.MM.getCollections()?.MovementsUnits || []).flatMap((c) => c?.models || []).map((m) => m.attributes);
+        const hit = list.filter((m) => +m.home_town_id === +a.source && +m.target_town_id === +a.target && m.command_id && (!arrivalMs || Math.abs(+m.arrival_at * 1000 - arrivalMs) <= 1500))
+          .sort((x, y) => +y.started_at - +x.started_at)[0];
+        if (hit) return +hit.command_id;
+      } catch {}
+      await sleep(700);
+    }
+    return null;
+  }
+  /* Hechizo sobre una orden YA enviada (como «Lanzar poder divino» en la ventana de la
+     orden). Leído del juego (spells_dialog_command.castSpell):
+       POST frontend_bridge?action=execute {model_url:"Commands", action_name:"cast",
+            arguments:{ id:<command_id>, power_id }} */
+  async function castSpellOnCommand(a, cmdId) {
+    await gpPostAs(a.source, 'frontend_bridge', 'execute', { model_url: 'Commands', action_name: 'cast', captcha: null, arguments: { id: +cmdId, power_id: a.spell }, nl_init: true });
+  }
+
   // Último momento (hora del servidor) en que aún tiene sentido enviar.
   const atkLastSend = (a) => (a.windowEnd ? a.windowEnd + 999 - a.duration : a.executeAt + ATK_MISS_TOLERANCE_MS);
 
@@ -5134,6 +5200,9 @@
     a.status = 'sending'; atkRefreshQueue();
     const retry = !!a.windowEnd && (a.method === 'ultra' || a.method === 'human');
     const inWindow = (t) => !a.windowEnd || (t >= a.wantAt && t < a.windowEnd + 1000);
+    // Con reintentos el hechizo NO va con el envío (se perdería al cancelar): se lanza sobre
+    // la orden que se queda, en cuanto el bot sabe que ya no la va a cancelar.
+    const lateSpell = retry && !!a.spell;
     a.attempts = 0;
     try {
       for (;;) {
@@ -5144,12 +5213,15 @@
           pre = { at: Date.now(), ...buildPayload(a, info) };
         }
         const sentLocal = Date.now();
-        const res = await gpPostAs(a.source, 'town_info', 'send_units', pre.payload);
+        const payload = { ...pre.payload };
+        if (lateSpell) delete payload.power_id;
+        const res = await gpPostAs(a.source, 'town_info', 'send_units', payload);
         const expected = a.executeAt + a.duration;
         const real = arrivalFromResponse(res, expected);
         if (!retry || !real || inWindow(real)) {
           a.status = 'sent'; a.sentAt = srvNow();
-          if (pre.missing.length) a.note = `Enviado con menos tropas: ${pre.missing.join(', ')}`;
+          const less = [pre.missing.length ? `faltaban ${pre.missing.join(', ')}` : '', pre.left?.length ? `sin sitio en los barcos se quedaron ${pre.left.join(', ')}` : ''].filter(Boolean);
+          if (less.length) a.note = `Enviado con menos tropas: ${less.join(' · ')}`;
           if (real) {
             a.realArrival = real;
             const errS = Math.round((real - expected) / 1000);
@@ -5158,6 +5230,20 @@
             if (!retry && errS !== 0 && Math.abs(errS) <= 2 && clockOffset().err < 250) {
               state.ataques.correctionMs = clamp(atkCorrection() + (errS > 0 ? 250 : -250), -1500, 1500);
               saveState();
+            }
+          }
+          if (lateSpell) {
+            // Ya no se cancela: ahora sí, el hechizo.
+            const spellName = UW.GameData?.powers?.[a.spell]?.name || a.spell;
+            try {
+              const cmd = (real && commandIdFromResponse(res, real)) || await findSentCommand(a, real);
+              if (!cmd) throw new Error('no se encontró la orden enviada');
+              await castSpellOnCommand(a, cmd);
+              a.spellCast = true;
+              atkLog(`${farmTownName(a.source)} → ${a.targetName}: ${spellName} lanzado sobre la orden.`, 'ok');
+            } catch (e) {
+              a.note = [a.note, `No se pudo lanzar ${spellName}: ${e.message}`].filter(Boolean).join(' · ');
+              atkLog(`${farmTownName(a.source)} → ${a.targetName}: no se pudo lanzar ${spellName} (${e.message}).`, 'error');
             }
           }
           const tries = a.attempts > 1 ? ` · ${a.attempts} intentos` : '';
@@ -5194,11 +5280,21 @@
     atkSave(); atkRefreshQueue();
   }
 
+  // ~35 s antes: se mira qué va a salir DE VERDAD (lo que haya, lo que quepa en los barcos,
+  // el héroe si está) y con eso se recalcula el viaje, para que la llegada siga siendo exacta
+  // aunque falte justo la tropa más lenta. Si algo no va a salir bien, se avisa en la orden.
   async function atkRecheck(a) {
     try {
       const info = await attackInfo(a.source, a.target, 0);
-      const t = travelFromInfo(info, a.units, a.hero);
-      if (t.error) return;
+      let units = a.units, hero = a.hero, warn = '';
+      try {
+        const pre = buildPayload(a, info);
+        units = pre.used; hero = pre.payload.heroes || '';
+        warn = [pre.missing.length ? `faltan ${pre.missing.join(', ')}` : '', pre.left.length ? `no caben en los barcos ${pre.left.join(', ')}` : '', a.hero && !hero ? 'el héroe no está' : ''].filter(Boolean).join(' · ');
+      } catch (e) { warn = e.message; }
+      if (warn) { a.note = `Al salir: ${warn}`; atkLog(`${farmTownName(a.source)} → ${a.targetName}: ${warn}.`, 'error'); }
+      const t = travelFromInfo(info, units, hero);
+      if (t.error) { atkSave(); return; }
       a.duration = t.ms;
       if (a.mode === 'arrival') {
         const exec = a.wantAt - t.ms;
@@ -5221,7 +5317,7 @@
         atkLog(`${farmTownName(a.source)} → ${a.targetName}: perdido (no se envía tarde).`, 'error');
         atkSave(); atkRefreshQueue(); continue;
       }
-      if (a.mode === 'arrival' && !a._rechecked && left < ATK_RECHECK_MS && left > ATK_PREFETCH_MS) {
+      if (!a._rechecked && left < ATK_RECHECK_MS && left > ATK_PREFETCH_MS) {
         a._rechecked = true; atkRecheck(a);
       }
       // Precarga (como mucho un intento cada 2 s: si falla no se inunda al servidor).
@@ -5241,9 +5337,78 @@
     }
   }
 
+
+  /* ---------- botón «Atacar con bot» dentro de la ventana de ataque del juego ----------
+     La ventana de ataque/apoyo del juego (WndHandlerAttack) ya tiene todo: las tropas
+     que has escrito (getSelectedUnits), el héroe (casilla cbx_include_hero), el hechizo
+     elegido (#spells_1 → data "attack"), el tipo y la estrategia (.attack_type/.attack_strategy
+     .checked) y la respuesta de town_info?action=attack (handler.data: duraciones de cada
+     tropa, isla, moral…), que es la MISMA que usa el bot. Con eso se rellena el formulario
+     de Ataques y se ve al momento cuánto tarda ese ejército. */
+  function isAttackHandler(h) { return !!h && typeof h.getSelectedUnits === 'function' && !!h.data && h.data.target_id != null; }
+  function hookGameAttackWindows() {
+    const W = UW.GPWindowMgr;
+    if (!W?.getOpenedWindows) return;
+    let list = [];
+    try { list = W.getOpenedWindows() || []; } catch { return; }
+    for (const w of list) {
+      let h = null; try { h = w.getHandler?.(); } catch {}
+      if (!isAttackHandler(h)) continue;
+      let root = null; try { root = w.getJQElement?.()?.[0]; } catch {}
+      if (!root) continue;
+      const wrap = root.querySelector('#btn_attack_town')?.parentElement || root.querySelector('.button_wrapper');
+      if (!wrap || wrap.querySelector('.nb-ingame-atk')) continue;
+      const support = h.data.type === 'support';
+      const b = document.createElement('div');
+      b.className = 'nb-ingame-atk';
+      b.textContent = support ? 'Apoyar con bot' : 'Atacar con bot';
+      b.title = 'Abre NOVABOT con estas tropas, héroe y hechizo para programar la hora exacta';
+      b.style.cssText = 'display:inline-flex;align-items:center;gap:5px;margin-left:6px;padding:0 12px;height:23px;line-height:23px;vertical-align:top;cursor:pointer;border-radius:4px;font:bold 12px Verdana,Arial,sans-serif;color:#2b1a05;background:linear-gradient(#f3d27a,#c9973a);border:1px solid #7a5418;box-shadow:inset 0 1px 0 rgba(255,255,255,.5);white-space:nowrap;user-select:none;';
+      b.addEventListener('mouseenter', () => { b.style.filter = 'brightness(1.08)'; });
+      b.addEventListener('mouseleave', () => { b.style.filter = ''; });
+      b.addEventListener('click', (e) => {
+        e.preventDefault(); e.stopPropagation();
+        try { attackFromGameWindow(w, h); } catch (err) { console.warn('[NOVABOT][ataques]', err); atkLog(`No se pudo leer la ventana del juego: ${err.message}`, 'error'); }
+      });
+      wrap.appendChild(b);
+    }
+  }
+  function attackFromGameWindow(w, h) {
+    const $e = w.getJQElement();
+    const units = {};
+    for (const [k, n] of Object.entries(h.getSelectedUnits() || {})) if (+n > 0 && k !== 'heroes' && k !== 'town_id') units[k] = Math.floor(+n);
+    let hero = '';
+    try { const cb = UW.CM?.get?.(w.getContext(), 'cbx_include_hero'); if (cb?.isChecked?.()) { const m = h.getHeroInTheTown?.(); if (m) hero = String(m.getId?.() ?? ''); } } catch {}
+    let spell = '';
+    try { const v = $e.find('#spells_1').data('attack'); if (v && v !== 'no_power') spell = String(v); } catch {}
+    let type = h.data.type || 'attack';
+    try { const v = $e.find('.attack_type.checked').data('attack'); if (v) type = String(v); } catch {}
+    let strategy = '';
+    try { const v = $e.find('.attack_strategy.checked').first().data('attack'); if (v) strategy = String(v); } catch {}
+    const source = +h.origin_town_id || +UW.Game?.townId;
+    const tid = +h.data.target_id;
+    let title = ''; try { title = String(w.getTitle?.() || ''); } catch {}
+    const target = atk.worldById.get(tid) || { id: tid, name: title || `Ciudad #${tid}`, player: '', ally: '', points: 0 };
+    const f = atk.form;
+    Object.assign(f, { source, target, units, hero, spell, type, search: '', replaceId: null, infoError: '', infoLoading: false });
+    if (strategy) f.strategy = strategy;
+    // La respuesta del juego es la misma que pide el bot: se usa tal cual (sin volver a pedirla).
+    f.infoKey = `${source}>${tid}`; f.info = h.data;
+    atk.infoCache.set(f.infoKey, { at: Date.now(), info: h.data });
+    atk.view = 'new';
+    state.activeTab = 'ataques'; saveState();
+    if (!state.open) setOpen(true);
+    try { buildTabs(); } catch {}
+    renderBody();
+    const t = travelFromInfo(h.data, units, hero);
+    atkLog(`Desde el juego: ${farmTownName(source)} → ${target.name} · ${Object.entries(units).map(([k, n]) => `${n} ${atkUnitName(k)}`).join(', ') || 'sin tropas'}${hero ? ` · ${heroName(hero)}` : ''}${spell ? ` · ${UW.GameData?.powers?.[spell]?.name || spell}` : ''}${t.ms ? ` · viaje ${fmtDur(t.ms)}` : ''}. Elige la hora y programa.`, 'info');
+    setTimeout(() => { try { TQ.step(5)?.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch {} }, 80);
+  }
+
   function startAttackEngine() {
     if (atk.started) return;
     atk.started = true;
+    setInterval(() => { try { hookGameAttackWindows(); } catch {} }, 700);
     if (!state.ataques) state.ataques = { correctionMs: 0 };
     atkLoad();
     for (const a of atk.queue) if (a.status === 'sending') { a.status = 'error'; a.error = 'La página se recargó mientras se enviaba: revisa en el juego si salió.'; }
@@ -5333,7 +5498,7 @@
     Object.assign(f, {
       source: a.source, target: atk.worldById.get(a.target) || { id: a.target, name: a.targetName, player: '', ally: '', points: 0 },
       units: { ...a.units }, hero: a.hero || '', spell: a.spell || '', type: a.type, strategy: a.strategy || '',
-      mode: a.mode, time: fmtClock(a.wantAt), onMissing: a.onMissing || 'partial', info: null, replaceId: a.id
+      mode: a.mode, time: fmtClock(a.wantAt), onMissing: a.onMissing || 'partial', future: !!a.future, info: null, replaceId: a.id
     });
     // No se borra: queda "en edición" (no sale) hasta que guardes el cambio; si
     // sales del formulario sin guardar, se puede reanudar desde la lista.
@@ -5415,7 +5580,7 @@
       el('div', { class: 'nb-stat' }, [el('span', {}, 'Llegada'), el('b', {}, plan.arrivalAt ? fmtClock(plan.arrivalAt) : '—'), el('small', {}, plan.arrivalAt ? dayWord(plan.arrivalAt) : '')])
     ]));
     if (plan.note) atkPlanEl.appendChild(el('div', { class: 'nb-alert nb-alert-warn' }, plan.note));
-    const draft = { id: null, source: f.source, type: f.type, units: f.units, executeAt: plan.executeAt };
+    const draft = { id: null, source: f.source, type: f.type, units: f.units, executeAt: plan.executeAt, onMissing: f.onMissing };
     for (const w of atkWarnings(draft, f.info, plan.arrivalAt)) {
       const box = el('div', { class: `nb-alert nb-alert-${w.lvl}` }, w.txt);
       if (w.fix === 'transport') box.appendChild(el('span', { class: 'nb-btn nb-btn-sm', onclick: () => { f.units = addNeededTransports(f.source, f.info, f.units); renderBody(); } }, 'Añadir barcos'));
@@ -5433,13 +5598,13 @@
     if (!plan || plan.error) throw new Error(plan?.error || 'Plan no válido.');
     if (!plan.executeAt) throw new Error('Pon una hora válida (HH:MM:SS).');
     const units = Object.fromEntries(Object.entries(f.units).filter(([, n]) => +n > 0).map(([k, n]) => [k, Math.floor(+n)]));
-    for (const [k, n] of Object.entries(units)) if (n > (+info.units?.[k]?.count || 0)) throw new Error(`Solo hay ${+info.units?.[k]?.count || 0} ${atkUnitName(k)} en la ciudad.`);
+    if (!f.future) for (const [k, n] of Object.entries(units)) if (n > (+info.units?.[k]?.count || 0)) throw new Error(`Solo hay ${+info.units?.[k]?.count || 0} ${atkUnitName(k)} en la ciudad (activa «Tropas que aún no tengo» para un ataque futuro).`);
     const item = {
       id: `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`, source: +f.source, target: +f.target.id,
       targetName: f.target.name + (f.target.player ? ` (${f.target.player})` : ''), type: f.type, strategy: f.strategy,
       units, hero: f.hero, spell: f.spell, mode: f.mode, wantAt: plan.wantAt, duration: plan.ms,
       windowEnd: plan.windowEnd || null, method: plan.windowEnd ? (f.method || 'exact') : 'exact',
-      executeAt: plan.executeAt, arrivalAt: plan.arrivalAt, onMissing: f.onMissing, status: 'pending',
+      executeAt: plan.executeAt, arrivalAt: plan.arrivalAt, onMissing: f.onMissing, status: 'pending', future: !!f.future,
       note: plan.note || '', error: '', createdAt: Date.now()
     };
     const danger = atkWarnings(item, info, plan.arrivalAt).filter((w) => w.lvl === 'danger');
@@ -5501,6 +5666,8 @@
     const f = atk.form;
     const info = f.info && f.infoKey === `${f.source}>${f.target?.id}` ? f.info : null;
     if (f.target && !info && !f.infoLoading && !f.infoError) atkLoadInfo();
+    // Objetivo que llegó sin datos del mundo (p. ej. desde la ventana del juego): completarlo.
+    if (f.target && !f.target.player && atk.worldLoaded) { const t = atk.worldById.get(+f.target.id); if (t) f.target = t; }
 
     // 1) Origen
     const srcSel = el('select', { class: 'nb-input' });
@@ -5553,17 +5720,20 @@
     const counts = {};
     if (info) for (const [k, u] of Object.entries(info.units || {})) counts[k] = +u.count || 0;
     else { try { Object.assign(counts, UW.ITowns.getTown(f.source)?.units?.() || {}); } catch {} } // solo las que están en la ciudad
-    const rows = Object.entries(counts).filter(([k, n]) => n > 0 && k !== 'militia' && UW.GameData?.units?.[k])
+    // Con «Tropas que aún no tengo»: todas las que el juego da con duración (aunque haya 0).
+    const future = !!f.future && !!info;
+    const rows = Object.entries(counts).filter(([k, n]) => (n > 0 || (future && +info.units?.[k]?.duration > 0) || +f.units[k] > 0) && k !== 'militia' && UW.GameData?.units?.[k])
       .sort(([a], [b]) => ((U(a).is_naval ? 1 : 0) - (U(b).is_naval ? 1 : 0)) || atkUnitName(a).localeCompare(atkUnitName(b), 'es'));
     const plan = info ? atkComputePlan() : null;
     const grid = el('div', { class: 'nb-units-grid' });
     for (const [k, n] of rows) {
-      const input = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '0', max: String(n), placeholder: '0', value: f.units[k] || '' });
-      input.addEventListener('input', () => { f.units[k] = clamp(pos(input.value, 0), 0, n); if (+input.value > n) input.value = n; atkPaintPlan(); markSlow(); });
+      const cap = future ? 99999 : n;
+      const input = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '0', max: String(cap), placeholder: '0', value: f.units[k] || '' });
+      input.addEventListener('input', () => { f.units[k] = clamp(pos(input.value, 0), 0, cap); if (+input.value > cap) input.value = cap; atkPaintPlan(); markSlow(); });
       const d = +info?.units?.[k]?.duration;
       grid.appendChild(el('div', { class: `nb-unit-cell${plan?.slow === k ? ' nb-slow' : ''}`, 'data-unit': k, title: d ? `Viaje de ${atkUnitName(k)}: ${fmtDur(d * 1000)}` : atkUnitName(k) }, [
         unitIcon(k, 25),
-        el('div', { class: 'nb-unit-info' }, [el('span', { class: 'nb-unit-name' }, atkUnitName(k)), el('span', { class: 'nb-unit-sub' }, `${n}${d ? ` · ${fmtDur(d * 1000)}` : ''}`)]),
+        el('div', { class: 'nb-unit-info' }, [el('span', { class: 'nb-unit-name' }, atkUnitName(k)), el('span', { class: `nb-unit-sub${+f.units[k] > n ? ' nb-warn-txt' : ''}` }, `${future ? `tienes ${n}` : n}${d ? ` · ${fmtDur(d * 1000)}` : ''}`)]),
         el('span', { class: 'nb-mini', title: 'Todas', onclick: () => { input.value = n; f.units[k] = n; atkPaintPlan(); markSlow(); } }, 'máx'),
         input
       ]));
@@ -5600,6 +5770,10 @@
       ]));
     }
     if (!spells.length) spellSel.appendChild(el('span', { class: 'nb-placeholder' }, 'No hay hechizos que se puedan lanzar sobre esta orden.'));
+
+    const futureRow = optionRow('Tropas que aún no tengo', 'Ataque futuro: puedes pedir más de las que hay ahora (tú te aseguras de tenerlas). Al salir se envía lo que haya', !!f.future, (v) => { f.future = v; renderBody(); });
+    const retryMode = f.mode === 'arrival' && normTime(f.until || '') && (f.method === 'ultra' || f.method === 'human');
+    const spellNote = f.spell && retryMode ? el('p', { class: 'nb-placeholder' }, 'Con Ultra/Humano el hechizo no va con el envío: se lanza sobre la orden en cuanto acierta el rango y ya no se va a cancelar (así no se pierde el favor en los intentos).') : null;
 
     // 6) Hora
     const modeSeg = el('div', { class: 'nb-seg' }, [['arrival', 'Llegar a las'], ['departure', 'Salir a las']].map(([m, l]) =>
@@ -5673,9 +5847,11 @@
           el('span', { class: 'nb-mini', onclick: () => setUnits(() => false) }, 'Ninguna')
         ]),
         grid,
+        futureRow,
         el('div', { class: 'nb-mt nb-pick-label' }, 'Héroe'), heroSel,
-        el('div', { class: 'nb-mt nb-pick-label' }, 'Hechizo (solo uno)'), spellSel
-      ] : el('p', { class: 'nb-placeholder' }, 'No hay tropas en esta ciudad.')),
+        el('div', { class: 'nb-mt nb-pick-label' }, 'Hechizo (solo uno)'), spellSel,
+        spellNote
+      ] : [el('p', { class: 'nb-placeholder' }, 'No hay tropas en esta ciudad.'), futureRow]),
       section(5, 'Hora del servidor', [modeSeg, el('div', { class: 'nb-time-row' }, [timeIn, quick]), rangeBox]),
       atkPlanEl,
       el('div', { class: 'nb-options' }, [
@@ -6489,6 +6665,8 @@
     // ------------------------------------------------------------------ Ataques
     add('Ataques', 'ataques', [
       { t: 'Ataques y apoyos', find: () => TQ.tab('ataques'), before: () => { if (atk.view !== 'new') { atk.view = 'new'; return true; } }, h: `<p>Programa ataques y apoyos para que <b>lleguen</b> (o salgan) al segundo exacto.</p>` },
+      { t: 'Desde la ventana del juego', find: () => TQ.tab('ataques'), h: `
+        <p>En la ventana de <b>Atacar</b> (o Apoyar) del propio juego hay un botón más: <b>Atacar con bot</b>. Elige allí las tropas, el héroe y el hechizo como siempre y púlsalo: se abre aquí el formulario ya relleno, con el <b>tiempo de viaje</b> de ese ejército. Solo te queda poner la hora y programar.</p>` },
       { t: 'Hora del servidor', find: () => TQ.sel('.nb-hero-atk', bodyEl), h: `
         <p>El reloj del <b>servidor</b> (no el de tu PC) y su precisión, y la próxima salida programada.</p>
         ${AUTO('Sincroniza el reloj con cada respuesta del juego hasta unas decenas de milisegundos, y dispara cada orden para que el servidor la procese a mitad del segundo buscado.')}` },
@@ -6500,16 +6678,18 @@
       { t: '4 · Tropas, héroe y hechizo', find: () => TQ.step(4), wide: true, h: `
         <ul><li>Escribe cuántas de cada una o pulsa <b>máx</b>. Atajos: Todas, Ofensivas, Solo tierra, Ninguna.</li>
         <li>Cada tropa muestra su tiempo de viaje; la que <b>marca</b> el tiempo (la más lenta, o los barcos si es otra isla) se resalta.</li>
+        <li><b>Tropas que aún no tengo</b>: para un ataque futuro puedes pedir más de las que hay ahora (tú te aseguras de tenerlas a esa hora). Al salir se envía lo que haya.</li>
         <li><b>Héroe</b>: solo los de la ciudad de origen que estén disponibles.</li>
-        <li><b>Hechizo</b>: uno, de los que se pueden lanzar sobre esa orden, con su coste de favor.</li></ul>` },
+        <li><b>Hechizo</b>: uno, de los que se pueden lanzar sobre esa orden, con su coste de favor. Con <b>Ultra</b> o <b>Humano</b> no va con el envío: se lanza sobre la orden cuando ya acertó el rango y no se va a cancelar, así no se pierde favor en los intentos.</li></ul>` },
       { t: '5 · Hora', find: () => TQ.step(5), wide: true, h: `
         <ul><li><b>Llegar a las</b> o <b>Salir a las</b> + hora HH:MM:SS del servidor. Botones: <b>ya</b> (lo antes posible), −1s, +1s, +10s, +1m, +10m.</li>
         <li><b>Rango</b> (solo llegar): acepta llegadas entre la hora y el «hasta».</li>
         <li><b>Preciso</b>: un envío calculado al milisegundo. <b>Ultra</b> y <b>Humano</b>: envía y, si la llegada cae fuera del rango, cancela y reintenta (esperando a que vuelvan las tropas) hasta acertar o hasta que no dé tiempo.</li></ul>` },
       { t: 'Plan y avisos', find: () => TQ.sel('.nb-plan', bodyEl), h: `
-        <p>Viaje, hora de <b>salida</b> y de <b>llegada</b> calculadas con los datos del juego, y avisos: objetivo de tu alianza o con pacto, protección de principiante, <b>modo noche</b>, moral, <b>faltan barcos</b> (con botón para añadirlos) o tropas ya usadas en otro ataque.</p>` },
+        <p>Viaje, hora de <b>salida</b> y de <b>llegada</b> calculadas con los datos del juego, y avisos: objetivo de tu alianza o con pacto, protección de principiante, <b>modo noche</b>, moral, <b>no caben en los barcos</b> (con botón para añadirlos), tropas que aún no tienes o ya usadas en otro ataque.</p>
+        <p>Hueco de los barcos: Bote de transporte 26, Bote rápido 10, +6 cada uno con <b>Literas</b>. Cada tropa ocupa su población; voladoras y héroe no ocupan.</p>` },
       { t: 'Opciones y programar', find: () => TQ.sel('.nb-options', bodyEl), h: `
-        <ul><li><b>Si faltan tropas al salir</b>: enviar lo que haya o no enviar.</li>
+        <ul><li><b>Si faltan tropas al salir</b>: enviar lo que haya o no enviar. Con «enviar lo que haya», si a otra isla no cabe todo en los barcos, se deja en la ciudad tropa de tierra, el <b>mismo %</b> de cada tipo, hasta que quepa.</li>
         <li><b>Modo tren</b>: tras programar, mantiene el objetivo y adelanta la hora X segundos para meter el siguiente.</li></ul>
         <p>Después, <b>Programar ataque/apoyo</b>: primero lo comprueba con el juego.</p>` },
       { t: 'Programados', before: () => { if (atk.view !== 'queue') { atk.view = 'queue'; return true; } }, find: () => TQ.card(/^Programados/), wide: true, h: `
@@ -6517,6 +6697,7 @@
         <ul><li><b>+1s</b>: duplica llegando 1 s después (para trenes). <b>✎</b>: editar. <b>✕</b>: cancelar/quitar.</li>
         <li><b>Limpiar terminados</b>: quita los ya enviados.</li></ul>
         ${AUTO(`<ul><li>Los temporizadores van en un proceso aparte: funcionan aunque la pestaña esté en segundo plano.</li>
+        <li>35 s antes mira qué va a salir de verdad (tropas que haya, lo que quepa en los barcos, el héroe) y recalcula el viaje con eso, para que la llegada siga siendo exacta; si falta algo, lo avisa en la orden.</li>
         <li>6 s antes precarga las tropas disponibles; después de enviar lee la llegada real y corrige el desfase para los siguientes.</li>
         <li>Si la hora pasó hace más de 8 s (p. ej. el PC se durmió), <b>no lo envía</b> y lo marca como perdido.</li></ul>`)}
         ${WARN('Para que salgan, el juego tiene que estar abierto y el PC despierto a esa hora.')}` }
@@ -6552,6 +6733,16 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.13.0', items: [
+      { t: 'Atacar con bot desde el juego', tab: 'ataques', before: () => { if (atk.view !== 'new') { atk.view = 'new'; return true; } }, find: () => TQ.tab('ataques'), h: `
+        <p>En la ventana de <b>Atacar</b> del juego hay un botón <b>Atacar con bot</b>: se lleva aquí las tropas, el héroe y el hechizo que elegiste, con el tiempo de viaje. Tú pones la hora.</p>` },
+      { t: 'Hechizo sin gastar favor en vano', tab: 'ataques', find: () => TQ.step(5) || TQ.tab('ataques'), h: `
+        <p>Con <b>Ultra</b> o <b>Humano</b> el hechizo ya no va en cada intento: se lanza sobre la orden cuando acierta el rango y el bot ya no la va a cancelar.</p>` },
+      { t: 'Barcos y tropas futuras', tab: 'ataques', find: () => TQ.step(4) || TQ.tab('ataques'), h: `
+        <ul><li>Si a otra isla no cabe todo en los barcos, al salir deja tropa de tierra en la ciudad (el mismo % de cada una) hasta que quepa, y lo avisa antes.</li>
+        <li><b>Tropas que aún no tengo</b>: programa un ataque con tropas que tendrás a esa hora.</li>
+        <li>35 s antes recalcula el viaje con lo que va a salir de verdad.</li></ul>` }
+    ] },
     { v: '1.12.6', items: [
       { t: 'Vista general: Construcción e Investigación', tab: 'resumen', before: () => { if (state.resumenView !== 'construccion') { state.resumenView = 'construccion'; return true; } }, find: () => TQ.sel('.nb-seg-main', bodyEl), h: `
         <p>Además de <b>Reclutamiento</b>, la Vista general tiene ahora <b>Construcción</b> e <b>Investigación</b>: una ficha por ciudad con lo que le has pedido al bot, lo siguiente que toca con sus recursos, por qué espera y la cola del juego.</p>` }
