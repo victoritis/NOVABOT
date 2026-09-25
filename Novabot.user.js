@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.14.3
+// @version      1.14.4
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.14.3';
+  const VERSION = '1.14.4';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -4173,6 +4173,9 @@
     // Con hora puesta, la espera "sin hora" sobra (si no, al llegar la hora seguiría en
     // espera para siempre, sin cuenta atrás).
     if (t.hold && +t.startAt > 0) delete t.hold;
+    // Ya no existe la espera "sin hora" (se quedaba parada sin cuenta atrás): si viene de
+    // una versión anterior, pasa a una cuenta atrás de 10 min que puedes cambiar o cancelar.
+    if (t.hold && !(+t.startAt > 0)) { delete t.hold; t.startAt = Date.now() + 10 * 60000; t.startMin = 10; }
     return t;
   }
 
@@ -4832,14 +4835,14 @@
     // recursos) aunque todavía no se haya puesto la hora.
     // Los minutos que escribes se guardan (por ciudad) aunque el panel se repinte.
     const startDrafts = (renderReclutamientoTab.startDrafts ||= {});
-    const delayIn = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '1', value: startDrafts[townId] || '', placeholder: 'min' });
+    const delayIn = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '1', value: startDrafts[townId] || (+tcfg.startMin || ''), placeholder: 'min' });
     delayIn.addEventListener('input', () => { if (delayIn.value) startDrafts[townId] = delayIn.value; else delete startDrafts[townId]; });
     const scheduled = +tcfg.startAt > Date.now();
     const program = () => {
       const min = pos(delayIn.value || startDrafts[townId], 0);
       if (!min) { delayIn.focus(); delayIn.style.outline = '1px solid #e06c6c'; delayIn.placeholder = '¿min?'; return; }
       const t = T();
-      t.startAt = Date.now() + min * 60000; delete t.hold;
+      t.startAt = Date.now() + min * 60000; t.startMin = min; delete t.hold;
       if (!recruitOnFor(townId)) t.enabled = true;
       delete startDrafts[townId];
       saveState(); renderBody();
@@ -4849,7 +4852,9 @@
     const startBox = scheduled
       ? el('div', { class: 'nb-alert nb-alert-info' }, [
           el('span', {}, ['Empieza en ', el('b', { 'data-nb-until': Math.round(tcfg.startAt / 1000) }, formatLeft(Math.round(tcfg.startAt / 1000))), ` (${new Date(tcfg.startAt).toLocaleTimeString('es-ES')})`]),
-          el('span', { class: 'nb-btn nb-btn-sm', onclick: () => { const t = T(); delete t.startAt; delete t.hold; saveState(); renderBody(); recruitLog(`${farmTownName(townId)}: inicio programado cancelado (recluta ya).`); } }, 'Cancelar')
+          el('span', { class: 'nb-stepper' }, [delayIn, el('span', { class: 'nb-add-level' }, 'min'),
+            el('span', { class: 'nb-btn nb-btn-sm', title: 'Poner la cuenta atrás a estos minutos desde ahora', onclick: program }, 'Cambiar'),
+            el('span', { class: 'nb-btn nb-btn-sm', title: 'Quitar la espera: empieza a reclutar ya', onclick: () => { const t = T(); delete t.startAt; delete t.hold; saveState(); renderBody(); recruitLog(`${farmTownName(townId)}: inicio programado cancelado (recluta ya).`); } }, 'Empezar ya')])
         ])
       : tcfg.hold
       ? el('div', { class: 'nb-row' }, [
@@ -4858,11 +4863,15 @@
             el('span', { class: 'nb-mini', title: 'Quitar la espera (empieza ya)', onclick: () => { const t = T(); delete t.hold; delete t.startAt; delete startDrafts[townId]; saveState(); renderBody(); recruitLog(`${farmTownName(townId)}: espera quitada.`); } }, '✕'),
             el('span', { class: 'nb-btn nb-btn-sm', onclick: program }, 'Programar')])
         ])
-      : optionRow('Empezar más tarde', 'Solo en esta ciudad: esperar X minutos antes de reclutar (reponer tras un ataque, dejar recursos para otra cosa, esperar a un héroe…). Mientras, no recibe ni reserva recursos', false, (v) => {
+      : optionRow('Empezar más tarde', 'Solo en esta ciudad: al activarlo empieza una cuenta atrás (cambias los minutos en la misma caja). Para reponer tras un ataque, dejar recursos para otra cosa, esperar a un héroe… Mientras, no recibe ni reserva recursos', false, (v) => {
           if (!v) return;
-          const t = T(); t.hold = true; delete t.startAt; saveState(); renderBody();
-          recruitLog(`${farmTownName(townId)}: en espera, sin pedir recursos hasta que se programe.`);
-          setTimeout(() => { try { document.querySelector('#novabot-panel .nb-stepper input[placeholder="min"]')?.focus(); } catch {} }, 50);
+          // Al activarlo empieza YA una cuenta atrás (los últimos minutos usados, o 10):
+          // nunca queda en espera sin hora. Los minutos se cambian en la misma caja.
+          const t = T(); const min = clamp(+t.startMin || 10, 1, 1440);
+          delete t.hold; t.startAt = Date.now() + min * 60000;
+          if (!recruitOnFor(townId)) t.enabled = true;
+          saveState(); renderBody();
+          recruitLog(`${farmTownName(townId)}: empezará dentro de ${min} min (${new Date(t.startAt).toLocaleTimeString('es-ES')}).`, 'ok');
         });
 
     const fillIn = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '10', max: '100', value: cfg.fillPct });
@@ -7224,7 +7233,7 @@
       { t: 'Reclutamiento', find: () => TQ.tab('reclutamiento'), h: `<p>Pides un <b>total</b> de cada tropa o barco por ciudad y el bot los recluta en <b>lotes grandes</b> hasta llegar.</p>` },
       { t: 'Activar', find: () => TQ.card(/^Reclutamiento automático/), h: `<p>Interruptor general + excepción para la ciudad actual (igual que en Construcción).</p>` },
       { t: 'Empezar más tarde / programar', find: () => TQ.txt('.nb-alert, .nb-row', /^Empezar más tarde|^Empieza en|^Empezar dentro/) || TQ.card(/^Reclutamiento automático/), h: `
-        <p><b>Empezar más tarde</b>: la ciudad queda <b>en espera</b>: no recluta, no pide ni reserva recursos (hasta puede donar a otras). Luego pones los minutos y <b>Programar</b>: empezará a esa hora.</p>
+        <p><b>Empezar más tarde</b>: al activarlo empieza <b>ya una cuenta atrás</b> (los últimos minutos que usaste, o 10). Mientras dura, la ciudad no recluta ni pide ni reserva recursos (hasta puede donar). En la misma caja cambias los minutos (<b>Cambiar</b>) o quitas la espera (<b>Empezar ya</b>). Ya no existe la espera «sin hora»: siempre ves cuándo empieza.</p>
         <p>Sirve para cualquier cosa que quieras esperar antes de reclutar, por ejemplo:</p>
         <ul><li><b>Reponer después de un ataque</b> (ver abajo).</li>
         <li>Dejar libres los recursos y comerciantes un rato para otra cosa (construcción, festival, otra ciudad).</li>
@@ -7411,9 +7420,13 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.14.4', items: [
+      { t: 'Empezar más tarde: siempre con cuenta atrás', tab: 'reclutamiento', find: () => TQ.card(/^Reclutamiento automático/) || TQ.tab('reclutamiento'), h: `
+        <p>Al activar <b>Empezar más tarde</b> empieza <b>ya</b> una cuenta atrás (10 min, o los últimos minutos que usaste). En la misma caja cambias los minutos (<b>Cambiar</b>) o pulsas <b>Empezar ya</b>. Ya no existe la espera «sin hora» que se quedaba parada: las ciudades que estaban así pasan a una cuenta atrás de 10 min.</p>` }
+    ] },
     { v: '1.14.3', items: [
       { t: 'Empezar más tarde: arreglado', tab: 'reclutamiento', find: () => TQ.card(/^Cuartel · tropas objetivo/) || TQ.tab('reclutamiento'), h: `
-        <p>A veces se quedaba <b>en espera sin cuenta atrás</b> y no empezaba nunca: los minutos escritos se borraban al repintarse el panel y «Programar» no hacía nada. Ahora lo que escribes no se pierde, si falta el número te lo marca, y con hora puesta siempre empieza a su hora.</p>
+        <p>A veces se quedaba <b>en espera sin cuenta atrás</b> y no empezaba nunca. Ahora <b>al activarlo empieza ya la cuenta atrás</b> (10 min o los últimos que usaste) y en la misma caja la cambias o pulsas «Empezar ya». Las ciudades que estaban en espera sin hora pasan a una cuenta atrás de 10 min.</p>
         <ul><li>Al llegar la hora vuelve a leer del juego las tropas antes de decidir (por si el combate fue justo antes).</li>
         <li>Si a esa hora aún van tropas <b>atacando</b>, espera a que lleguen: recluta las que murieron o quita el objetivo si volvieron todas. Debajo de cada tropa ves cuántas van atacando y cuándo llegan.</li></ul>` },
       { t: 'Una sola pestaña ejecuta el bot', tab: 'ataques', find: () => TQ.tab('ataques'), h: `
