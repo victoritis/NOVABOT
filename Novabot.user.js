@@ -3149,7 +3149,7 @@
      wood/stone/iron, started_at, arrival_at) + registro propio hasta que aparecen.
   --------------------------------------------------------------------------------- */
   const RES = ['wood', 'stone', 'iron'];
-  const tradeRuntime = { timer: null, running: false, log: [], ledger: [], pairCooldown: new Map(), waitingSince: new Map(), capSeen: new Map(), lastSendAt: 0 };
+  const tradeRuntime = { recentFrom: new Map(), timer: null, running: false, log: [], ledger: [], pairCooldown: new Map(), waitingSince: new Map(), capSeen: new Map(), lastSendAt: 0 };
   let tradeLogEl = null;
   const sumRes = (r) => RES.reduce((s, k) => s + (+r?.[k] || 0), 0);
   const fmtRes = (r) => RES.filter((k) => r[k] > 0).map((k) => `${Math.round(r[k])} ${({ wood: 'madera', stone: 'piedra', iron: 'plata' })[k]}`).join(', ');
@@ -3829,7 +3829,10 @@
 
     // 1) Evitar pérdida en la próxima recolección.
     const urgent = [];
-    for (const d of ids) for (const k of resList) if (M.T[d].over[k] > 0 && !waited(k)) urgent.push({ d, k, over: M.T[d].over[k] });
+    // (Evitar perder va SIEMPRE, aunque otras ciudades esperen ese recurso: lo que sobra se
+    // reparte igual, primero a quien lo necesita. Las que acaban de enviar se saltan hasta
+    // que el juego actualice su almacén.)
+    for (const d of ids) for (const k of resList) if (M.T[d].over[k] > 0 && !ctx.skipDonors?.has(d)) urgent.push({ d, k, over: M.T[d].over[k] });
     urgent.sort((a, b) => b.over - a.over);
     for (const u of urgent) {
       const D = M.T[u.d];
@@ -3846,7 +3849,7 @@
 
     // 2) Adelantar a las ciudades con encargos a punto lo que les va a faltar, desde
     //    las que tienen de sobra (por encima de la media del imperio + media tolerancia).
-    if (ctx.mode === 'pronto') {
+    if (ctx.mode === 'pronto' && !ctx.urgentOnly) {
       const wants = [];
       for (const [r, u] of ctx.up) for (const k of resList) { const l = lack(r, k); if (l >= 100) wants.push({ r, k, l, at: u.at }); }
       wants.sort((a, b) => a.at - b.at || b.l - a.l);
@@ -3869,7 +3872,7 @@
     }
 
     // 3) Alimentar aldeas con tasa alta (solo en modo libre).
-    if (free && state.aldeas.enabled && state.aldeas.feed) {
+    if (free && !ctx.urgentOnly && state.aldeas.enabled && state.aldeas.feed) {
       for (const w of exFeedWants(M)) {
         const X = w.give, e = w.townId;
         if (!tradeTownOk(e)) continue;
@@ -3896,7 +3899,7 @@
     // mitad de lo que queda hasta el 100 % (con todo al 78 % y tolerancia 20, las que
     // pasan del 89 % dan a las que están por debajo del 65 %, con la tolerancia por abajo en 13).
     const tolUpOf = (k) => Math.min(tol, Math.max(0.03, (1 - M.F[k]) / 2));
-    if (cfg.balance !== false) {
+    if (cfg.balance !== false && !ctx.urgentOnly) {
       const donors = [];
       for (const d of ids) for (const k of resList) {
         if (waited(k)) continue;
@@ -3937,9 +3940,9 @@
     return out.sort((a, b) => (KIND_RANK[a.kind] - KIND_RANK[b.kind]) || (b.total - a.total));
   }
 
-  async function balanceTick(needs = []) {
+  async function balanceTick(needs = [], opts = {}) {
     const cfg = state.equilibrio;
-    const ctx = balanceContext(needs);
+    const ctx = { ...balanceContext(needs), ...opts };
     balRuntime.mode = ctx.mode;
     const moves = planBalance(resourceModel(), ctx);
     const max = Math.max(1, +cfg.maxMoves || 4);
@@ -3952,7 +3955,7 @@
         const arrival = Date.now() + m.eta * 1000;
         tradeRuntime.ledger.push({ from: m.from, to: m.to, ...m.ship, arrival, expires: arrival + 120000 });
         tradeRuntime.pairCooldown.set(`${m.from}>${m.to}`, Date.now() + 60000);
-        tradeRuntime.lastSendAt = Date.now();
+        tradeRuntime.lastSendAt = Date.now(); tradeRuntime.recentFrom.set(m.from, Date.now());
         for (const f of m.feeds) {
           exRuntime.feeds.push({ townId: m.to, relId: +f.rel.id, give: f.give, get: f.get, amount: f.amount, arrival: arrival + 10000, expires: arrival + 20 * 60000 });
         }
@@ -4033,7 +4036,7 @@
         await gpPostAs(p.from, 'town_info', 'trade', { id: p.to, wood: p.ship.wood, stone: p.ship.stone, iron: p.ship.iron, nl_init: true });
         tradeRuntime.ledger.push({ from: p.from, to: p.to, ...p.ship, arrival: Date.now() + p.eta * 1000, expires: Date.now() + p.eta * 1000 + 120000 });
         tradeRuntime.pairCooldown.set(`${p.from}>${p.to}`, Date.now() + 20000);
-        tradeRuntime.lastSendAt = Date.now();
+        tradeRuntime.lastSendAt = Date.now(); tradeRuntime.recentFrom.set(p.from, Date.now());
         tradeLog(`${farmTownName(p.from)} → ${farmTownName(p.to)}: ${fmtRes(p.ship)} · ${Math.round(p.eta / 60)} min · para ${p.label}`, 'ok');
         setTimeout(refreshOverviews, 3000);
       } catch (e) {
@@ -4047,9 +4050,14 @@
     if (plan.length) renderIfIdle('comercio');
     // Equilibrio (8c-bis): solo en vueltas en que no hubo nada que enviar para encargos
     // y con los datos ya al día tras el último envío (cada 30 s como mucho).
-    if (!plan.length && state.equilibrio?.enabled && Date.now() >= balRuntime.nextAt && Date.now() - (tradeRuntime.lastSendAt || 0) > 15000) {
+    // Además, aunque haya encargos que enviar, lo que se va a PERDER (almacén lleno) se
+    // reparte igual cada 30 s (antes esperaba a que no hubiera nada que enviar y, con
+    // reclutamiento o construcción en marcha, las ciudades llenas perdían recursos).
+    if (state.equilibrio?.enabled && Date.now() >= balRuntime.nextAt) {
+      const quiet = !plan.length && Date.now() - (tradeRuntime.lastSendAt || 0) > 15000;
       balRuntime.nextAt = Date.now() + 30000;
-      await balanceTick(needs);
+      const skip = new Set([...tradeRuntime.recentFrom].filter(([, t]) => Date.now() - t < 15000).map(([id]) => id));
+      await balanceTick(needs, quiet ? {} : { urgentOnly: true, skipDonors: skip });
     }
   }
 
@@ -4850,7 +4858,7 @@
             el('span', { class: 'nb-mini', title: 'Quitar la espera (empieza ya)', onclick: () => { const t = T(); delete t.hold; delete t.startAt; delete startDrafts[townId]; saveState(); renderBody(); recruitLog(`${farmTownName(townId)}: espera quitada.`); } }, '✕'),
             el('span', { class: 'nb-btn nb-btn-sm', onclick: program }, 'Programar')])
         ])
-      : optionRow('Empezar más tarde', 'Solo en esta ciudad. Desde que lo activas no recibe ni reserva recursos (puede donar)', false, (v) => {
+      : optionRow('Empezar más tarde', 'Solo en esta ciudad: esperar X minutos antes de reclutar (reponer tras un ataque, dejar recursos para otra cosa, esperar a un héroe…). Mientras, no recibe ni reserva recursos', false, (v) => {
           if (!v) return;
           const t = T(); t.hold = true; delete t.startAt; saveState(); renderBody();
           recruitLog(`${farmTownName(townId)}: en espera, sin pedir recursos hasta que se programe.`);
@@ -7217,7 +7225,11 @@
       { t: 'Activar', find: () => TQ.card(/^Reclutamiento automático/), h: `<p>Interruptor general + excepción para la ciudad actual (igual que en Construcción).</p>` },
       { t: 'Empezar más tarde / programar', find: () => TQ.txt('.nb-alert, .nb-row', /^Empezar más tarde|^Empieza en|^Empezar dentro/) || TQ.card(/^Reclutamiento automático/), h: `
         <p><b>Empezar más tarde</b>: la ciudad queda <b>en espera</b>: no recluta, no pide ni reserva recursos (hasta puede donar a otras). Luego pones los minutos y <b>Programar</b>: empezará a esa hora.</p>
-        <p>Útil para esperar a un <b>héroe</b> que abarata tropas: el bot te avisa si llega antes o después de empezar.</p>
+        <p>Sirve para cualquier cosa que quieras esperar antes de reclutar, por ejemplo:</p>
+        <ul><li><b>Reponer después de un ataque</b> (ver abajo).</li>
+        <li>Dejar libres los recursos y comerciantes un rato para otra cosa (construcción, festival, otra ciudad).</li>
+        <li>Esperar a que termine una investigación, suba el cuartel/puerto o haya población libre.</li>
+        <li>Esperar a un <b>héroe</b> que abarata tropas: el bot te avisa si llega antes o después de empezar.</li></ul>
         <p>También para <b>reponer después de un ataque</b>: en espera puedes pedir un total que ya tienes. Al empezar se vuelve a contar: si perdiste tropas, recluta las que falten; si siguen todas, se quita sin reclutar nada.</p>
         ${AUTO(`<ul><li>Al llegar la hora, antes de decidir nada, vuelve a leer del juego las tropas y las colas (por si el combate fue justo antes).</li>
         <li>Si a esa hora todavía van tropas <b>atacando</b> (sin llegar), no decide aún: espera a que lleguen, recuenta y entonces recluta las que murieron (o quita el objetivo si volvieron todas).</li>
@@ -7410,6 +7422,8 @@
         <ul><li>Tras cancelar un intento comprueba en el juego que se canceló de verdad.</li>
         <li>Antes de reintentar espera también al héroe.</li>
         <li>En Programados, <b>Sale</b> es la salida del intento que se quedó y se ve cuántos intentos hizo.</li></ul>` },
+      { t: 'Almacén lleno: se reparte siempre', tab: 'comercio', find: () => TQ.card(/^Equilibrio entre ciudades/) || TQ.tab('comercio'), h: `
+        <p>Antes, con el comercio ocupado en encargos (reclutamiento, construcción…), el equilibrio no actuaba y las ciudades con el almacén lleno perdían recursos. Ahora lo que se va a perder se reparte cada 30 s igualmente, aunque otras ciudades estén esperando ese recurso (se les da a ellas primero).</p>` },
       { t: 'Comercio: almacén pequeño fuera', tab: 'comercio', find: () => TQ.card(/^Comercio automático/) || TQ.tab('comercio'), h: `
         <p>Las ciudades con el <b>almacén por debajo de nivel 6</b> ya no mandan ni reciben recursos de otras ciudades (el juego no deja comerciar por debajo de nivel 5 y daba error). Salen avisadas en Comercio.</p>` },
       { t: 'Vista general: % de recursos', tab: 'resumen', before: () => { if ((state.resumenView || 'ciudades') !== 'ciudades') { state.resumenView = 'ciudades'; return true; } }, find: () => TQ.card(/^Vista general/) || TQ.tab('resumen'), h: `
@@ -7501,7 +7515,8 @@
     ] },
     { v: '1.10.0', items: [
       { t: 'Equilibrio entre ciudades', tab: 'comercio', find: () => TQ.card(/^Equilibrio entre ciudades/), h: `
-        <p>Nuevo: antes de cada recolección calcula el botín de cada ciudad y lo que no cabría lo manda a otras ciudades con sitio. También reparte entre ciudades y trae recursos a las aldeas que tienen buena tasa.</p>` },
+        <p>Nuevo: antes de cada recolección calcula el botín de cada ciudad y lo que no cabría lo manda a otras ciudades con sitio. También reparte entre ciudades y trae recursos a las aldeas que tienen buena tasa.</p>
+        ${AUTO('Evitar perder va <b>siempre</b>: aunque el comercio esté enviando encargos, cada 30 s mira qué ciudades van a llenar el almacén y reparte lo que sobra (primero a las que lo necesitan). Solo no lo hace si ninguna ciudad cercana tiene sitio.')}` },
       { t: 'Intercambio con aldeas más listo', tab: 'granjas', find: () => TQ.card(/^Intercambio con aldeas/), h: `
         <ul><li>Calcula la <b>tasa real de cada ciudad</b> (antes usaba la de la ciudad abierta y el +0,1 de la Oficina comercial engañaba).</li>
         <li>Los cambios normales, solo con <b>tasa alta</b> (rinde mucho más); con tasa baja solo si se iba a perder.</li>
