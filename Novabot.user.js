@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.13.3
+// @version      1.13.4
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.13.3';
+  const VERSION = '1.13.4';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -5282,7 +5282,13 @@
   }
 
   // Último momento (hora del servidor) en que aún tiene sentido enviar.
-  const atkLastSend = (a) => (a.windowEnd ? a.windowEnd + 999 - a.duration : a.executeAt + ATK_MISS_TOLERANCE_MS);
+  /* Aleatoriedad del juego: la llegada real varía unos segundos arriba o abajo de la
+     calculada. Con Ultra/Humano se prueba en una ventana de envío de ±N s (3–15, lo eliges):
+     el primer intento sale N s ANTES de lo ideal y se sigue probando hasta N s DESPUÉS,
+     aunque un intento llegue tarde (el siguiente puede caer dentro). */
+  const atkIsRetry = (a) => !!a.windowEnd && (a.method === 'ultra' || a.method === 'human');
+  const atkJitterMs = (a) => (atkIsRetry(a) ? clamp(Math.round(+a.jitter || 0), 0, 15) * 1000 : 0);
+  const atkLastSend = (a) => (a.windowEnd ? a.windowEnd + 999 - a.duration + atkJitterMs(a) : a.executeAt + ATK_MISS_TOLERANCE_MS);
 
   async function atkFire(a) {
     if (a.status !== 'pending') return;
@@ -5361,20 +5367,27 @@
         await gpPostAs(a.source, 'command_info', 'cancel_command', { id: cmd });
         const away = Date.now() - sentLocal; // las tropas tardan lo mismo en volver
         atkLog(`${farmTownName(a.source)} → ${a.targetName}: intento ${a.attempts} llegaba ${fmtClock(real)} → cancelado.`, 'info');
-        if (real >= a.windowEnd + 1000) throw new Error(`Llegaba ${fmtClock(real)}, después ${a.accepted ? 'de la última hora aceptada' : 'del rango'}: ya no se puede acertar.`);
-        if (a.attempts >= 60) throw new Error('Demasiados intentos sin acertar el rango.');
-        let wait = away + 300 + (a.method === 'human' ? 1000 + Math.random() * 1500 : 100 + Math.random() * 200);
+        const jit = atkJitterMs(a);
+        if (!jit && real >= a.windowEnd + 1000) throw new Error(`Llegaba ${fmtClock(real)}, después ${a.accepted ? 'de la última hora aceptada' : 'del rango'}: ya no se puede acertar.`);
+        if (a.attempts >= 80) throw new Error('Demasiados intentos sin acertar el rango.');
+        // Espera: hasta que vuelvan las tropas (tardan lo mismo que estuvieron fuera) y, en
+        // Humano, como mínimo los segundos que elegiste entre un intento y el siguiente.
+        let wait = away + 300 + (a.method === 'human' ? 0 : 100 + Math.random() * 200);
+        if (a.method === 'human') wait = Math.max(wait, clamp(+a.humanDelay || 2, 1, 120) * 1000 - (Date.now() - sentLocal));
         // Apuntar a la primera hora aceptada que aún se pueda alcanzar (con lista, saltando
         // los segundos que no quieres); si llegaba antes del rango, esperar a ese momento.
         let goal = a.wantAt;
-        if (a.accepted) {
+        if (jit) goal = null; // con aleatoriedad no se apunta: se sigue probando en toda la ventana
+        else if (a.accepted) {
           const earliest = srvNow() + wait + a.duration;
           goal = a.accepted.find((x) => x + 999 >= earliest);
           if (!goal) throw new Error('Ya no da tiempo a acertar ninguna de las horas aceptadas.');
         }
-        const ideal = goal - a.duration + ATK_INTO_SECOND_MS - clockOffset().off - latencyOneWay();
-        wait = Math.max(wait, ideal - Date.now());
-        if (srvNow() + wait > atkLastSend(a)) throw new Error('Ya no da tiempo a acertar el rango.');
+        if (goal) {
+          const ideal = goal - a.duration + ATK_INTO_SECOND_MS - clockOffset().off - latencyOneWay();
+          wait = Math.max(wait, ideal - Date.now());
+        }
+        if (srvNow() + wait > atkLastSend(a)) throw new Error(jit ? `No acertó en ${a.attempts} intento(s) dentro de la ventana de ±${jit / 1000} s.` : 'Ya no da tiempo a acertar el rango.');
         atkRefreshQueue();
         await sleep(wait);
       }
@@ -5404,11 +5417,11 @@
       if (t.error) { atkSave(); return; }
       a.duration = t.ms;
       if (a.mode === 'arrival') {
-        const exec = a.wantAt - t.ms;
+        const exec = a.wantAt - t.ms - atkJitterMs(a);
         if (exec < srvNow() + 300) { a.executeAt = Math.ceil((srvNow() + 1500) / 1000) * 1000; a.note = 'La llegada pedida ya no era alcanzable: sale en cuanto se pueda.'; }
         else a.executeAt = exec;
       }
-      a.arrivalAt = a.executeAt + a.duration;
+      a.arrivalAt = atkIsRetry(a) ? a.wantAt : a.executeAt + a.duration;
       atkSave();
     } catch {}
   }
@@ -5630,7 +5643,8 @@
       source: a.source, target: atk.worldById.get(a.target) || { id: a.target, name: a.targetName, player: '', ally: '', points: 0 },
       units: { ...a.units }, hero: a.hero || '', spell: a.spell || '', type: a.type, strategy: a.strategy || '',
       mode: a.mode, time: fmtClock(a.wantAt), day: clamp(dayOffsetOf(a.wantAt), 0, 2), onMissing: a.onMissing || 'partial', future: !!a.future, info: null, replaceId: a.id,
-      until: a.windowEnd && a.rangeKind !== 'list' ? fmtClock(a.windowEnd) : '', method: a.method || 'exact',
+      until: a.windowEnd && a.rangeKind !== 'list' && a.windowEnd !== a.wantAt ? fmtClock(a.windowEnd) : '', method: a.method || 'exact',
+      jitter: a.jitter || 10, humanDelay: a.humanDelay || 2,
       rangeKind: a.rangeKind === 'list' ? 'list' : 'range', accept: a.acceptText || (a.accepted ? a.accepted.map((x) => fmtClock(x)).join(', ') : '')
     });
     // No se borra: queda "en edición" (no sale) hasta que guardes el cambio; si
@@ -5732,7 +5746,18 @@
       windowEnd = nextWallTime(u, wantAt - 1000);
       if (windowEnd - wantAt > 3600000) windowEnd = null; // rango absurdo (> 1 h): se ignora
     }
-    return { ms: t.ms, slow: t.slow, executeAt, arrivalAt, wantAt, windowEnd, accepted, note, late };
+    // Ultra/Humano sin «hasta»: vale solo ese segundo, pero se reintenta igual.
+    const retryM = f.mode === 'arrival' && (f.method === 'ultra' || f.method === 'human');
+    if (retryM && wantAt && !windowEnd) windowEnd = wantAt;
+    let firstTry = null;
+    if (retryM && executeAt && windowEnd) {
+      const jit = clamp(Math.round(+f.jitter || 10), 3, 15) * 1000;
+      firstTry = executeAt - jit;
+      // Aunque lo ideal ya haya pasado, si aún queda ventana de prueba se empieza ya.
+      if (firstTry < now + 1500 && now + 1500 <= windowEnd - t.ms + jit) { firstTry = Math.ceil((now + 1500) / 1000) * 1000; late = ''; }
+      executeAt = firstTry;
+    }
+    return { ms: t.ms, slow: t.slow, executeAt, arrivalAt, wantAt, windowEnd, accepted, note, late, firstTry };
   }
 
   function atkPaintPlan() {
@@ -5746,7 +5771,7 @@
     if (plan.error) { atkPlanEl.appendChild(el('p', { class: 'nb-placeholder nb-err' }, plan.error)); return; }
     atkPlanEl.appendChild(el('div', { class: 'nb-stats' }, [
       el('div', { class: 'nb-stat' }, [el('span', {}, 'Viaje'), el('b', {}, fmtDur(plan.ms)), el('small', {}, plan.slow === 'hero' ? 'marca el héroe' : plan.slow ? `marca: ${atkUnitName(plan.slow)}` : '')]),
-      el('div', { class: 'nb-stat' }, [el('span', {}, 'Salida'), el('b', {}, plan.executeAt ? fmtClock(plan.executeAt) : '—'), el('small', {}, plan.executeAt ? dayWord(plan.executeAt) : '')]),
+      el('div', { class: 'nb-stat' }, [el('span', {}, plan.firstTry ? 'Primer intento' : 'Salida'), el('b', {}, plan.executeAt ? fmtClock(plan.executeAt) : '—'), el('small', {}, plan.executeAt ? `${dayWord(plan.executeAt)}${plan.firstTry ? ` · prueba hasta ${fmtClock(plan.windowEnd - plan.ms + clamp(Math.round(+f.jitter || 10), 3, 15) * 1000)}` : ''}` : '')]),
       el('div', { class: 'nb-stat' }, [el('span', {}, 'Llegada'), el('b', {}, plan.arrivalAt ? fmtClock(plan.arrivalAt) : '—'), el('small', {}, plan.arrivalAt ? dayWord(plan.arrivalAt) : '')])
     ]));
     if (plan.late) atkPlanEl.appendChild(el('div', { class: 'nb-alert nb-alert-danger' }, plan.late));
@@ -5775,6 +5800,7 @@
       targetName: f.target.name + (f.target.player ? ` (${f.target.player})` : ''), type: f.type, strategy: f.strategy,
       units, hero: f.hero, spell: f.spell, mode: f.mode, wantAt: plan.wantAt, duration: plan.ms,
       windowEnd: plan.windowEnd || null, method: plan.windowEnd ? (f.method || 'exact') : 'exact',
+      jitter: plan.firstTry ? clamp(Math.round(+f.jitter || 10), 3, 15) : 0, humanDelay: clamp(+f.humanDelay || 2, 1, 120),
       accepted: plan.accepted && plan.accepted.length > 1 ? plan.accepted : null, rangeKind: f.rangeKind === 'list' ? 'list' : 'range', acceptText: f.accept || '',
       executeAt: plan.executeAt, arrivalAt: plan.arrivalAt, onMissing: f.onMissing, status: 'pending', future: !!f.future,
       note: plan.note || '', error: '', createdAt: Date.now()
@@ -5945,7 +5971,7 @@
     if (!spells.length) spellSel.appendChild(el('span', { class: 'nb-placeholder' }, 'No hay hechizos que se puedan lanzar sobre esta orden.'));
 
     const futureRow = optionRow('Tropas que aún no tengo', 'Ataque futuro: puedes pedir más de las que hay ahora (tú te aseguras de tenerlas). Al salir se envía lo que haya', !!f.future, (v) => { f.future = v; renderBody(); });
-    const retryMode = f.mode === 'arrival' && (f.rangeKind === 'list' ? !!String(f.accept || '').trim() : !!normTime(f.until || '')) && (f.method === 'ultra' || f.method === 'human');
+    const retryMode = f.mode === 'arrival' && (f.method === 'ultra' || f.method === 'human');
     const spellNote = f.spell && retryMode ? el('p', { class: 'nb-placeholder' }, 'Con Ultra/Humano el hechizo no va con el envío: se lanza sobre la orden en cuanto acierta el rango y ya no se va a cancelar (así no se pierde el favor en los intentos).') : null;
 
     // 6) Hora
@@ -5984,8 +6010,20 @@
     untilIn.addEventListener('input', () => { f.until = untilIn.value; atkPaintPlan(); });
     untilIn.addEventListener('blur', () => { const n = normTime(untilIn.value); if (untilIn.value && n !== untilIn.value) { untilIn.value = n; f.until = n; atkPaintPlan(); } });
     const methodSeg = el('div', { class: 'nb-seg nb-seg-sm' }, [
-      ['exact', 'Preciso (1 envío)'], ['ultra', 'Ultra (envía y cancela rápido)'], ['human', 'Humano (reintenta cada 1-2 s)']
+      ['exact', 'Preciso (1 envío)'], ['ultra', 'Ultra (envía y cancela rápido)'], ['human', 'Humano (espera entre intentos)']
     ].map(([v, l]) => el('span', { class: `nb-seg-btn${(f.method || 'exact') === v ? ' active' : ''}`, onclick: () => { f.method = v; renderBody(); } }, l)));
+    // Ultra/Humano: ventana de aleatoriedad (±s) y, en Humano, espera entre intentos.
+    const numBox = (key, def, min, max, label, hint) => {
+      const i = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: String(min), max: String(max), step: '1', value: String(f[key] ?? def) });
+      i.addEventListener('change', () => { f[key] = clamp(Math.round(+i.value || def), min, max); i.value = f[key]; atkPaintPlan(); });
+      return el('div', { class: 'nb-row' }, [el('div', { class: 'nb-option-text' }, [el('span', { class: 'nb-option-label' }, label), el('span', { class: 'nb-option-hint' }, hint)]), i]);
+    };
+    const retrySel = f.method === 'ultra' || f.method === 'human';
+    const retryOpts = retrySel ? el('div', {}, [
+      numBox('jitter', 10, 3, 15, 'Aleatoriedad del juego (± s)', 'Empieza a probar estos segundos ANTES de lo ideal y sigue hasta estos segundos DESPUÉS (3–15)'),
+      f.method === 'human' ? numBox('humanDelay', 2, 1, 120, 'Espera entre intentos (s)', 'Tras cancelar, espera esto (y a que vuelvan las tropas) antes de volver a lanzar') : null
+    ]) : null;
+
     // Horas aceptadas a mano (lista): la primera pasa a ser la hora de arriba.
     const acceptIn = el('input', { class: 'nb-input', type: 'text', placeholder: '22:00:01, 22:00:03-22:00:05, 22:00:09', value: f.accept || '' });
     const syncFirst = () => {
@@ -6005,9 +6043,10 @@
         ? el('div', {}, [el('span', { class: 'nb-row-label' }, 'Horas de llegada aceptadas (sueltas o rangos; las que no pongas no valen)'), acceptIn])
         : el('div', { class: 'nb-time-row' }, [el('span', { class: 'nb-row-label' }, 'Rango aceptado: de la hora de arriba hasta'), untilIn]),
       methodSeg,
+      retryOpts,
       el('p', { class: 'nb-placeholder' }, (f.method || 'exact') === 'exact'
         ? `Un solo envío calculado al milisegundo${isList ? ', a la primera hora de la lista' : ''}.`
-        : `Envía; si la llegada ${isList ? 'no es una de las horas aceptadas' : 'cae fuera del rango'}, cancela la orden y vuelve a intentarlo (esperando a que vuelvan las tropas${isList ? ', apuntando a la siguiente hora aceptada' : ''}) hasta acertar o hasta que ya no dé tiempo.`)
+        : `Envía; si la llegada ${isList ? 'no es una de las horas aceptadas' : 'cae fuera del rango (sin «hasta»: si no es justo esa hora)'}, cancela la orden y vuelve a intentarlo (esperando a que vuelvan las tropas${f.method === 'human' ? ' y los segundos que pongas' : ''}). Como el juego mete unos segundos de azar en la llegada, empieza a probar antes y sigue probando dentro de la ventana de ± segundos, aunque un intento llegue tarde.`)
     ]) : null;
 
     atkPlanEl = el('div', { class: 'nb-plan' });
@@ -6882,7 +6921,9 @@
         <li><b>Hoy / Mañana / Pasado mañana</b>: el día de esa hora. Si la hora ya pasó (o no da tiempo a llegar), <b>no se programa</b> y te lo dice: nunca se pasa solo al día siguiente. Para un ataque a la 1:00 programado a las 23:00, elige <b>Mañana</b>. Los botones de ±tiempo cambian el día solos si cruzas la medianoche.</li>
         <li><b>Rango</b> (solo llegar): acepta llegadas entre la hora y el «hasta».</li>
         <li><b>Horas a mano</b> (solo llegar): escribe las horas de llegada que valen, sueltas o por rangos (<code>22:00:01, 22:00:03-22:00:05</code>). Las que no pongas no valen, así puedes saltarte un segundo del medio. La primera pasa a ser la hora de arriba.</li>
-        <li><b>Preciso</b>: un envío calculado al milisegundo. <b>Ultra</b> y <b>Humano</b>: envía y, si la llegada cae fuera del rango, cancela y reintenta (esperando a que vuelvan las tropas) hasta acertar o hasta que no dé tiempo.</li></ul>` },
+        <li><b>Preciso</b>: un envío calculado al milisegundo. <b>Ultra</b> y <b>Humano</b>: envía y, si la llegada cae fuera del rango (o, sin «hasta», no es justo esa hora), cancela y reintenta hasta acertar.</li>
+        <li><b>Aleatoriedad (± s, 3–15)</b>: el juego mete unos segundos de azar en la llegada. Con Ultra/Humano el primer intento sale esos segundos <b>antes</b> de lo ideal y se sigue probando hasta esos segundos <b>después</b>, aunque un intento llegue tarde.</li>
+        <li><b>Espera entre intentos</b> (solo Humano): tras cancelar, cuántos segundos espera antes de volver a lanzar (y siempre a que vuelvan las tropas). Ultra reintenta en cuanto vuelven.</li></ul>` },
       { t: 'Plan y avisos', find: () => TQ.sel('.nb-plan', bodyEl), h: `
         <p>Viaje, hora de <b>salida</b> y de <b>llegada</b> calculadas con los datos del juego, y avisos: objetivo de tu alianza o con pacto, protección de principiante, <b>modo noche</b>, moral, <b>no caben en los barcos</b> (con botón para añadirlos), tropas que aún no tienes o ya usadas en otro ataque.</p>
         <p>Hueco de los barcos: Bote de transporte 26, Bote rápido 10, +6 cada uno con <b>Literas</b>. Cada tropa ocupa su población; voladoras y héroe no ocupan.</p>` },
@@ -6932,6 +6973,12 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.13.4', items: [
+      { t: 'Reintentos con el azar del juego', tab: 'ataques', before: () => { if (atk.view !== 'new') { atk.view = 'new'; return true; } }, find: () => TQ.step(5) || TQ.tab('ataques'), h: `
+        <ul><li>Ultra/Humano: nuevo <b>Aleatoriedad (± s)</b>, de 3 a 15. Empieza a probar antes de la hora ideal y sigue probando después, aunque un intento haya llegado tarde.</li>
+        <li>Humano: eliges la <b>espera entre intentos</b>.</li>
+        <li>Ultra/Humano ya funcionan sin «hasta»: vale solo esa hora exacta.</li></ul>` }
+    ] },
     { v: '1.13.3', items: [
       { t: 'Programados al día con el juego', tab: 'ataques', before: () => { if (atk.view !== 'queue') { atk.view = 'queue'; return true; } }, find: () => TQ.card(/^Programados/) || TQ.tab('ataques'), h: `
         <ul><li>Si cancelas en el juego un ataque que envió el bot, en Programados pasa a <b>cancelado</b>.</li>
