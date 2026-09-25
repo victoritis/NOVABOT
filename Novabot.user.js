@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.13.1
+// @version      1.13.3
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.13.1';
+  const VERSION = '1.13.3';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -4744,7 +4744,7 @@
     view: 'new', infoCache: new Map(), worker: null, timers: new Map(), log: [],
     form: {
       source: null, target: null, search: '', units: {}, hero: '', spell: '', type: 'attack', strategy: '',
-      mode: 'arrival', time: '', onMissing: 'partial', keep: true, step: 1, info: null, infoError: '', infoLoading: false
+      mode: 'arrival', time: '', day: 0, onMissing: 'partial', keep: false, step: 1, info: null, infoError: '', infoLoading: false
     },
     recent: []
   };
@@ -4840,6 +4840,21 @@
     while (t <= notBefore) t += 86400000;
     return t;
   }
+
+  // Día elegido a mano: "22:36:14" de hoy (0), mañana (1) o pasado (2), hora del juego.
+  // Ya NO se pasa solo al día siguiente si la hora ya pasó: eso lo decides tú.
+  function wallTimeOnDay(hms, day = 0) {
+    const m = /^(\d{1,2}):(\d{2}):(\d{2})$/.exec(hms);
+    if (!m || +m[1] > 23 || +m[2] > 59 || +m[3] > 59) return null;
+    const d = wall(srvNow());
+    return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + (+day || 0), +m[1], +m[2], +m[3]) - srvGmt();
+  }
+  // Día (0 hoy, 1 mañana…) de un instante, según la hora del juego.
+  function dayOffsetOf(ms) {
+    const a = wall(srvNow()), b = wall(ms);
+    return Math.round((Date.UTC(b.getUTCFullYear(), b.getUTCMonth(), b.getUTCDate()) - Date.UTC(a.getUTCFullYear(), a.getUTCMonth(), a.getUTCDate())) / 86400000);
+  }
+  const DAY_WORDS = ['hoy', 'mañana', 'pasado mañana'];
 
   // ---------- temporizador en Web Worker (no se frena en segundo plano) ----------
   function atkWorker() {
@@ -5135,7 +5150,9 @@
       for (const [k, n] of Object.entries(a.units)) committed[k] = (committed[k] || 0) + (+n || 0);
     }
     const short = Object.entries(item.units).filter(([k, n]) => +n > 0 && (+info.units?.[k]?.count || 0) - (committed[k] || 0) < +n);
-    if (short.length) w.push({ lvl: 'warn', txt: `Tropas también usadas en otro ataque anterior: ${short.map(([k]) => atkUnitName(k)).join(', ')}.` });
+    const noneLeft = short.length && Object.entries(item.units).filter(([, n]) => +n > 0).every(([k]) => (+info.units?.[k]?.count || 0) - (committed[k] || 0) <= 0);
+    if (noneLeft && !item.future) w.push({ lvl: 'danger', txt: `Esas tropas ya van TODAS en otro ataque programado antes desde esta ciudad: a este no le quedará nada (¿lo estás programando dos veces?).` });
+    else if (short.length) w.push({ lvl: 'warn', txt: `Tropas también usadas en otro ataque anterior: ${short.map(([k]) => atkUnitName(k)).join(', ')}.` });
     return w;
   }
 
@@ -5205,17 +5222,56 @@
     return null;
   }
   // Orden recién enviada, buscada en los movimientos del juego (por si la respuesta no trae su id).
-  async function findSentCommand(a, arrivalMs) {
-    for (let i = 0; i < 4; i++) {
+  async function findSentCommand(a, arrivalMs) { return (await findSentMovement(a, arrivalMs))?.cmd || null; }
+  // La orden recién enviada en los movimientos del juego → { cmd, arrival } (arrival en ms).
+  // Sin llegada conocida: la más reciente de ese origen → destino (salida ≥ la hora de envío).
+  async function findSentMovement(a, arrivalMs, sentAfterMs = 0) {
+    for (let i = 0; i < 5; i++) {
       try {
         const list = [].concat(UW.MM.getCollections()?.MovementsUnits || []).flatMap((c) => c?.models || []).map((m) => m.attributes);
-        const hit = list.filter((m) => +m.home_town_id === +a.source && +m.target_town_id === +a.target && m.command_id && (!arrivalMs || Math.abs(+m.arrival_at * 1000 - arrivalMs) <= 1500))
+        const hit = list.filter((m) => +m.home_town_id === +a.source && +m.target_town_id === +a.target && m.command_id
+            && (arrivalMs ? Math.abs(+m.arrival_at * 1000 - arrivalMs) <= 1500 : +m.started_at * 1000 >= sentAfterMs - 3000))
           .sort((x, y) => +y.started_at - +x.started_at)[0];
-        if (hit) return +hit.command_id;
+        if (hit) return { cmd: +hit.command_id, arrival: +hit.arrival_at * 1000 };
       } catch {}
-      await sleep(700);
+      await sleep(600);
     }
     return null;
+  }
+
+  /* Órdenes del juego (Vista general → Órdenes): GET town_overviews?action=command_overview
+     → data.commands (de TODAS las ciudades). Sirve para ver si una orden enviada por el bot
+     sigue en marcha o la cancelaste en el juego. */
+  async function fetchCommandOverview() {
+    const r = await gpGet('town_overviews', 'command_overview', { nl_init: true });
+    let x = r?.json !== undefined ? r.json : r;
+    if (typeof x === 'string') { try { x = JSON.parse(x); } catch {} }
+    const list = x?.data?.commands;
+    return Array.isArray(list) ? list : null;
+  }
+  let atkSyncBusy = false, atkSyncAt = 0;
+  async function atkSyncWithGame(force = false) {
+    const now = srvNow();
+    const watch = atk.queue.filter((a) => a.status === 'sent' && (a.realArrival || a.arrivalAt) > now + 3000 && now - (a.sentAt || 0) > 15000);
+    if (!watch.length || atkSyncBusy || (!force && Date.now() - atkSyncAt < 20000)) return;
+    atkSyncBusy = true; atkSyncAt = Date.now();
+    try {
+      const cmds = await fetchCommandOverview();
+      if (!cmds) return;
+      const txt = cmds.map((c) => { try { return JSON.stringify(c); } catch { return ''; } });
+      let changed = false;
+      for (const a of watch) {
+        const arr = Math.round((a.realArrival || a.arrivalAt) / 1000);
+        const alive = txt.some((t) => (a.commandId && new RegExp(`\\b${a.commandId}\\b`).test(t))
+          || (new RegExp(`\\b${a.target}\\b`).test(t) && [arr - 1, arr, arr + 1].some((v) => t.includes(String(v)))));
+        if (!alive) {
+          a.status = 'cancelled'; a.note = 'Ya no está en las Órdenes del juego: cancelada (o devuelta) en el juego.';
+          atkLog(`${farmTownName(a.source)} → ${a.targetName}: ya no está en las Órdenes del juego → cancelada.`, 'info');
+          changed = true;
+        }
+      }
+      if (changed) { atkSave(); atkRefreshQueue(); }
+    } catch {} finally { atkSyncBusy = false; }
   }
   /* Hechizo sobre una orden YA enviada (como «Lanzar poder divino» en la ventana de la
      orden). Leído del juego (spells_dialog_command.castSpell):
@@ -5257,7 +5313,11 @@
         if (lateSpell) delete payload.power_id;
         const res = await gpPostAs(a.source, 'town_info', 'send_units', payload);
         const expected = a.executeAt + a.duration;
-        const real = arrivalFromResponse(res, expected);
+        let real = arrivalFromResponse(res, expected);
+        let cmdFound = real ? commandIdFromResponse(res, real) : null;
+        // La respuesta no siempre trae la llegada: se lee de los movimientos del juego.
+        if (!real) { const mv = await findSentMovement(a, null, sentLocal + clockOffset().off); if (mv) { real = mv.arrival; cmdFound = mv.cmd; } }
+        if (cmdFound) a.commandId = cmdFound;
         if (!retry || !real || inWindow(real)) {
           a.status = 'sent'; a.sentAt = srvNow();
           const less = [pre.missing.length ? `faltaban ${pre.missing.join(', ')}` : '', pre.left?.length ? `sin sitio en los barcos se quedaron ${pre.left.join(', ')}` : ''].filter(Boolean);
@@ -5276,7 +5336,7 @@
             // Ya no se cancela: ahora sí, el hechizo.
             const spellName = UW.GameData?.powers?.[a.spell]?.name || a.spell;
             try {
-              const cmd = (real && commandIdFromResponse(res, real)) || await findSentCommand(a, real);
+              const cmd = cmdFound || (real && commandIdFromResponse(res, real)) || await findSentCommand(a, real);
               if (!cmd) throw new Error('no se encontró la orden enviada');
               await castSpellOnCommand(a, cmd);
               a.spellCast = true;
@@ -5291,7 +5351,7 @@
           break;
         }
         // Fuera del rango: cancelar y reintentar si aún da tiempo.
-        const cmd = commandIdFromResponse(res, real);
+        const cmd = cmdFound || commandIdFromResponse(res, real);
         if (!cmd) {
           a.status = 'sent'; a.sentAt = srvNow(); a.realArrival = real;
           a.note = 'Llegada fuera del rango y no se pudo identificar la orden para cancelarla.';
@@ -5406,13 +5466,14 @@
       const wrap = root.querySelector('#btn_attack_town')?.parentElement || root.querySelector('.button_wrapper');
       if (!wrap || wrap.querySelector('.nb-ingame-atk')) continue;
       const support = h.data.type === 'support';
+      // Botón con la misma estructura y clases que los del juego (button_new: left/right/caption),
+      // así usa su propio estilo, color y efecto al pasar el ratón, y queda alineado con Atacar/Planificar.
       const b = document.createElement('div');
-      b.className = 'nb-ingame-atk';
-      b.textContent = support ? 'Apoyar con bot' : 'Atacar con bot';
-      b.title = 'Abre NOVABOT con estas tropas, héroe y hechizo para programar la hora exacta';
-      b.style.cssText = 'display:inline-flex;align-items:center;gap:5px;margin-left:6px;padding:0 12px;height:23px;line-height:23px;vertical-align:top;cursor:pointer;border-radius:4px;font:bold 12px Verdana,Arial,sans-serif;color:#2b1a05;background:linear-gradient(#f3d27a,#c9973a);border:1px solid #7a5418;box-shadow:inset 0 1px 0 rgba(255,255,255,.5);white-space:nowrap;user-select:none;';
-      b.addEventListener('mouseenter', () => { b.style.filter = 'brightness(1.08)'; });
-      b.addEventListener('mouseleave', () => { b.style.filter = ''; });
+      b.className = 'button_new nb-ingame-atk';
+      b.style.marginLeft = '4px';
+      b.title = `${support ? 'Apoyar' : 'Atacar'} con NOVABOT: se lleva estas tropas, héroe y hechizo al bot para programar la hora exacta`;
+      b.innerHTML = '<div class="left"></div><div class="right"></div><div class="caption js-caption"><span></span><div class="effect js-effect"></div></div>';
+      b.querySelector('.caption span').textContent = 'Con bot';
       b.addEventListener('click', (e) => {
         e.preventDefault(); e.stopPropagation();
         try { attackFromGameWindow(w, h); } catch (err) { console.warn('[NOVABOT][ataques]', err); atkLog(`No se pudo leer la ventana del juego: ${err.message}`, 'error'); }
@@ -5465,6 +5526,7 @@
     if (atk.started) return;
     atk.started = true;
     setInterval(() => { try { hookGameAttackWindows(); } catch {} }, 700);
+    setInterval(() => { atkSyncWithGame(); }, 5000);
     if (!state.ataques) state.ataques = { correctionMs: 0 };
     atkLoad();
     for (const a of atk.queue) if (a.status === 'sending') { a.status = 'error'; a.error = 'La página se recargó mientras se enviaba: revisa en el juego si salió.'; }
@@ -5503,10 +5565,10 @@
   function atkRefreshQueue() {
     if (!atkQueueEl || state.activeTab !== 'ataques') return;
     atkQueueEl.innerHTML = '';
-    const order = { sending: 0, pending: 1, editing: 1, error: 2, missed: 2, skipped: 3, sent: 4 };
+    const order = { sending: 0, pending: 1, editing: 1, error: 2, missed: 2, skipped: 3, cancelled: 3, sent: 4 };
     const list = atk.queue.slice().sort((a, b) => (order[a.status] - order[b.status]) || (a.status === 'sent' ? b.executeAt - a.executeAt : a.executeAt - b.executeAt));
     if (!list.length) { atkQueueEl.appendChild(el('p', { class: 'nb-placeholder' }, 'No hay nada programado.')); return; }
-    const label = { pending: 'programado', editing: 'en edición', sending: 'enviando…', sent: 'enviado', error: 'error', missed: 'perdido', skipped: 'no enviado' };
+    const label = { pending: 'programado', editing: 'en edición', sending: 'enviando…', sent: 'enviado', error: 'error', missed: 'perdido', skipped: 'no enviado', cancelled: 'cancelado' };
     for (const a of list) {
       const units = Object.entries(a.units).map(([k, n]) => `${n} ${atkUnitName(k)}`).join(' · ');
       const actions = [];
@@ -5522,11 +5584,12 @@
         if (a.status === 'missed' || a.status === 'error') actions.push(el('span', { class: 'nb-mini', title: 'Volver a programar (editar)', onclick: () => atkEdit(a) }, '✎'));
         actions.push(el('span', { class: 'nb-mini', title: 'Quitar de la lista', onclick: () => { atk.queue = atk.queue.filter((x) => x !== a); atkSave(); atkRefreshQueue(); } }, '✕'));
       }
-      atkQueueEl.appendChild(el('div', { class: `nb-atk-item nb-atk-${a.status}` }, [
+      const cssSt = a.status === 'cancelled' ? 'skipped' : a.status;
+      atkQueueEl.appendChild(el('div', { class: `nb-atk-item nb-atk-${cssSt}` }, [
         el('div', { class: 'nb-atk-top' }, [
           el('span', { class: `nb-tag nb-tag-${a.type === 'support' ? 'support' : 'attack'}` }, a.type === 'support' ? 'apoyo' : a.type === 'revolt' ? 'revuelta' : 'ataque'),
           el('span', { class: 'nb-atk-route' }, `${farmTownName(a.source)} → ${a.targetName}`),
-          el('span', { class: `nb-tag nb-tag-${a.status}` }, label[a.status] || a.status)
+          el('span', { class: `nb-tag nb-tag-${cssSt}` }, label[a.status] || a.status)
         ]),
         el('div', { class: 'nb-atk-times' }, [
           el('div', {}, [el('span', {}, 'Sale'), el('b', {}, fmtWhen(a.executeAt))]),
@@ -5566,7 +5629,7 @@
     Object.assign(f, {
       source: a.source, target: atk.worldById.get(a.target) || { id: a.target, name: a.targetName, player: '', ally: '', points: 0 },
       units: { ...a.units }, hero: a.hero || '', spell: a.spell || '', type: a.type, strategy: a.strategy || '',
-      mode: a.mode, time: fmtClock(a.wantAt), onMissing: a.onMissing || 'partial', future: !!a.future, info: null, replaceId: a.id,
+      mode: a.mode, time: fmtClock(a.wantAt), day: clamp(dayOffsetOf(a.wantAt), 0, 2), onMissing: a.onMissing || 'partial', future: !!a.future, info: null, replaceId: a.id,
       until: a.windowEnd && a.rangeKind !== 'list' ? fmtClock(a.windowEnd) : '', method: a.method || 'exact',
       rangeKind: a.rangeKind === 'list' ? 'list' : 'range', accept: a.acceptText || (a.accepted ? a.accepted.map((x) => fmtClock(x)).join(', ') : '')
     });
@@ -5632,16 +5695,16 @@
     if (t.error) return { error: t.error };
     const now = srvNow();
     const hms = normTime(f.time);
-    let executeAt = null, arrivalAt = null, wantAt = null, note = '';
+    let executeAt = null, arrivalAt = null, wantAt = null, note = '', late = '';
+    const day = clamp(+f.day || 0, 0, 2), dayTxt = DAY_WORDS[day];
     if (/^\d{2}:\d{2}:\d{2}$/.test(hms)) {
+      wantAt = wallTimeOnDay(hms, day);
       if (f.mode === 'arrival') {
-        wantAt = nextWallTime(hms, now + t.ms + 1500);
-        const today = nextWallTime(hms, now);
-        if (today && wantAt !== today) note = `Hoy ya no llega a las ${hms} (lo antes posible: ${fmtWhen(now + t.ms)}): se programa para ${dayWord(wantAt)}.`;
         executeAt = wantAt - t.ms; arrivalAt = wantAt;
+        if (wantAt < now + t.ms + 1500) late = `${dayTxt[0].toUpperCase() + dayTxt.slice(1)} a las ${hms} ya no llega: lo antes posible es ${fmtWhen(now + t.ms + 1500)}. Cambia la hora o el día.`;
       } else {
-        wantAt = nextWallTime(hms, now + 1500);
         executeAt = wantAt; arrivalAt = wantAt + t.ms;
+        if (wantAt < now + 1500) late = `${dayTxt[0].toUpperCase() + dayTxt.slice(1)} a las ${hms} ya pasó. Cambia la hora o el día.`;
       }
     }
     // Fin del rango (solo al fijar la llegada): la misma hora o una posterior.
@@ -5652,19 +5715,24 @@
       const { secs, bad } = parseAcceptList(f.accept);
       if (bad.length) note = [note, `No entiendo: ${bad.join(', ')}`].filter(Boolean).join(' · ');
       if (secs.length) {
-        const base = now + t.ms + 1500;
-        const first = Math.min(...secs.map((x) => nextWallTime(secToHms(x), base)));
-        const list = secs.map((x) => nextWallTime(secToHms(x), first - 1000)).filter((x) => x - first <= 3600000).sort((a, b) => a - b);
+        // La primera escrita, en el día elegido; las demás detrás de ella (pueden pasar de medianoche).
+        const first = wallTimeOnDay(secToHms(secs[0]), day);
+        const reach = now + t.ms + 1500;
+        const all = secs.map((x) => nextWallTime(secToHms(x), first - 1000)).filter((x) => x - first <= 3600000).sort((a, b) => a - b);
+        const list = all.filter((x) => x >= reach);
         const dropped = secs.length - list.length;
-        if (dropped) note = [note, `${dropped} hora(s) ya no alcanzables o a más de 1 h de la primera: se ignoran.`].filter(Boolean).join(' · ');
-        accepted = list; wantAt = list[0]; windowEnd = list[list.length - 1];
-        executeAt = wantAt - t.ms; arrivalAt = wantAt;
+        if (!list.length) { late = `Ninguna de esas horas llega ${dayTxt}: lo antes posible es ${fmtWhen(reach)}. Cambia las horas o el día.`; wantAt = all[0] || first; executeAt = wantAt - t.ms; arrivalAt = wantAt; }
+        else {
+          if (dropped) note = [note, `${dropped} hora(s) ya no alcanzables o a más de 1 h de la primera: se ignoran.`].filter(Boolean).join(' · ');
+          accepted = list; wantAt = list[0]; windowEnd = list[list.length - 1];
+          executeAt = wantAt - t.ms; arrivalAt = wantAt;
+        }
       }
     } else if (f.mode === 'arrival' && wantAt && /^\d{2}:\d{2}:\d{2}$/.test(u)) {
       windowEnd = nextWallTime(u, wantAt - 1000);
       if (windowEnd - wantAt > 3600000) windowEnd = null; // rango absurdo (> 1 h): se ignora
     }
-    return { ms: t.ms, slow: t.slow, executeAt, arrivalAt, wantAt, windowEnd, accepted, note };
+    return { ms: t.ms, slow: t.slow, executeAt, arrivalAt, wantAt, windowEnd, accepted, note, late };
   }
 
   function atkPaintPlan() {
@@ -5681,6 +5749,7 @@
       el('div', { class: 'nb-stat' }, [el('span', {}, 'Salida'), el('b', {}, plan.executeAt ? fmtClock(plan.executeAt) : '—'), el('small', {}, plan.executeAt ? dayWord(plan.executeAt) : '')]),
       el('div', { class: 'nb-stat' }, [el('span', {}, 'Llegada'), el('b', {}, plan.arrivalAt ? fmtClock(plan.arrivalAt) : '—'), el('small', {}, plan.arrivalAt ? dayWord(plan.arrivalAt) : '')])
     ]));
+    if (plan.late) atkPlanEl.appendChild(el('div', { class: 'nb-alert nb-alert-danger' }, plan.late));
     if (plan.note) atkPlanEl.appendChild(el('div', { class: 'nb-alert nb-alert-warn' }, plan.note));
     const draft = { id: null, source: f.source, target: f.target?.id, type: f.type, units: f.units, executeAt: plan.executeAt, onMissing: f.onMissing };
     for (const w of atkWarnings(draft, f.info, plan.arrivalAt)) {
@@ -5698,6 +5767,7 @@
     const plan = atkComputePlan();
     if (!plan || plan.error) throw new Error(plan?.error || 'Plan no válido.');
     if (!plan.executeAt) throw new Error(f.mode === 'arrival' && f.rangeKind === 'list' ? 'Pon al menos una hora aceptada válida (HH:MM:SS).' : 'Pon una hora válida (HH:MM:SS).');
+    if (plan.late) throw new Error(plan.late);
     const units = Object.fromEntries(Object.entries(f.units).filter(([, n]) => +n > 0).map(([k, n]) => [k, Math.floor(+n)]));
     if (!f.future) for (const [k, n] of Object.entries(units)) if (n > (+info.units?.[k]?.count || 0)) throw new Error(`Solo hay ${+info.units?.[k]?.count || 0} ${atkUnitName(k)} en la ciudad (activa «Tropas que aún no tengo» para un ataque futuro).`);
     const item = {
@@ -5720,8 +5790,8 @@
     atk.recent =[f.target, ...atk.recent.filter((t) => t.id !== f.target.id)].slice(0, 6);
     atkLog(`Programado: ${farmTownName(item.source)} → ${item.targetName}, sale ${fmtWhen(item.executeAt)}, llega ${fmtWhen(item.arrivalAt)}.`, 'ok');
     // Tren: mantener objetivo y avanzar la hora para el siguiente.
-    if (f.keep) { f.units = {}; if (/^\d{2}:\d{2}:\d{2}$/.test(normTime(f.time))) f.time = fmtClock(nextWallTime(normTime(f.time), srvNow()) + (+f.step || 1) * 1000); }
-    else Object.assign(f, { target: null, units: {}, time: '', info: null, hero: '', spell: '' });
+    if (f.keep) { f.units = {}; const b = wallTimeOnDay(normTime(f.time), f.day); if (b) { const n = b + (+f.step || 1) * 1000; f.time = fmtClock(n); f.day = clamp(dayOffsetOf(n), 0, 2); } }
+    else { Object.assign(f, { target: null, units: {}, time: '', info: null, hero: '', spell: '' }); atk.view = 'queue'; }
     renderBody();
   }
 
@@ -5753,6 +5823,7 @@
         atkQueueEl
       ]));
       atkRefreshQueue();
+      atkSyncWithGame(true);
     } else {
       atkQueueEl = null;
       renderAtkForm(towns);
@@ -5883,15 +5954,22 @@
     const timeIn = el('input', { class: 'nb-input nb-input-time', type: 'text', inputmode: 'numeric', placeholder: 'HH:MM:SS', value: f.time, maxlength: '8' });
     timeIn.addEventListener('input', () => { f.time = timeIn.value; atkPaintPlan(); });
     timeIn.addEventListener('blur', () => { const n = normTime(timeIn.value); if (n !== timeIn.value) { timeIn.value = n; f.time = n; atkPaintPlan(); } });
+    // Pone hora y día a partir de un instante (si cruza medianoche, cambia el día).
+    const setWhen = (ms) => {
+      const d = clamp(dayOffsetOf(ms), 0, 2), changed = d !== (+f.day || 0);
+      f.time = fmtClock(ms); f.day = d; timeIn.value = f.time;
+      if (changed) renderBody(); else atkPaintPlan();
+    };
     const shift = (s) => {
-      const base = /^\d{2}:\d{2}:\d{2}$/.test(normTime(f.time)) ? nextWallTime(normTime(f.time), srvNow() - 86400000 + 1) : srvNow();
-      f.time = fmtClock(base + s * 1000); timeIn.value = f.time; atkPaintPlan();
+      const base = wallTimeOnDay(normTime(f.time), f.day) || srvNow();
+      setWhen(base + s * 1000);
     };
     const soonest = () => {
       const p = atkComputePlan();
-      const base = srvNow() + 15000 + (f.mode === 'arrival' && p?.ms ? p.ms : 0);
-      f.time = fmtClock(Math.ceil(base / 1000) * 1000); timeIn.value = f.time; atkPaintPlan();
+      setWhen(Math.ceil((srvNow() + 15000 + (f.mode === 'arrival' && p?.ms ? p.ms : 0)) / 1000) * 1000);
     };
+    const daySeg = el('div', { class: 'nb-seg nb-seg-sm', title: 'Día de la hora de arriba (hora del juego)' }, DAY_WORDS.map((w, i) =>
+      el('span', { class: `nb-seg-btn${(+f.day || 0) === i ? ' active' : ''}`, onclick: () => { f.day = i; renderBody(); } }, w[0].toUpperCase() + w.slice(1))));
     const quick = el('div', { class: 'nb-quick' }, [
       el('span', { class: 'nb-mini', onclick: soonest, title: 'Lo antes posible (+15 s)' }, 'ya'),
       el('span', { class: 'nb-mini', onclick: () => shift(-1) }, '−1s'),
@@ -5970,7 +6048,7 @@
         el('div', { class: 'nb-mt nb-pick-label' }, 'Hechizo (solo uno)'), spellSel,
         spellNote
       ] : [el('p', { class: 'nb-placeholder' }, 'No hay tropas en esta ciudad.'), futureRow]),
-      section(5, 'Hora del servidor', [modeSeg, el('div', { class: 'nb-time-row' }, [timeIn, quick]), rangeBox]),
+      section(5, 'Hora del servidor', [modeSeg, el('div', { class: 'nb-time-row' }, [timeIn, quick]), daySeg, rangeBox]),
       atkPlanEl,
       el('div', { class: 'nb-options' }, [
         el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Si faltan tropas al salir'), missSeg]),
@@ -6784,7 +6862,7 @@
     add('Ataques', 'ataques', [
       { t: 'Ataques y apoyos', find: () => TQ.tab('ataques'), before: () => { if (atk.view !== 'new') { atk.view = 'new'; return true; } }, h: `<p>Programa ataques y apoyos para que <b>lleguen</b> (o salgan) al segundo exacto.</p>` },
       { t: 'Desde la ventana del juego', find: () => TQ.tab('ataques'), h: `
-        <p>En la ventana de <b>Atacar</b> (o Apoyar) del propio juego hay un botón más: <b>Atacar con bot</b>. Elige allí las tropas, el héroe y el hechizo como siempre y púlsalo: se abre aquí el formulario ya relleno, con el <b>tiempo de viaje</b> de ese ejército. Solo te queda poner la hora y programar.</p>` },
+        <p>En la ventana de <b>Atacar</b> (o Apoyar) del propio juego hay un botón más, con el mismo estilo que los del juego, junto a Atacar y Planificar: <b>Con bot</b>. Elige allí las tropas, el héroe y el hechizo como siempre y púlsalo: se abre aquí el formulario ya relleno, con el <b>tiempo de viaje</b> de ese ejército. Solo te queda poner la hora y programar.</p>` },
       { t: 'Hora del servidor', find: () => TQ.sel('.nb-hero-atk', bodyEl), h: `
         <p>El reloj del <b>servidor</b> (no el de tu PC) y su precisión, y la próxima salida programada.</p>
         ${AUTO('Sincroniza el reloj con cada respuesta del juego hasta unas decenas de milisegundos, y dispara cada orden para que el servidor la procese a mitad del segundo buscado.')}` },
@@ -6801,6 +6879,7 @@
         <li><b>Hechizo</b>: uno, de los que se pueden lanzar sobre esa orden, con su coste de favor. Con <b>Ultra</b> o <b>Humano</b> no va con el envío: se lanza sobre la orden cuando ya acertó el rango y no se va a cancelar, así no se pierde favor en los intentos.</li></ul>` },
       { t: '5 · Hora', find: () => TQ.step(5), wide: true, h: `
         <ul><li><b>Llegar a las</b> o <b>Salir a las</b> + hora HH:MM:SS del servidor. Botones: <b>ya</b> (lo antes posible), −1s, +1s, +10s, +1m, +10m.</li>
+        <li><b>Hoy / Mañana / Pasado mañana</b>: el día de esa hora. Si la hora ya pasó (o no da tiempo a llegar), <b>no se programa</b> y te lo dice: nunca se pasa solo al día siguiente. Para un ataque a la 1:00 programado a las 23:00, elige <b>Mañana</b>. Los botones de ±tiempo cambian el día solos si cruzas la medianoche.</li>
         <li><b>Rango</b> (solo llegar): acepta llegadas entre la hora y el «hasta».</li>
         <li><b>Horas a mano</b> (solo llegar): escribe las horas de llegada que valen, sueltas o por rangos (<code>22:00:01, 22:00:03-22:00:05</code>). Las que no pongas no valen, así puedes saltarte un segundo del medio. La primera pasa a ser la hora de arriba.</li>
         <li><b>Preciso</b>: un envío calculado al milisegundo. <b>Ultra</b> y <b>Humano</b>: envía y, si la llegada cae fuera del rango, cancela y reintenta (esperando a que vuelvan las tropas) hasta acertar o hasta que no dé tiempo.</li></ul>` },
@@ -6809,12 +6888,13 @@
         <p>Hueco de los barcos: Bote de transporte 26, Bote rápido 10, +6 cada uno con <b>Literas</b>. Cada tropa ocupa su población; voladoras y héroe no ocupan.</p>` },
       { t: 'Opciones y programar', find: () => TQ.sel('.nb-options', bodyEl), h: `
         <ul><li><b>Si faltan tropas al salir</b>: enviar lo que haya o no enviar. Con «enviar lo que haya», si a otra isla no cabe todo en los barcos, se deja en la ciudad tropa de tierra, el <b>mismo %</b> de cada tipo, hasta que quepa.</li>
-        <li><b>Modo tren</b>: tras programar, mantiene el objetivo y adelanta la hora X segundos para meter el siguiente.</li></ul>
+        <li><b>Modo tren</b> (apagado por defecto): tras programar, mantiene el objetivo, vacía las tropas y adelanta la hora X segundos para meter el siguiente ataque seguido. Apagado: tras programar te lleva a <b>Programados</b>.</li></ul>
         <p>Después, <b>Programar ataque/apoyo</b>: primero lo comprueba con el juego.</p>` },
       { t: 'Programados', before: () => { if (atk.view !== 'queue') { atk.view = 'queue'; return true; } }, find: () => TQ.card(/^Programados/), wide: true, h: `
         <p>Cada orden con su estado (programado, enviando, enviado con el error de llegada, perdido, no enviado…).</p>
         <ul><li><b>+1s</b>: duplica llegando 1 s después (para trenes). <b>✎</b>: editar. <b>✕</b>: cancelar/quitar.</li>
-        <li><b>Limpiar terminados</b>: quita los ya enviados.</li></ul>
+        <li><b>Limpiar terminados</b>: quita los ya enviados.</li>
+        <li>Los enviados se comparan con las <b>Órdenes</b> del juego: si cancelas uno en el juego, aquí pasa a <b>cancelado</b>.</li></ul>
         ${AUTO(`<ul><li>Los temporizadores van en un proceso aparte: funcionan aunque la pestaña esté en segundo plano.</li>
         <li>35 s antes mira qué va a salir de verdad (tropas que haya, lo que quepa en los barcos, el héroe) y recalcula el viaje con eso, para que la llegada siga siendo exacta; si falta algo, lo avisa en la orden.</li>
         <li>6 s antes precarga las tropas disponibles; después de enviar lee la llegada real y corrige el desfase para los siguientes.</li>
@@ -6852,6 +6932,18 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.13.3', items: [
+      { t: 'Programados al día con el juego', tab: 'ataques', before: () => { if (atk.view !== 'queue') { atk.view = 'queue'; return true; } }, find: () => TQ.card(/^Programados/) || TQ.tab('ataques'), h: `
+        <ul><li>Si cancelas en el juego un ataque que envió el bot, en Programados pasa a <b>cancelado</b>.</li>
+        <li>La llegada real se lee también de los movimientos del juego (antes a veces salía «enviado» sin hora de llegada).</li>
+        <li>Si programas dos veces las mismas tropas desde la misma ciudad, avisa antes de programar.</li>
+        <li><b>Modo tren</b> viene apagado: tras programar te lleva a Programados.</li>
+        <li>El botón de la ventana de ataque del juego ahora es <b>Con bot</b>, con el mismo aspecto que Atacar y Planificar.</li></ul>` }
+    ] },
+    { v: '1.13.2', items: [
+      { t: 'Ataques: eliges el día', tab: 'ataques', before: () => { if (atk.view !== 'new') { atk.view = 'new'; return true; } }, find: () => TQ.step(5) || TQ.tab('ataques'), h: `
+        <p>Debajo de la hora: <b>Hoy / Mañana / Pasado mañana</b>. Si pones una hora que ya pasó, ya no se programa sola para el día siguiente: te avisa y no deja programarla hasta que cambies la hora o el día.</p>` }
+    ] },
     { v: '1.13.1', items: [
       { t: 'Horas a mano y viaje exacto', tab: 'ataques', find: () => TQ.step(5) || TQ.tab('ataques'), h: `
         <ul><li><b>Horas a mano</b>: en vez de un rango, las horas de llegada que valen (p. ej. <code>22:00:01, 22:00:03</code>, sin el :02). Con Ultra/Humano apunta a la siguiente que valga.</li>
