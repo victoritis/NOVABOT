@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.13.0
+// @version      1.13.1
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.13.0';
+  const VERSION = '1.13.1';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -4978,28 +4978,66 @@
     finally { UW.Game.townId = prev; }
   }
 
-  // Duración (ms) con las reglas de Grepolis. Devuelve también la tropa que marca el tiempo.
-  function travelFromInfo(info, units, heroId) {
-    const sel = Object.entries(units).filter(([, n]) => +n > 0).map(([k]) => k);
-    if (!sel.length) return { error: 'Elige al menos una tropa.' };
-    const dur = (k) => +info.units?.[k]?.duration || 0;
-    const ground = sel.filter((k) => !U(k).is_naval && !isFlying(k));
-    const naval = sel.filter((k) => U(k).is_naval);
-    let counted;
-    if (info.same_island) counted = sel;
-    else {
-      if (ground.length && !naval.length) return { error: 'Otra isla: las tropas de tierra necesitan barcos de transporte.' };
-      counted = sel.filter((k) => U(k).is_naval || isFlying(k));
+  /* Duración del viaje: la calcula el MISMO código del juego que usa la ventana de ataque
+     (módulo "helpers/runtime", getSlowestRuntimeByDistance), pero con la ciudad de ORIGEN
+     (el juego usa siempre la ciudad abierta). Así entran todas sus reglas:
+       · si hay barcos, solo cuentan los barcos (las tropas de tierra y voladoras van con
+         ellos), aunque sea la misma isla; el héroe cuenta siempre;
+       · Sirenas: +2 % de velocidad a los barcos por cada una (máx. +100 %);
+       · bonus de la ciudad (Meteorología, Cartografía…), de hechizos y del héroe;
+       · tiempo = floor(distancia × 50 / velocidad) + preparación (900 s / velocidad del mundo, mín. 60).
+     Comprobado contra lo que devuelve el servidor (town_info?action=attack): coincide al
+     segundo tropa a tropa. Si el módulo no está, se calcula igual a mano. */
+  function gameRuntimeHelper() { try { return UW.require?.('helpers/runtime') || null; } catch { return null; } }
+  function travelFromInfo(info, units, heroId, sourceId) {
+    const sel = {};
+    for (const [k, n] of Object.entries(units || {})) if (+n > 0 && UW.GameData?.units?.[k]) sel[k] = Math.floor(+n);
+    if (!Object.keys(sel).length) return { error: 'Elige al menos una tropa.' };
+    const ground = Object.keys(sel).filter((k) => !U(k).is_naval && !isFlying(k));
+    const naval = Object.keys(sel).filter((k) => U(k).is_naval);
+    if (!info.same_island && ground.length && !naval.length) return { error: 'Otra isla: las tropas de tierra necesitan barcos de transporte.' };
+    const dist = +info.distance;
+    const R = gameRuntimeHelper();
+    const town = (() => { try { return UW.ITowns?.getTown?.(+(sourceId || UW.Game?.townId)) || null; } catch { return null; } })();
+    if (R && town && dist > 0) {
+      try {
+        const heroM = heroId ? heroModels().find((m) => heroIdOf(m) === String(heroId)) || null : null;
+        const all = { ...sel };
+        const rel = R.getRelevantUnitsForSlowestRuntime(all, heroM);
+        const speeds = R.getUnitSpeedsWithBonus(rel, town, heroM);
+        const rt = R.getUnitRuntimes(all, dist, speeds);
+        const setup = +R.getSetupTimeByType() || 0;
+        let slow = null, max = 0;
+        for (const k of Object.keys(rel)) if (Number.isFinite(rt[k]) && rt[k] + setup > max) { max = rt[k] + setup; slow = GameData_isHero(k) ? 'hero' : k; }
+        if (max > 0) return { ms: max * 1000, slow, how: 'juego' };
+      } catch (e) { console.warn('[NOVABOT][ataques] cálculo del juego falló, uso el propio:', e); }
     }
+    // Respaldo: duración por tropa del servidor + las mismas reglas.
+    const dur = (k) => +info.units?.[k]?.duration || 0;
+    const counted = naval.length ? naval : Object.keys(sel);
+    const sirens = +sel.siren || 0;
+    const setupS = Math.max(60, 900 / (+UW.Game?.game_speed || 1));
     let slow = null, max = 0;
-    for (const k of counted) if (dur(k) > max) { max = dur(k); slow = k; }
+    for (const k of counted) {
+      let d = dur(k);
+      if (sirens && U(k).is_naval && d > setupS) d = Math.floor((d - setupS) / (1 + Math.min(0.02 * sirens, 1))) + setupS;
+      if (d > max) { max = d; slow = k; }
+    }
     if (heroId) { const h = +info.heroes_durations?.[heroId]?.duration || 0; if (h > max) { max = h; slow = 'hero'; } }
     if (!max) return { error: 'El juego no devolvió la duración de esas tropas.' };
-    return { ms: max * 1000, slow };
+    return { ms: max * 1000, slow, how: 'servidor' };
   }
+  const GameData_isHero = (k) => !!UW.GameData?.heroes?.[k];
 
+  // Hace falta transporte si hay tropa de tierra y o bien es otra isla o bien van barcos
+  // (en el juego, con barcos la tropa de tierra siempre va embarcada).
+  const needsTransport = (info, units) => {
+    const ks = Object.keys(units || {}).filter((k) => +units[k] > 0);
+    const ground = ks.some((k) => UW.GameData?.units?.[k] && !U(k).is_naval && !isFlying(k));
+    return ground && (!info?.same_island || ks.some((k) => U(k).is_naval));
+  };
   function transportCheck(sourceId, info, units) {
-    if (info.same_island) return null;
+    if (!needsTransport(info, units)) return null;
     const sel = Object.fromEntries(Object.entries(units).filter(([, n]) => +n > 0));
     let c = null;
     try { c = UW.GameDataUnits?.calculateCapacity?.(+sourceId, sel); } catch {}
@@ -5041,7 +5079,7 @@
      ocupa su población; las voladoras y el héroe no ocupan. */
   function fitToShips(units, info) {
     const none = { units, left: {}, cap: 0, need: 0 };
-    if (!info || info.same_island) return none;
+    if (!info || !needsTransport(info, units)) return none;
     const berth = +info.researches?.berth || 0;
     const pop = (k) => +U(k).population || 1;
     let cap = 0, need = 0;
@@ -5070,7 +5108,9 @@
   function atkWarnings(item, info, arrivalAt) {
     const w = [];
     const type = item.type;
-    if (type !== 'support' && info.same_alliance) w.push({ lvl: 'danger', txt: 'El objetivo es de TU ALIANZA.' });
+    const own = item.target != null && allTownIds().includes(+item.target);
+    if (own && type !== 'support') w.push({ lvl: 'warn', txt: 'Es una ciudad TUYA: sirve para probar, pero el juego puede rechazar el ataque.' });
+    else if (type !== 'support' && info.same_alliance) w.push({ lvl: 'danger', txt: 'El objetivo es de TU ALIANZA.' });
     else if (type !== 'support' && info.alliance_pact) w.push({ lvl: 'danger', txt: 'El objetivo es de una alianza con PACTO.' });
     if (type !== 'support' && info.has_player_protection && +info.protection_ends * 1000 > (arrivalAt || 0)) w.push({ lvl: 'danger', txt: `Objetivo con protección de principiante hasta ${fmtWhen(+info.protection_ends * 1000)}.` });
     const ns = +info.night_starts_at_hour, nd = +info.night_duration;
@@ -5199,7 +5239,7 @@
     }
     a.status = 'sending'; atkRefreshQueue();
     const retry = !!a.windowEnd && (a.method === 'ultra' || a.method === 'human');
-    const inWindow = (t) => !a.windowEnd || (t >= a.wantAt && t < a.windowEnd + 1000);
+    const inWindow = (t) => a.accepted ? a.accepted.includes(Math.floor(t / 1000) * 1000) : (!a.windowEnd || (t >= a.wantAt && t < a.windowEnd + 1000));
     // Con reintentos el hechizo NO va con el envío (se perdería al cancelar): se lanza sobre
     // la orden que se queda, en cuanto el bot sabe que ya no la va a cancelar.
     const lateSpell = retry && !!a.spell;
@@ -5247,7 +5287,7 @@
             }
           }
           const tries = a.attempts > 1 ? ` · ${a.attempts} intentos` : '';
-          atkLog(`${farmTownName(a.source)} → ${a.targetName}: ${a.type === 'support' ? 'apoyo' : 'ataque'} enviado${real ? ` · llega ${fmtClock(real)}${a.windowEnd ? (inWindow(real) ? ' ✓ dentro del rango' : ' (fuera del rango)') : a.arrivalErr ? ` (${a.arrivalErr > 0 ? '+' : ''}${a.arrivalErr} s)` : ' ✓ exacto'}` : ''}${tries}.`, 'ok');
+          atkLog(`${farmTownName(a.source)} → ${a.targetName}: ${a.type === 'support' ? 'apoyo' : 'ataque'} enviado${real ? ` · llega ${fmtClock(real)}${a.windowEnd ? (inWindow(real) ? ` ✓ ${a.accepted ? 'hora aceptada' : 'dentro del rango'}` : ` (${a.accepted ? 'no es una hora aceptada' : 'fuera del rango'})`) : a.arrivalErr ? ` (${a.arrivalErr > 0 ? '+' : ''}${a.arrivalErr} s)` : ' ✓ exacto'}` : ''}${tries}.`, 'ok');
           break;
         }
         // Fuera del rango: cancelar y reintentar si aún da tiempo.
@@ -5261,11 +5301,18 @@
         await gpPostAs(a.source, 'command_info', 'cancel_command', { id: cmd });
         const away = Date.now() - sentLocal; // las tropas tardan lo mismo en volver
         atkLog(`${farmTownName(a.source)} → ${a.targetName}: intento ${a.attempts} llegaba ${fmtClock(real)} → cancelado.`, 'info');
-        if (real >= a.windowEnd + 1000) throw new Error(`Llegaba ${fmtClock(real)}, después del rango: ya no se puede acertar.`);
+        if (real >= a.windowEnd + 1000) throw new Error(`Llegaba ${fmtClock(real)}, después ${a.accepted ? 'de la última hora aceptada' : 'del rango'}: ya no se puede acertar.`);
         if (a.attempts >= 60) throw new Error('Demasiados intentos sin acertar el rango.');
         let wait = away + 300 + (a.method === 'human' ? 1000 + Math.random() * 1500 : 100 + Math.random() * 200);
-        // Si llegaba antes del rango, esperar al momento ideal de salida.
-        const ideal = a.wantAt - a.duration + ATK_INTO_SECOND_MS - clockOffset().off - latencyOneWay();
+        // Apuntar a la primera hora aceptada que aún se pueda alcanzar (con lista, saltando
+        // los segundos que no quieres); si llegaba antes del rango, esperar a ese momento.
+        let goal = a.wantAt;
+        if (a.accepted) {
+          const earliest = srvNow() + wait + a.duration;
+          goal = a.accepted.find((x) => x + 999 >= earliest);
+          if (!goal) throw new Error('Ya no da tiempo a acertar ninguna de las horas aceptadas.');
+        }
+        const ideal = goal - a.duration + ATK_INTO_SECOND_MS - clockOffset().off - latencyOneWay();
         wait = Math.max(wait, ideal - Date.now());
         if (srvNow() + wait > atkLastSend(a)) throw new Error('Ya no da tiempo a acertar el rango.');
         atkRefreshQueue();
@@ -5293,7 +5340,7 @@
         warn = [pre.missing.length ? `faltan ${pre.missing.join(', ')}` : '', pre.left.length ? `no caben en los barcos ${pre.left.join(', ')}` : '', a.hero && !hero ? 'el héroe no está' : ''].filter(Boolean).join(' · ');
       } catch (e) { warn = e.message; }
       if (warn) { a.note = `Al salir: ${warn}`; atkLog(`${farmTownName(a.source)} → ${a.targetName}: ${warn}.`, 'error'); }
-      const t = travelFromInfo(info, units, hero);
+      const t = travelFromInfo(info, units, hero, a.source);
       if (t.error) { atkSave(); return; }
       a.duration = t.ms;
       if (a.mode === 'arrival') {
@@ -5400,7 +5447,16 @@
     if (!state.open) setOpen(true);
     try { buildTabs(); } catch {}
     renderBody();
-    const t = travelFromInfo(h.data, units, hero);
+    const t = travelFromInfo(h.data, units, hero, source);
+    // Comprobación con lo que muestra la propia ventana del juego ("Duración").
+    try {
+      const txt = String($e.find('span.way_duration').first().text() || '');
+      const m = /(\d+):(\d{2}):(\d{2})/.exec(txt);
+      if (m && t.ms) {
+        const shown = (+m[1] * 3600 + +m[2] * 60 + +m[3]) * 1000;
+        if (Math.abs(shown - t.ms) > 1000) atkLog(`Ojo: el juego muestra ${fmtDur(shown)} de viaje y el bot calcula ${fmtDur(t.ms)}. Revisa las tropas antes de programar.`, 'error');
+      }
+    } catch {}
     atkLog(`Desde el juego: ${farmTownName(source)} → ${target.name} · ${Object.entries(units).map(([k, n]) => `${n} ${atkUnitName(k)}`).join(', ') || 'sin tropas'}${hero ? ` · ${heroName(hero)}` : ''}${spell ? ` · ${UW.GameData?.powers?.[spell]?.name || spell}` : ''}${t.ms ? ` · viaje ${fmtDur(t.ms)}` : ''}. Elige la hora y programa.`, 'info');
     setTimeout(() => { try { TQ.step(5)?.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch {} }, 80);
   }
@@ -5486,6 +5542,7 @@
           a.hero ? el('span', { class: 'nb-res', title: heroName(a.hero) }, [heroIcon(a.hero), heroName(a.hero)]) : null,
           a.spell ? el('span', { class: 'nb-res' }, [el('span', { class: `nb-icon nb-icon-25 power_icon30x30 ${a.spell}` }), 'hechizo']) : null
         ]),
+        a.windowEnd ? el('div', { class: 'nb-goal-sub' }, `Acepta: ${a.accepted ? acceptSummary(a.accepted) : `${fmtClock(a.wantAt)} – ${fmtClock(a.windowEnd)}`} · ${({ exact: 'preciso', ultra: 'ultra', human: 'humano' })[a.method] || 'preciso'}`) : null,
         a.error ? el('div', { class: 'nb-goal-sub nb-err' }, a.error) : a.note ? el('div', { class: 'nb-goal-sub' }, a.note) : null,
         el('div', { class: 'nb-atk-actions' }, actions)
       ]));
@@ -5493,12 +5550,25 @@
     atkUpdateLive();
   }
 
+  // [t, t+1, t+2, t+5] → "22:00:01–22:00:03, 22:00:06"
+  function acceptSummary(list) {
+    const out = [];
+    for (let i = 0; i < list.length;) {
+      let j = i; while (j + 1 < list.length && list[j + 1] - list[j] === 1000) j++;
+      out.push(j > i ? `${fmtClock(list[i])}–${fmtClock(list[j])}` : fmtClock(list[i]));
+      i = j + 1;
+    }
+    return out.join(', ');
+  }
+
   function atkEdit(a) {
     const f = atk.form;
     Object.assign(f, {
       source: a.source, target: atk.worldById.get(a.target) || { id: a.target, name: a.targetName, player: '', ally: '', points: 0 },
       units: { ...a.units }, hero: a.hero || '', spell: a.spell || '', type: a.type, strategy: a.strategy || '',
-      mode: a.mode, time: fmtClock(a.wantAt), onMissing: a.onMissing || 'partial', future: !!a.future, info: null, replaceId: a.id
+      mode: a.mode, time: fmtClock(a.wantAt), onMissing: a.onMissing || 'partial', future: !!a.future, info: null, replaceId: a.id,
+      until: a.windowEnd && a.rangeKind !== 'list' ? fmtClock(a.windowEnd) : '', method: a.method || 'exact',
+      rangeKind: a.rangeKind === 'list' ? 'list' : 'range', accept: a.acceptText || (a.accepted ? a.accepted.map((x) => fmtClock(x)).join(', ') : '')
     });
     // No se borra: queda "en edición" (no sale) hasta que guardes el cambio; si
     // sales del formulario sin guardar, se puede reanudar desde la lista.
@@ -5514,6 +5584,8 @@
     const b = { ...a, id: `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`, status: 'pending', note: '', error: '' };
     delete b._pre; delete b._armed; delete b._rechecked; delete b.realArrival; delete b.arrivalErr;
     b.wantAt = a.wantAt + 1000; b.executeAt = a.executeAt + 1000; b.arrivalAt = a.arrivalAt + 1000;
+    if (a.windowEnd) b.windowEnd = a.windowEnd + 1000;
+    if (a.accepted) { b.accepted = a.accepted.map((x) => x + 1000); b.acceptText = b.accepted.map((x) => fmtClock(x)).join(', '); }
     atk.queue.push(b); atkSave(); atkRefreshQueue();
     atkLog(`Duplicado: ${b.targetName}, llega ${fmtClock(b.arrivalAt)}.`, 'info');
   }
@@ -5536,10 +5608,27 @@
     if (state.activeTab === 'ataques' && atk.view === 'new') renderBody();
   }
 
+  // "22:00:01, 22:00:03-22:00:05 22:00:09" → segundos del día aceptados (en el orden escrito).
+  // Un rango se expande segundo a segundo (máx. 1 h).
+  function parseAcceptList(txt) {
+    const toSec = (v) => { const n = normTime(v); const m = /^(\d{2}):(\d{2}):(\d{2})$/.exec(n); return m && +m[1] < 24 && +m[2] < 60 && +m[3] < 60 ? +m[1] * 3600 + +m[2] * 60 + +m[3] : null; };
+    const out = [], bad = [];
+    for (const part of String(txt || '').replace(/\s*[-–]\s*/g, '-').split(/[,;\s]+/).filter(Boolean)) {
+      const [a, b] = part.split(/\s*[-–]\s*/);
+      const x = toSec(a), y = b !== undefined ? toSec(b) : x;
+      if (x === null || y === null) { bad.push(part); continue; }
+      const len = ((y - x + 86400) % 86400);
+      if (len > 3600) { bad.push(part); continue; }
+      for (let i = 0; i <= len; i++) out.push((x + i) % 86400);
+    }
+    return { secs: [...new Set(out)], bad };
+  }
+  const secToHms = (n) => `${two(Math.floor(n / 3600))}:${two(Math.floor(n % 3600 / 60))}:${two(n % 60)}`;
+
   function atkComputePlan() {
     const f = atk.form;
     if (!f.info) return null;
-    const t = travelFromInfo(f.info, f.units, f.hero);
+    const t = travelFromInfo(f.info, f.units, f.hero, f.source);
     if (t.error) return { error: t.error };
     const now = srvNow();
     const hms = normTime(f.time);
@@ -5556,13 +5645,26 @@
       }
     }
     // Fin del rango (solo al fijar la llegada): la misma hora o una posterior.
-    let windowEnd = null;
+    let windowEnd = null, accepted = null;
     const u = normTime(f.until || '');
-    if (f.mode === 'arrival' && wantAt && /^\d{2}:\d{2}:\d{2}$/.test(u)) {
+    if (f.mode === 'arrival' && f.rangeKind === 'list') {
+      // Horas aceptadas puestas a mano: la primera que aún se pueda alcanzar manda.
+      const { secs, bad } = parseAcceptList(f.accept);
+      if (bad.length) note = [note, `No entiendo: ${bad.join(', ')}`].filter(Boolean).join(' · ');
+      if (secs.length) {
+        const base = now + t.ms + 1500;
+        const first = Math.min(...secs.map((x) => nextWallTime(secToHms(x), base)));
+        const list = secs.map((x) => nextWallTime(secToHms(x), first - 1000)).filter((x) => x - first <= 3600000).sort((a, b) => a - b);
+        const dropped = secs.length - list.length;
+        if (dropped) note = [note, `${dropped} hora(s) ya no alcanzables o a más de 1 h de la primera: se ignoran.`].filter(Boolean).join(' · ');
+        accepted = list; wantAt = list[0]; windowEnd = list[list.length - 1];
+        executeAt = wantAt - t.ms; arrivalAt = wantAt;
+      }
+    } else if (f.mode === 'arrival' && wantAt && /^\d{2}:\d{2}:\d{2}$/.test(u)) {
       windowEnd = nextWallTime(u, wantAt - 1000);
       if (windowEnd - wantAt > 3600000) windowEnd = null; // rango absurdo (> 1 h): se ignora
     }
-    return { ms: t.ms, slow: t.slow, executeAt, arrivalAt, wantAt, windowEnd, note };
+    return { ms: t.ms, slow: t.slow, executeAt, arrivalAt, wantAt, windowEnd, accepted, note };
   }
 
   function atkPaintPlan() {
@@ -5580,7 +5682,7 @@
       el('div', { class: 'nb-stat' }, [el('span', {}, 'Llegada'), el('b', {}, plan.arrivalAt ? fmtClock(plan.arrivalAt) : '—'), el('small', {}, plan.arrivalAt ? dayWord(plan.arrivalAt) : '')])
     ]));
     if (plan.note) atkPlanEl.appendChild(el('div', { class: 'nb-alert nb-alert-warn' }, plan.note));
-    const draft = { id: null, source: f.source, type: f.type, units: f.units, executeAt: plan.executeAt, onMissing: f.onMissing };
+    const draft = { id: null, source: f.source, target: f.target?.id, type: f.type, units: f.units, executeAt: plan.executeAt, onMissing: f.onMissing };
     for (const w of atkWarnings(draft, f.info, plan.arrivalAt)) {
       const box = el('div', { class: `nb-alert nb-alert-${w.lvl}` }, w.txt);
       if (w.fix === 'transport') box.appendChild(el('span', { class: 'nb-btn nb-btn-sm', onclick: () => { f.units = addNeededTransports(f.source, f.info, f.units); renderBody(); } }, 'Añadir barcos'));
@@ -5591,12 +5693,11 @@
   async function atkSubmit() {
     const f = atk.form;
     if (!f.target) throw new Error('Elige un objetivo.');
-    if (f.target.id && allTownIds().includes(+f.target.id) && f.type !== 'support') throw new Error('Es una ciudad tuya: para mandar tropas usa "Apoyo".');
     const info = await attackInfo(f.source, f.target.id, 0);
     f.info = info;
     const plan = atkComputePlan();
     if (!plan || plan.error) throw new Error(plan?.error || 'Plan no válido.');
-    if (!plan.executeAt) throw new Error('Pon una hora válida (HH:MM:SS).');
+    if (!plan.executeAt) throw new Error(f.mode === 'arrival' && f.rangeKind === 'list' ? 'Pon al menos una hora aceptada válida (HH:MM:SS).' : 'Pon una hora válida (HH:MM:SS).');
     const units = Object.fromEntries(Object.entries(f.units).filter(([, n]) => +n > 0).map(([k, n]) => [k, Math.floor(+n)]));
     if (!f.future) for (const [k, n] of Object.entries(units)) if (n > (+info.units?.[k]?.count || 0)) throw new Error(`Solo hay ${+info.units?.[k]?.count || 0} ${atkUnitName(k)} en la ciudad (activa «Tropas que aún no tengo» para un ataque futuro).`);
     const item = {
@@ -5604,6 +5705,7 @@
       targetName: f.target.name + (f.target.player ? ` (${f.target.player})` : ''), type: f.type, strategy: f.strategy,
       units, hero: f.hero, spell: f.spell, mode: f.mode, wantAt: plan.wantAt, duration: plan.ms,
       windowEnd: plan.windowEnd || null, method: plan.windowEnd ? (f.method || 'exact') : 'exact',
+      accepted: plan.accepted && plan.accepted.length > 1 ? plan.accepted : null, rangeKind: f.rangeKind === 'list' ? 'list' : 'range', acceptText: f.accept || '',
       executeAt: plan.executeAt, arrivalAt: plan.arrivalAt, onMissing: f.onMissing, status: 'pending', future: !!f.future,
       note: plan.note || '', error: '', createdAt: Date.now()
     };
@@ -5772,7 +5874,7 @@
     if (!spells.length) spellSel.appendChild(el('span', { class: 'nb-placeholder' }, 'No hay hechizos que se puedan lanzar sobre esta orden.'));
 
     const futureRow = optionRow('Tropas que aún no tengo', 'Ataque futuro: puedes pedir más de las que hay ahora (tú te aseguras de tenerlas). Al salir se envía lo que haya', !!f.future, (v) => { f.future = v; renderBody(); });
-    const retryMode = f.mode === 'arrival' && normTime(f.until || '') && (f.method === 'ultra' || f.method === 'human');
+    const retryMode = f.mode === 'arrival' && (f.rangeKind === 'list' ? !!String(f.accept || '').trim() : !!normTime(f.until || '')) && (f.method === 'ultra' || f.method === 'human');
     const spellNote = f.spell && retryMode ? el('p', { class: 'nb-placeholder' }, 'Con Ultra/Humano el hechizo no va con el envío: se lanza sobre la orden en cuanto acierta el rango y ya no se va a cancelar (así no se pierde el favor en los intentos).') : null;
 
     // 6) Hora
@@ -5806,12 +5908,28 @@
     const methodSeg = el('div', { class: 'nb-seg nb-seg-sm' }, [
       ['exact', 'Preciso (1 envío)'], ['ultra', 'Ultra (envía y cancela rápido)'], ['human', 'Humano (reintenta cada 1-2 s)']
     ].map(([v, l]) => el('span', { class: `nb-seg-btn${(f.method || 'exact') === v ? ' active' : ''}`, onclick: () => { f.method = v; renderBody(); } }, l)));
+    // Horas aceptadas a mano (lista): la primera pasa a ser la hora de arriba.
+    const acceptIn = el('input', { class: 'nb-input', type: 'text', placeholder: '22:00:01, 22:00:03-22:00:05, 22:00:09', value: f.accept || '' });
+    const syncFirst = () => {
+      const { secs } = parseAcceptList(f.accept);
+      if (!secs.length) return;
+      const p = atkComputePlan();
+      const first = p?.accepted?.[0] ? fmtClock(p.accepted[0]) : secToHms(secs[0]);
+      if (first !== f.time) { f.time = first; timeIn.value = first; }
+    };
+    acceptIn.addEventListener('input', () => { f.accept = acceptIn.value; syncFirst(); atkPaintPlan(); });
+    const kindSeg = el('div', { class: 'nb-seg nb-seg-sm' }, [['range', 'Rango (desde – hasta)'], ['list', 'Horas a mano']].map(([v, l]) =>
+      el('span', { class: `nb-seg-btn${(f.rangeKind || 'range') === v ? ' active' : ''}`, onclick: () => { f.rangeKind = v; if (v === 'list') syncFirst(); renderBody(); } }, l)));
+    const isList = f.rangeKind === 'list';
     const rangeBox = f.mode === 'arrival' ? el('div', { class: 'nb-range' }, [
-      el('div', { class: 'nb-time-row' }, [el('span', { class: 'nb-row-label' }, 'Rango aceptado: de la hora de arriba hasta'), untilIn]),
+      kindSeg,
+      isList
+        ? el('div', {}, [el('span', { class: 'nb-row-label' }, 'Horas de llegada aceptadas (sueltas o rangos; las que no pongas no valen)'), acceptIn])
+        : el('div', { class: 'nb-time-row' }, [el('span', { class: 'nb-row-label' }, 'Rango aceptado: de la hora de arriba hasta'), untilIn]),
       methodSeg,
       el('p', { class: 'nb-placeholder' }, (f.method || 'exact') === 'exact'
-        ? 'Un solo envío calculado al milisegundo.'
-        : 'Envía; si la llegada cae fuera del rango, cancela la orden y vuelve a intentarlo (esperando a que vuelvan las tropas) hasta acertar o hasta que ya no dé tiempo.')
+        ? `Un solo envío calculado al milisegundo${isList ? ', a la primera hora de la lista' : ''}.`
+        : `Envía; si la llegada ${isList ? 'no es una de las horas aceptadas' : 'cae fuera del rango'}, cancela la orden y vuelve a intentarlo (esperando a que vuelvan las tropas${isList ? ', apuntando a la siguiente hora aceptada' : ''}) hasta acertar o hasta que ya no dé tiempo.`)
     ]) : null;
 
     atkPlanEl = el('div', { class: 'nb-plan' });
@@ -6673,17 +6791,18 @@
       { t: 'Nuevo / Programados', find: () => TQ.sel('.nb-seg-main', bodyEl), h: `<p><b>Nuevo</b>: el formulario. <b>Programados</b>: la lista de lo que tienes pendiente y lo ya enviado.</p>` },
       { t: '1 y 2 · Origen y objetivo', find: () => TQ.step(2) || TQ.step(1), h: `
         <p><b>Origen</b>: tu ciudad desde la que sale.</p>
-        <p><b>Objetivo</b>: busca por nombre, jugador, alianza, id o pega un <b>[town]…[/town]</b>. Debajo salen los recientes. Las tuyas aparecen como <b>tuya</b> (a esas solo se manda Apoyo).</p>` },
+        <p><b>Objetivo</b>: busca por nombre, jugador, alianza, id o pega un <b>[town]…[/town]</b>. Debajo salen los recientes. Las tuyas aparecen como <b>tuya</b>: se pueden atacar para probar (avisa de que el juego puede rechazarlo).</p>` },
       { t: '3 · Tipo', find: () => TQ.step(3), h: `<p>Ataque, los tipos especiales que permita el juego (asedio, revuelta…) o <b>Apoyo</b>. Si hay estrategias de ataque, se eligen aquí.</p>` },
       { t: '4 · Tropas, héroe y hechizo', find: () => TQ.step(4), wide: true, h: `
         <ul><li>Escribe cuántas de cada una o pulsa <b>máx</b>. Atajos: Todas, Ofensivas, Solo tierra, Ninguna.</li>
-        <li>Cada tropa muestra su tiempo de viaje; la que <b>marca</b> el tiempo (la más lenta, o los barcos si es otra isla) se resalta.</li>
+        <li>Cada tropa muestra su tiempo de viaje; la que <b>marca</b> el tiempo se resalta. El viaje se calcula con el <b>mismo código que la ventana del juego</b>: si van barcos, mandan los barcos (la tierra va embarcada, aunque sea la misma isla); cada <b>Sirena</b> acelera los barcos un 2 %; y cuentan los bonus de la ciudad, hechizos y héroe.</li>
         <li><b>Tropas que aún no tengo</b>: para un ataque futuro puedes pedir más de las que hay ahora (tú te aseguras de tenerlas a esa hora). Al salir se envía lo que haya.</li>
         <li><b>Héroe</b>: solo los de la ciudad de origen que estén disponibles.</li>
         <li><b>Hechizo</b>: uno, de los que se pueden lanzar sobre esa orden, con su coste de favor. Con <b>Ultra</b> o <b>Humano</b> no va con el envío: se lanza sobre la orden cuando ya acertó el rango y no se va a cancelar, así no se pierde favor en los intentos.</li></ul>` },
       { t: '5 · Hora', find: () => TQ.step(5), wide: true, h: `
         <ul><li><b>Llegar a las</b> o <b>Salir a las</b> + hora HH:MM:SS del servidor. Botones: <b>ya</b> (lo antes posible), −1s, +1s, +10s, +1m, +10m.</li>
         <li><b>Rango</b> (solo llegar): acepta llegadas entre la hora y el «hasta».</li>
+        <li><b>Horas a mano</b> (solo llegar): escribe las horas de llegada que valen, sueltas o por rangos (<code>22:00:01, 22:00:03-22:00:05</code>). Las que no pongas no valen, así puedes saltarte un segundo del medio. La primera pasa a ser la hora de arriba.</li>
         <li><b>Preciso</b>: un envío calculado al milisegundo. <b>Ultra</b> y <b>Humano</b>: envía y, si la llegada cae fuera del rango, cancela y reintenta (esperando a que vuelvan las tropas) hasta acertar o hasta que no dé tiempo.</li></ul>` },
       { t: 'Plan y avisos', find: () => TQ.sel('.nb-plan', bodyEl), h: `
         <p>Viaje, hora de <b>salida</b> y de <b>llegada</b> calculadas con los datos del juego, y avisos: objetivo de tu alianza o con pacto, protección de principiante, <b>modo noche</b>, moral, <b>no caben en los barcos</b> (con botón para añadirlos), tropas que aún no tienes o ya usadas en otro ataque.</p>
@@ -6733,6 +6852,12 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.13.1', items: [
+      { t: 'Horas a mano y viaje exacto', tab: 'ataques', find: () => TQ.step(5) || TQ.tab('ataques'), h: `
+        <ul><li><b>Horas a mano</b>: en vez de un rango, las horas de llegada que valen (p. ej. <code>22:00:01, 22:00:03</code>, sin el :02). Con Ultra/Humano apunta a la siguiente que valga.</li>
+        <li>El viaje se calcula con el mismo código que la ventana del juego (Sirenas, barcos, bonus). Si al venir del juego no coincide con lo que muestra, avisa.</li>
+        <li>Puedes atacar tus propias ciudades para probar.</li></ul>` }
+    ] },
     { v: '1.13.0', items: [
       { t: 'Atacar con bot desde el juego', tab: 'ataques', before: () => { if (atk.view !== 'new') { atk.view = 'new'; return true; } }, find: () => TQ.tab('ataques'), h: `
         <p>En la ventana de <b>Atacar</b> del juego hay un botón <b>Atacar con bot</b>: se lleva aquí las tropas, el héroe y el hechizo que elegiste, con el tiempo de viaje. Tú pones la hora.</p>` },
