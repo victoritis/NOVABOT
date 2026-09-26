@@ -5697,18 +5697,21 @@
     // la orden que se queda, en cuanto el bot sabe que ya no la va a cancelar.
     const lateSpell = retry && !!a.spell;
     a.attempts = 0; a.tries = [];
-    let lastUsed = null, lastHero = ''; // tropas (y héroe) del intento anterior (cancelado): deben haber vuelto
+    let lastUsed = null, lastHero = '', lastPre = null; // tropas (y héroe) del intento anterior (cancelado): deben haber vuelto
     try {
       for (;;) {
         a.attempts += 1;
-        let pre = a.attempts === 1 ? a._pre : null;
-        if (!pre || Date.now() - pre.at > 20000) {
+        // Ultra: reintento con el mismo envío (sin volver a preguntar al juego qué tropas hay:
+        // ya se sabe cuándo vuelven). Si el juego dice que aún no están, se pregunta y se espera.
+        let pre = a.attempts === 1 ? a._pre : (a.method === 'ultra' && lastPre && Date.now() - lastPre.at < 60000 ? lastPre : null);
+        const reused = a.attempts > 1 && !!pre;
+        if (!pre || Date.now() - pre.at > 60000) {
           let info = await attackInfo(a.source, a.target, 0);
           // Reintento: esperar a que vuelvan TODAS las tropas del intento cancelado (si no,
           // saldría un ataque con menos tropas de las que pediste).
           const back = (inf) => !lastUsed || Object.entries(lastUsed).every(([u, n]) => (+inf?.units?.[u]?.count || 0) >= n);
           const heroBack = () => !lastHero || heroesIn(a.source).some((h) => h.id === String(lastHero));
-          for (let k = 0; k < 10 && !back(info) && srvNow() + 700 < atkLastSend(a); k++) { await sleep(500); info = await attackInfo(a.source, a.target, 0); }
+          for (let k = 0; k < (a.method === 'ultra' ? 30 : 10) && !back(info) && srvNow() + 700 < atkLastSend(a); k++) { await sleep(a.method === 'ultra' ? 150 : 500); info = await attackInfo(a.source, a.target, 0); }
           // El héroe vuelve con ellas; su dato del juego puede tardar un poco (máx. ~1,2 s).
           for (let k = 0; k < 3 && back(info) && !heroBack(); k++) await sleep(400);
           if (!back(info)) throw new Error('Las tropas del intento anterior no habían vuelto a tiempo para otro intento: revisa en el juego si quedó alguno en marcha.');
@@ -5719,7 +5722,12 @@
         const sentLocal = Date.now();
         const payload = { ...pre.payload };
         if (lateSpell) delete payload.power_id;
-        await gpPostAs(a.source, 'town_info', 'send_units', payload);
+        try { await gpPostAs(a.source, 'town_info', 'send_units', payload); }
+        catch (e) {
+          if (!reused || srvNow() + 300 > atkLastSend(a)) throw e;
+          lastPre = null; a.attempts -= 1; await sleep(150); continue; // tropas aún no en casa: preguntar y reintentar
+        }
+        lastPre = pre;
         a._away = true; lastUsed = pre.used; lastHero = pre.payload.heroes || '';
         const expected = a.executeAt + a.duration;
         const sentSrv = sentLocal + clockOffset().off;
@@ -5797,10 +5805,13 @@
         atkLog(`${who()}: intento ${a.attempts} llegaba ${fmtClock(real)} → cancelado.`, 'info');
         const jit = atkJitterMs(a);
         if (!jit && real >= a.windowEnd + 1000) throw new Error(`Llegaba ${fmtClock(real)}, después ${a.accepted ? 'de la última hora aceptada' : 'del rango'}: ya no se puede acertar (no ha salido nada).`);
-        if (a.attempts >= 80) throw new Error('Demasiados intentos sin acertar el rango (no ha salido nada).');
+        if (a.attempts >= 200) throw new Error('Demasiados intentos sin acertar el rango (no ha salido nada).');
         // Siguiente intento (hora local): cuando vuelvan las tropas (tardan lo mismo que
         // estuvieron fuera) y, en Humano, como mínimo los segundos que elegiste.
-        let nextAt = cancelAt + away + 300 + (a.method === 'human' ? 0 : 100 + Math.random() * 200);
+        let nextAt = cancelAt + away + (a.method === 'human' ? 300 : 220 + Math.random() * 80);
+        // Ultra: como mucho N intentos por segundo (por defecto 4, lo eliges). El límite real
+        // es lo que tardan las tropas en volver: si vuelven más tarde, se espera a ellas.
+        if (a.method === 'ultra') nextAt = Math.max(nextAt, sentLocal + 1000 / clamp(+a.ultraRate || 4, 1, 10));
         // Humano: la espera elegida con azar (entre 0,3 s menos y 0,5 s más), para que
         // nunca sea el mismo tiempo exacto entre intentos (2 s → 2,05 · 1,92 · 2,34…).
         if (a.method === 'human') nextAt = Math.max(nextAt, sentLocal + Math.max(700, clamp(+a.humanDelay || 2, 1, 120) * 1000 + Math.round(-300 + Math.random() * 800)));
@@ -6079,7 +6090,7 @@
       units: { ...a.units }, hero: a.hero || '', spell: a.spell || '', type: a.type, strategy: a.strategy || '',
       mode: a.mode, time: fmtClock(a.wantAt), day: clamp(dayOffsetOf(a.wantAt), 0, 2), onMissing: a.onMissing || 'partial', future: !!a.future, info: null, replaceId: a.id,
       until: a.windowEnd && a.rangeKind !== 'list' && a.windowEnd !== a.wantAt ? fmtClock(a.windowEnd) : '', method: a.method || 'exact',
-      jitter: a.jitter || 10, humanDelay: a.humanDelay || 2,
+      jitter: a.jitter || 10, humanDelay: a.humanDelay || 2, ultraRate: a.ultraRate || 4,
       rangeKind: a.rangeKind === 'list' ? 'list' : 'range', accept: a.acceptText || (a.accepted ? a.accepted.map((x) => fmtClock(x)).join(', ') : '')
     });
     // No se borra: queda "en edición" (no sale) hasta que guardes el cambio; si
@@ -6236,7 +6247,7 @@
       targetName: f.target.name + (f.target.player ? ` (${f.target.player})` : ''), type: f.type, strategy: f.strategy,
       units, hero: f.hero, spell: f.spell, mode: f.mode, wantAt: plan.wantAt, duration: plan.ms,
       windowEnd: plan.windowEnd || null, method: plan.windowEnd ? (f.method || 'exact') : 'exact',
-      jitter: plan.firstTry ? clamp(Math.round(+f.jitter || 10), 3, 15) : 0, humanDelay: clamp(+f.humanDelay || 2, 1, 120),
+      jitter: plan.firstTry ? clamp(Math.round(+f.jitter || 10), 3, 15) : 0, humanDelay: clamp(+f.humanDelay || 2, 1, 120), ultraRate: clamp(Math.round(+f.ultraRate || 4), 1, 10),
       accepted: plan.accepted && plan.accepted.length > 1 ? plan.accepted : null, rangeKind: f.rangeKind === 'list' ? 'list' : 'range', acceptText: f.accept || '',
       executeAt: plan.executeAt, arrivalAt: plan.arrivalAt, onMissing: f.onMissing, status: 'pending', future: !!f.future,
       note: plan.note || '', error: '', createdAt: Date.now(),
@@ -6458,6 +6469,7 @@
     const retrySel = f.method === 'ultra' || f.method === 'human';
     const retryOpts = retrySel ? el('div', {}, [
       numBox('jitter', 10, 3, 15, 'Aleatoriedad del juego (± s)', 'Empieza a probar estos segundos ANTES de lo ideal y sigue hasta estos segundos DESPUÉS (3–15)'),
+      f.method === 'ultra' ? numBox('ultraRate', 4, 1, 10, 'Intentos por segundo (máx.)', 'Como mucho estos intentos cada segundo (1–10). El límite real es lo que tardan las tropas en volver tras cancelar') : null,
       f.method === 'human' ? numBox('humanDelay', 2, 1, 120, 'Espera entre intentos (s)', 'Tras cancelar, espera esto con azar (−0,3 s a +0,5 s) y siempre a que vuelvan las tropas antes de volver a lanzar') : null
     ]) : null;
 
@@ -7380,7 +7392,7 @@
         <li><b>Preciso</b>: un envío calculado al milisegundo. <b>Ultra</b> y <b>Humano</b>: envía y, si la llegada cae fuera del rango (o, sin «hasta», no es justo esa hora), cancela y reintenta hasta acertar.
         ${AUTO('Cada intento se busca en la <b>Vista general de órdenes</b> del juego (sirve desde cualquier ciudad): se mira su llegada real y solo se cancela <b>esa</b> orden, nunca la de otro ataque del tren. Antes de reintentar espera a que vuelvan <b>todas</b> las tropas. Después, la llegada de lo enviado se sigue comprobando con esa vista.')}</li>
         <li><b>Aleatoriedad (± s, 3–15)</b>: el juego mete unos segundos de azar en la llegada. Con Ultra/Humano el primer intento sale esos segundos <b>antes</b> de lo ideal y se sigue probando hasta esos segundos <b>después</b>, aunque un intento llegue tarde.</li>
-        <li><b>Espera entre intentos</b> (solo Humano): tras cancelar, cuántos segundos espera antes de volver a lanzar (y siempre a que vuelvan las tropas). Ultra reintenta en cuanto vuelven.</li>
+        <li><b>Espera entre intentos</b> (solo Humano): tras cancelar, cuántos segundos espera antes de volver a lanzar (y siempre a que vuelvan las tropas). Ultra reintenta en cuanto vuelven, con un máximo de <b>intentos por segundo</b> (por defecto 4, de 1 a 10; el límite real es lo que tardan las tropas en volver).</li>
         <li>En Humano esa espera lleva <b>azar</b>: entre 0,3 s menos y 0,5 s más cada vez (con 2 s: 2,05 · 1,92 · 2,34…), nunca el mismo tiempo exacto.</li></ul>` },
       { t: 'Plan y avisos', find: () => TQ.sel('.nb-plan', bodyEl), h: `
         <p>Viaje, hora de <b>salida</b> y de <b>llegada</b> calculadas con los datos del juego, y avisos: objetivo de tu alianza o con pacto, protección de principiante, <b>modo noche</b>, moral, <b>no caben en los barcos</b> (con botón para añadirlos), tropas que aún no tienes o ya usadas en otro ataque.</p>
@@ -7433,6 +7445,8 @@
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
     { v: '1.14.4', items: [
+      { t: 'Ultra: intentos por segundo', tab: 'ataques', before: () => { if (atk.view !== 'new') { atk.view = 'new'; return true; } }, find: () => TQ.step(5) || TQ.tab('ataques'), h: `
+        <p>En modo <b>Ultra</b> eliges cuántos intentos por segundo como máximo (por defecto <b>4</b>, de 1 a 10). Reintenta en cuanto vuelven las tropas del intento cancelado, sin pasar de ese ritmo; si las tropas tardan más en volver, manda eso.</p>` },
       { t: 'Programados: rango de llegada', tab: 'ataques', before: () => { if (atk.view !== 'queue') { atk.view = 'queue'; return true; } }, find: () => TQ.card(/^Programados/) || TQ.tab('ataques'), h: `
         <p>En <b>Programados</b>, los ataques con rango (o con horas a mano) muestran ahora <b>«Llega entre»</b> con todos los segundos que valen (p. ej. 21:18:05 – 21:18:07), en vez de solo el primero. Cuando ya se ha enviado, sale la llegada real.</p>` },
       { t: 'Humano: espera con azar', tab: 'ataques', before: () => { if (atk.view !== 'new') { atk.view = 'new'; return true; } }, find: () => TQ.step(5) || TQ.tab('ataques'), h: `
