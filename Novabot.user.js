@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.14.4
+// @version      1.14.5
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.14.4';
+  const VERSION = '1.14.5';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -3803,7 +3803,10 @@
     const ids = M.towns.filter(tradeTownOk); // almacén < nivel 6: fuera del comercio entre ciudades
     const moves = new Map();
     const capLeft = {};
-    for (const id of ids) { const t = M.T[id]; capLeft[id] = Math.max(0, Math.min(t.cap, t.cap - t.maxCap * (1 - capPct))); }
+    // Para NO PERDER recursos (almacén lleno) se pueden usar todos los comerciantes libres;
+    // para lo demás, solo la parte configurada (el resto queda para encargos).
+    const capNormal = {};
+    for (const id of ids) { const t = M.T[id]; capNormal[id] = Math.max(0, Math.min(t.cap, t.cap - t.maxCap * (1 - capPct))); capLeft[id] = Math.max(0, t.cap); }
     // Lo que alguna ciudad espera ahora no lo mueve el equilibrio (lo reparte el comercio).
     const waited = (k) => ctx.mode === 'encargos' && (M.globalMiss[k] || 0) > 0;
     const giveable = (d, k) => (M.T[d].miss[k] > 0 ? 0 : Math.max(0, Math.floor(M.T[d].cur[k] - M.T[d].keep[k] - (ctx.up.get(d)?.[k] || 0))));
@@ -3849,6 +3852,7 @@
         want -= x;
       }
     }
+    for (const id of ids) { const used = Math.max(0, M.T[id].cap - capLeft[id]); capLeft[id] = Math.max(0, Math.min(capLeft[id], capNormal[id] - used)); }
 
     // 2) Adelantar a las ciudades con encargos a punto lo que les va a faltar, desde
     //    las que tienen de sobra (por encima de la media del imperio + media tolerancia).
@@ -7444,6 +7448,10 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.14.5', items: [
+      { t: 'Almacén lleno: con todos los comerciantes', tab: 'comercio', find: () => TQ.card(/^Equilibrio entre ciudades/) || TQ.tab('comercio'), h: `
+        <p>Una ciudad con el almacén lleno solo podía usar el 20–30 % de sus comerciantes para repartir lo que sobra: con un envío ya en camino no mandaba más y seguía perdiendo recursos. Ahora, para <b>no perder</b>, usa todos los comerciantes libres; para igualar ciudades sigue usando solo la parte configurada.</p>` }
+    ] },
     { v: '1.14.4', items: [
       { t: 'Ultra: intentos por segundo', tab: 'ataques', before: () => { if (atk.view !== 'new') { atk.view = 'new'; return true; } }, find: () => TQ.step(5) || TQ.tab('ataques'), h: `
         <p>En modo <b>Ultra</b> eliges cuántos intentos por segundo como máximo (por defecto <b>4</b>, de 1 a 10). Reintenta en cuanto vuelven las tropas del intento cancelado, sin pasar de ese ritmo; si las tropas tardan más en volver, manda eso.</p>` },
@@ -7467,7 +7475,8 @@
         <li>Antes de reintentar espera también al héroe.</li>
         <li>En Programados, <b>Sale</b> es la salida del intento que se quedó y se ve cuántos intentos hizo.</li></ul>` },
       { t: 'Almacén lleno: se reparte siempre', tab: 'comercio', find: () => TQ.card(/^Equilibrio entre ciudades/) || TQ.tab('comercio'), h: `
-        <p>Antes, con el comercio ocupado en encargos (reclutamiento, construcción…), el equilibrio no actuaba y las ciudades con el almacén lleno perdían recursos. Ahora lo que se va a perder se reparte cada 30 s igualmente, aunque otras ciudades estén esperando ese recurso (se les da a ellas primero).</p>` },
+        <p>Antes, con el comercio ocupado en encargos (reclutamiento, construcción…), el equilibrio no actuaba y las ciudades con el almacén lleno perdían recursos. Ahora lo que se va a perder se reparte cada 30 s igualmente, aunque otras ciudades estén esperando ese recurso (se les da a ellas primero).</p>
+        <p>Y para eso usa <b>todos los comerciantes libres</b> de la ciudad llena (antes solo el 20–30 % reservado al equilibrio, y en cuanto había un envío en camino ya no mandaba más).</p>` },
       { t: 'Comercio: almacén pequeño fuera', tab: 'comercio', find: () => TQ.card(/^Comercio automático/) || TQ.tab('comercio'), h: `
         <p>Las ciudades con el <b>almacén por debajo de nivel 6</b> ya no mandan ni reciben recursos de otras ciudades (el juego no deja comerciar por debajo de nivel 5 y daba error). Salen avisadas en Comercio.</p>` },
       { t: 'Vista general: % de recursos', tab: 'resumen', before: () => { if ((state.resumenView || 'ciudades') !== 'ciudades') { state.resumenView = 'ciudades'; return true; } }, find: () => TQ.card(/^Vista general/) || TQ.tab('resumen'), h: `
@@ -7560,7 +7569,7 @@
     { v: '1.10.0', items: [
       { t: 'Equilibrio entre ciudades', tab: 'comercio', find: () => TQ.card(/^Equilibrio entre ciudades/), h: `
         <p>Nuevo: antes de cada recolección calcula el botín de cada ciudad y lo que no cabría lo manda a otras ciudades con sitio. También reparte entre ciudades y trae recursos a las aldeas que tienen buena tasa.</p>
-        ${AUTO('Evitar perder va <b>siempre</b>: aunque el comercio esté enviando encargos, cada 30 s mira qué ciudades van a llenar el almacén y reparte lo que sobra (primero a las que lo necesitan). Solo no lo hace si ninguna ciudad cercana tiene sitio.')}` },
+        ${AUTO('Evitar perder va <b>siempre</b> (y con todos los comerciantes libres de la ciudad llena): aunque el comercio esté enviando encargos, cada 30 s mira qué ciudades van a llenar el almacén y reparte lo que sobra (primero a las que lo necesitan). Solo no lo hace si ninguna ciudad cercana tiene sitio.')}` },
       { t: 'Intercambio con aldeas más listo', tab: 'granjas', find: () => TQ.card(/^Intercambio con aldeas/), h: `
         <ul><li>Calcula la <b>tasa real de cada ciudad</b> (antes usaba la de la ciudad abierta y el +0,1 de la Oficina comercial engañaba).</li>
         <li>Los cambios normales, solo con <b>tasa alta</b> (rinde mucho más); con tasa baja solo si se iba a perder.</li>
