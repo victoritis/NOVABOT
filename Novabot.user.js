@@ -5164,7 +5164,9 @@
     return Math.min(1500, v[Math.floor(v.length / 2)] / 2);
   };
   // Hora "de pared" del servidor (la que se ve en el juego).
-  const srvGmt = () => { try { return (+UW.Timestamp?.serverGMTOffset || +UW.Game?.server_gmt_offset || 0) * 1000; } catch { return 0; } };
+  // (Timestamp.serverGMTOffset es una FUNCIÓN en el juego: se llama; así sigue bien si
+  // el servidor cambia de hora de verano a invierno sin recargar. Si no, la de Game.)
+  const srvGmt = () => { try { const f = UW.Timestamp?.serverGMTOffset; const v = typeof f === 'function' ? +f.call(UW.Timestamp) : +f; return (Number.isFinite(v) && v !== 0 ? v : +UW.Game?.server_gmt_offset || 0) * 1000; } catch { return 0; } };
   const two = (n) => String(n).padStart(2, '0');
   const wall = (ms) => new Date(ms + srvGmt());
   const fmtClock = (ms, tenths = false) => {
@@ -5799,7 +5801,9 @@
         // Siguiente intento (hora local): cuando vuelvan las tropas (tardan lo mismo que
         // estuvieron fuera) y, en Humano, como mínimo los segundos que elegiste.
         let nextAt = cancelAt + away + 300 + (a.method === 'human' ? 0 : 100 + Math.random() * 200);
-        if (a.method === 'human') nextAt = Math.max(nextAt, sentLocal + clamp(+a.humanDelay || 2, 1, 120) * 1000);
+        // Humano: la espera elegida con azar (entre 0,3 s menos y 0,5 s más), para que
+        // nunca sea el mismo tiempo exacto entre intentos (2 s → 2,05 · 1,92 · 2,34…).
+        if (a.method === 'human') nextAt = Math.max(nextAt, sentLocal + Math.max(700, clamp(+a.humanDelay || 2, 1, 120) * 1000 + Math.round(-300 + Math.random() * 800)));
         // Apuntar a la primera hora aceptada que aún se pueda alcanzar (con lista, saltando
         // los segundos que no quieres); si llegaba antes del rango, esperar a ese momento.
         let goal = a.wantAt;
@@ -6032,7 +6036,11 @@
         ]),
         el('div', { class: 'nb-atk-times' }, [
           el('div', {}, [el('span', {}, 'Sale'), el('b', {}, fmtWhen(a.status === 'sent' && a.sentSrv ? a.sentSrv : a.executeAt))]),
-          el('div', {}, [el('span', {}, 'Llega'), el('b', {}, fmtWhen(a.realArrival || a.arrivalAt))]),
+          el('div', {}, [el('span', {}, a.realArrival ? 'Llega' : a.windowEnd ? 'Llega entre' : 'Llega'), el('b', {}, a.realArrival ? fmtWhen(a.realArrival)
+            // Sin llegada real aún: el rango de segundos que vale (no solo el primero).
+            : a.accepted ? `${dayWord(a.accepted[0])} ${acceptSummary(a.accepted)}`
+            : a.windowEnd && a.windowEnd !== a.wantAt ? `${fmtWhen(a.wantAt)} – ${fmtClock(a.windowEnd)}`
+            : fmtWhen(a.arrivalAt))]),
           a.status === 'pending' || a.status === 'sending'
             ? el('div', { class: 'nb-atk-count' }, [el('span', {}, 'Falta'), el('b', { 'data-atk-at': a.executeAt }, fmtCount(a.executeAt - srvNow()))])
             : a.arrivalErr !== undefined && a.status === 'sent'
@@ -6450,7 +6458,7 @@
     const retrySel = f.method === 'ultra' || f.method === 'human';
     const retryOpts = retrySel ? el('div', {}, [
       numBox('jitter', 10, 3, 15, 'Aleatoriedad del juego (± s)', 'Empieza a probar estos segundos ANTES de lo ideal y sigue hasta estos segundos DESPUÉS (3–15)'),
-      f.method === 'human' ? numBox('humanDelay', 2, 1, 120, 'Espera entre intentos (s)', 'Tras cancelar, espera esto (y a que vuelvan las tropas) antes de volver a lanzar') : null
+      f.method === 'human' ? numBox('humanDelay', 2, 1, 120, 'Espera entre intentos (s)', 'Tras cancelar, espera esto con azar (−0,3 s a +0,5 s) y siempre a que vuelvan las tropas antes de volver a lanzar') : null
     ]) : null;
 
     // Horas aceptadas a mano (lista): la primera pasa a ser la hora de arriba.
@@ -7372,7 +7380,8 @@
         <li><b>Preciso</b>: un envío calculado al milisegundo. <b>Ultra</b> y <b>Humano</b>: envía y, si la llegada cae fuera del rango (o, sin «hasta», no es justo esa hora), cancela y reintenta hasta acertar.
         ${AUTO('Cada intento se busca en la <b>Vista general de órdenes</b> del juego (sirve desde cualquier ciudad): se mira su llegada real y solo se cancela <b>esa</b> orden, nunca la de otro ataque del tren. Antes de reintentar espera a que vuelvan <b>todas</b> las tropas. Después, la llegada de lo enviado se sigue comprobando con esa vista.')}</li>
         <li><b>Aleatoriedad (± s, 3–15)</b>: el juego mete unos segundos de azar en la llegada. Con Ultra/Humano el primer intento sale esos segundos <b>antes</b> de lo ideal y se sigue probando hasta esos segundos <b>después</b>, aunque un intento llegue tarde.</li>
-        <li><b>Espera entre intentos</b> (solo Humano): tras cancelar, cuántos segundos espera antes de volver a lanzar (y siempre a que vuelvan las tropas). Ultra reintenta en cuanto vuelven.</li></ul>` },
+        <li><b>Espera entre intentos</b> (solo Humano): tras cancelar, cuántos segundos espera antes de volver a lanzar (y siempre a que vuelvan las tropas). Ultra reintenta en cuanto vuelven.</li>
+        <li>En Humano esa espera lleva <b>azar</b>: entre 0,3 s menos y 0,5 s más cada vez (con 2 s: 2,05 · 1,92 · 2,34…), nunca el mismo tiempo exacto.</li></ul>` },
       { t: 'Plan y avisos', find: () => TQ.sel('.nb-plan', bodyEl), h: `
         <p>Viaje, hora de <b>salida</b> y de <b>llegada</b> calculadas con los datos del juego, y avisos: objetivo de tu alianza o con pacto, protección de principiante, <b>modo noche</b>, moral, <b>no caben en los barcos</b> (con botón para añadirlos), tropas que aún no tienes o ya usadas en otro ataque.</p>
         <p>Hueco de los barcos: Bote de transporte 26, Bote rápido 10, +6 cada uno con <b>Literas</b>. Cada tropa ocupa su población; voladoras y héroe no ocupan.</p>` },
@@ -7424,6 +7433,10 @@
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
     { v: '1.14.4', items: [
+      { t: 'Programados: rango de llegada', tab: 'ataques', before: () => { if (atk.view !== 'queue') { atk.view = 'queue'; return true; } }, find: () => TQ.card(/^Programados/) || TQ.tab('ataques'), h: `
+        <p>En <b>Programados</b>, los ataques con rango (o con horas a mano) muestran ahora <b>«Llega entre»</b> con todos los segundos que valen (p. ej. 21:18:05 – 21:18:07), en vez de solo el primero. Cuando ya se ha enviado, sale la llegada real.</p>` },
+      { t: 'Humano: espera con azar', tab: 'ataques', before: () => { if (atk.view !== 'new') { atk.view = 'new'; return true; } }, find: () => TQ.step(5) || TQ.tab('ataques'), h: `
+        <p>En modo <b>Humano</b>, la espera entre intentos que eliges lleva ahora un poco de azar: entre <b>0,3 s menos y 0,5 s más</b> cada vez (con 2 s: 2,05 · 1,92 · 2,34…). Así nunca se repite el mismo tiempo exacto. Siempre espera a que vuelvan las tropas.</p>` },
       { t: 'Empezar más tarde: siempre con cuenta atrás', tab: 'reclutamiento', find: () => TQ.card(/^Reclutamiento automático/) || TQ.tab('reclutamiento'), h: `
         <p>Todas las horas del panel (registros, inicio programado, colas…) se muestran ahora con la <b>hora del servidor</b>, como los ataques (que ya la usaban). Antes, quien juega desde otro país veía esas horas en la de su PC.</p>
         <p>Al activar <b>Empezar más tarde</b> empieza <b>ya</b> una cuenta atrás (10 min, o los últimos minutos que usaste). En la misma caja cambias los minutos (<b>Cambiar</b>) o pulsas <b>Empezar ya</b>. Ya no existe la espera «sin hora» que se quedaba parada: las ciudades que estaban así pasan a una cuenta atrás de 10 min.</p>` }
