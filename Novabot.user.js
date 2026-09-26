@@ -84,6 +84,9 @@
   const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
   const pos = (v, d = 0) => { const n = Math.round(+v); return Number.isFinite(n) && n >= 0 ? n : d; };
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // Hora en formato HH:MM:SS SIEMPRE con la hora del servidor del juego (no la del PC:
+  // un jugador en otro país veía horas de su zona). ms = hora local (Date.now()).
+  const srvClock = (ms) => { try { return fmtClock(+ms + clockOffset().off); } catch { return new Date(ms).toLocaleTimeString('es-ES'); } };
   const isPlainObj = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
   // Copia src dentro de dst sin cambiar dst de objeto (ni sus sub-objetos): quien tenga
   // una referencia a dst o a uno de sus sub-objetos sigue viendo los datos buenos.
@@ -1496,7 +1499,7 @@
       const seconds = anyBooty ? booty : base;
       farmRuntime.lastClaim = { at: Date.now(), booty: anyBooty, delay: randomDelayMs() };
       farmRuntime.nextCycleAt = Date.now() + seconds * 1000 + farmRuntime.lastClaim.delay;
-      farmLog(`Recogidas ${towns.length} ciudades de una vez (${Math.round(seconds / 60)} min). Próximo a las ${new Date(farmRuntime.nextCycleAt).toLocaleTimeString('es-ES')}.`, 'ok');
+      farmLog(`Recogidas ${towns.length} ciudades de una vez (${Math.round(seconds / 60)} min). Próximo a las ${srvClock(farmRuntime.nextCycleAt)}.`, 'ok');
     } catch (e) {
       farmRuntime.nextCycleAt = Date.now() + 60000;
       farmLog(`No se pudo recoger (${e.message}). Reintento en 1 min.`, 'error');
@@ -1562,7 +1565,7 @@
       return;
     }
     for (const entry of farmRuntime.log) {
-      const time = new Date(entry.at).toLocaleTimeString('es-ES');
+      const time = srvClock(entry.at);
       farmLogEl.appendChild(el('div', { class: `nb-log-item nb-log-${entry.kind}` }, `${time} · ${entry.text}`));
     }
   }
@@ -1607,7 +1610,7 @@
           if (lc && farmRuntime.nextCycleAt > Date.now()) {
             const secs = (lc.booty ? FARM_TIME_SETS.booty : FARM_TIME_SETS.normal)[clamp(i, 0, 3)];
             farmRuntime.nextCycleAt = lc.at + secs * 1000 + lc.delay;
-            farmLog(`Tiempo cambiado: próximo ciclo a las ${new Date(Math.max(Date.now(), farmRuntime.nextCycleAt)).toLocaleTimeString('es-ES')}.`, 'info');
+            farmLog(`Tiempo cambiado: próximo ciclo a las ${srvClock(Math.max(Date.now(), farmRuntime.nextCycleAt))}.`, 'info');
           }
           renderBody(); updateCountdown();
         }
@@ -2270,7 +2273,7 @@
         'Plata en ciudades: ', el('b', {}, fmt(plan.total)), ' · se deja: ', el('b', {}, fmt(plan.keep)),
         ' · se puede meter: ', el('b', {}, fmt(plan.budget)), ' · ya guardada: ', el('b', {}, fmt(totalStored))
       ]) : null,
-      el('div', { class: 'nb-row nb-mt' }, [el('span', { class: 'nb-row-label' }, caveRuntime.infoAt ? `Datos de las cuevas: ${new Date(caveRuntime.infoAt).toLocaleTimeString('es-ES')}` : 'Datos de las cuevas: sin leer'),
+      el('div', { class: 'nb-row nb-mt' }, [el('span', { class: 'nb-row-label' }, caveRuntime.infoAt ? `Datos de las cuevas: ${srvClock(caveRuntime.infoAt)}` : 'Datos de las cuevas: sin leer'),
         el('span', { class: 'nb-btn nb-btn-sm', onclick: () => refreshCaveInfo().then(() => renderIfIdle('cueva')).catch((e) => caveLog(e.message, 'error')) }, 'Actualizar')]),
       el('div', { class: 'nb-mt' }, [list])
     ]));
@@ -2601,7 +2604,7 @@
       return;
     }
     for (const e of buildRuntime.log) {
-      buildLogEl.appendChild(el('div', { class: `nb-log-item nb-log-${e.kind}` }, `${new Date(e.at).toLocaleTimeString('es-ES')} · ${e.text}`));
+      buildLogEl.appendChild(el('div', { class: `nb-log-item nb-log-${e.kind}` }, `${srvClock(e.at)} · ${e.text}`));
     }
   }
 
@@ -4080,7 +4083,7 @@
     if (!tradeLogEl) return;
     tradeLogEl.innerHTML = '';
     if (!tradeRuntime.log.length) { tradeLogEl.appendChild(el('p', { class: 'nb-placeholder' }, 'Sin actividad todavía.')); return; }
-    for (const e of tradeRuntime.log) tradeLogEl.appendChild(el('div', { class: `nb-log-item nb-log-${e.kind}` }, `${new Date(e.at).toLocaleTimeString('es-ES')} · ${e.text}`));
+    for (const e of tradeRuntime.log) tradeLogEl.appendChild(el('div', { class: `nb-log-item nb-log-${e.kind}` }, `${srvClock(e.at)} · ${e.text}`));
   }
 
   function renderComercioTab() {
@@ -4436,7 +4439,7 @@
       const kinds = [...new Set(pending.map((r) => (isNavalUnit(r.id) ? 'naval' : 'ground')))];
       const next = Math.min(...kinds.map((k) => unitQueueNextFree(townId, k) || Infinity));
       return { rows: pending, units: {}, cost: { wood: 0, stone: 0, iron: 0 }, queueFull: true, nextFree: Number.isFinite(next) ? next : 0,
-        reason: `Cola de reclutamiento llena${Number.isFinite(next) ? ` hasta ${new Date(next).toLocaleTimeString('es-ES')}` : ''}: no se piden recursos.` };
+        reason: `Cola de reclutamiento llena${Number.isFinite(next) ? ` hasta ${srvClock(next)}` : ''}: no se piden recursos.` };
     }
     rows.splice(0, rows.length, ...open);
     const pick = rows.find((r) => r.fit > 0 && r.rem >= r.fit)   // falta al menos un lote completo
@@ -4803,7 +4806,7 @@
     if (!recruitLogEl) return;
     recruitLogEl.innerHTML = '';
     if (!recruitRuntime.log.length) { recruitLogEl.appendChild(el('p', { class: 'nb-placeholder' }, 'Sin actividad todavía.')); return; }
-    for (const e of recruitRuntime.log) recruitLogEl.appendChild(el('div', { class: `nb-log-item nb-log-${e.kind}` }, `${new Date(e.at).toLocaleTimeString('es-ES')} · ${e.text}`));
+    for (const e of recruitRuntime.log) recruitLogEl.appendChild(el('div', { class: `nb-log-item nb-log-${e.kind}` }, `${srvClock(e.at)} · ${e.text}`));
   }
 
   function renderReclutamientoTab() {
@@ -4846,12 +4849,12 @@
       if (!recruitOnFor(townId)) t.enabled = true;
       delete startDrafts[townId];
       saveState(); renderBody();
-      recruitLog(`${farmTownName(townId)}: reclutamiento programado para dentro de ${min} min (${new Date(t.startAt).toLocaleTimeString('es-ES')}).`, 'ok');
+      recruitLog(`${farmTownName(townId)}: reclutamiento programado para dentro de ${min} min (${srvClock(t.startAt)}).`, 'ok');
     };
     delayIn.addEventListener('keydown', (e) => { if (e.key === 'Enter') program(); });
     const startBox = scheduled
       ? el('div', { class: 'nb-alert nb-alert-info' }, [
-          el('span', {}, ['Empieza en ', el('b', { 'data-nb-until': Math.round(tcfg.startAt / 1000) }, formatLeft(Math.round(tcfg.startAt / 1000))), ` (${new Date(tcfg.startAt).toLocaleTimeString('es-ES')})`]),
+          el('span', {}, ['Empieza en ', el('b', { 'data-nb-until': Math.round(tcfg.startAt / 1000) }, formatLeft(Math.round(tcfg.startAt / 1000))), ` (${srvClock(tcfg.startAt)})`]),
           el('span', { class: 'nb-stepper' }, [delayIn, el('span', { class: 'nb-add-level' }, 'min'),
             el('span', { class: 'nb-btn nb-btn-sm', title: 'Poner la cuenta atrás a estos minutos desde ahora', onclick: program }, 'Cambiar'),
             el('span', { class: 'nb-btn nb-btn-sm', title: 'Quitar la espera: empieza a reclutar ya', onclick: () => { const t = T(); delete t.startAt; delete t.hold; saveState(); renderBody(); recruitLog(`${farmTownName(townId)}: inicio programado cancelado (recluta ya).`); } }, 'Empezar ya')])
@@ -4871,7 +4874,7 @@
           delete t.hold; t.startAt = Date.now() + min * 60000;
           if (!recruitOnFor(townId)) t.enabled = true;
           saveState(); renderBody();
-          recruitLog(`${farmTownName(townId)}: empezará dentro de ${min} min (${new Date(t.startAt).toLocaleTimeString('es-ES')}).`, 'ok');
+          recruitLog(`${farmTownName(townId)}: empezará dentro de ${min} min (${srvClock(t.startAt)}).`, 'ok');
         });
 
     const fillIn = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '10', max: '100', value: cfg.fillPct });
@@ -4962,7 +4965,7 @@
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
       el('div', { class: 'nb-card-title' }, 'Siguiente lote'),
       recruitRuntime.wait.get(townId) ? el('div', { class: 'nb-alert nb-alert-warn' }, recruitRuntime.wait.get(townId)) : null,
-      scheduled ? el('div', { class: 'nb-countdown' }, [el('span', {}, 'Empieza a reclutar en'), el('b', { 'data-nb-until': Math.round(tcfg.startAt / 1000) }, formatLeft(Math.round(tcfg.startAt / 1000))), el('small', {}, new Date(tcfg.startAt).toLocaleTimeString('es-ES'))])
+      scheduled ? el('div', { class: 'nb-countdown' }, [el('span', {}, 'Empieza a reclutar en'), el('b', { 'data-nb-until': Math.round(tcfg.startAt / 1000) }, formatLeft(Math.round(tcfg.startAt / 1000))), el('small', {}, srvClock(tcfg.startAt))])
         : tcfg.hold ? el('div', { class: 'nb-alert nb-alert-warn' }, 'En espera: no pide recursos. Pon los minutos y pulsa Programar.') : null,
       ...heroNotes,
       lotBox
@@ -5979,7 +5982,7 @@
   function paintLog(box, list) {
     box.innerHTML = '';
     if (!list.length) { box.appendChild(el('p', { class: 'nb-placeholder' }, 'Sin actividad todavía.')); return; }
-    for (const e of list) box.appendChild(el('div', { class: `nb-log-item nb-log-${e.kind}` }, `${new Date(e.at).toLocaleTimeString('es-ES')} · ${e.text}`));
+    for (const e of list) box.appendChild(el('div', { class: `nb-log-item nb-log-${e.kind}` }, `${srvClock(e.at)} · ${e.text}`));
   }
 
   // ---------- UI ----------
@@ -7422,6 +7425,7 @@
   const TOUR_NEWS = [
     { v: '1.14.4', items: [
       { t: 'Empezar más tarde: siempre con cuenta atrás', tab: 'reclutamiento', find: () => TQ.card(/^Reclutamiento automático/) || TQ.tab('reclutamiento'), h: `
+        <p>Todas las horas del panel (registros, inicio programado, colas…) se muestran ahora con la <b>hora del servidor</b>, como los ataques (que ya la usaban). Antes, quien juega desde otro país veía esas horas en la de su PC.</p>
         <p>Al activar <b>Empezar más tarde</b> empieza <b>ya</b> una cuenta atrás (10 min, o los últimos minutos que usaste). En la misma caja cambias los minutos (<b>Cambiar</b>) o pulsas <b>Empezar ya</b>. Ya no existe la espera «sin hora» que se quedaba parada: las ciudades que estaban así pasan a una cuenta atrás de 10 min.</p>` }
     ] },
     { v: '1.14.3', items: [
@@ -8014,7 +8018,7 @@
       } else {
         cloud.gistAt = g.updated_at || '';
         cloudSaveBase(remote);
-        cloud.status = changedHere ? `Cargado de la nube (${new Date(+r.updatedAt).toLocaleTimeString('es-ES')})` : 'Sincronizado';
+        cloud.status = changedHere ? `Cargado de la nube (${srvClock(+r.updatedAt)})` : 'Sincronizado';
       }
       // Si algo cambió aquí mientras se sincronizaba, queda pendiente para la siguiente.
       if ((cloud.gen || 0) === gen0) { cloud.dirty = false; gmSet(acctKey('nb_cloud_dirty_at'), 0); }
@@ -8084,7 +8088,7 @@
   function paintCloudStatus() {
     if (!cloudStatusEl) return;
     cloudStatusEl.textContent = cloud.error ? `Error: ${cloud.error}` : cloud.busy ? 'Sincronizando…' : cloud.dirty ? 'Cambios pendientes de subir…'
-      : (cloud.status || 'Sincronizado') + (cloud.lastPull ? ` · última comprobación ${new Date(Math.max(cloud.lastPull, cloud.lastPush)).toLocaleTimeString('es-ES')}` : '');
+      : (cloud.status || 'Sincronizado') + (cloud.lastPull ? ` · última comprobación ${srvClock(Math.max(cloud.lastPull, cloud.lastPush))}` : '');
     cloudStatusEl.className = `nb-goal-sub${cloud.error ? ' nb-err' : ''}`;
   }
   function renderCloudCard() {
