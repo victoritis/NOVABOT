@@ -498,8 +498,8 @@
      falta, el lote siguiente (y si está listo), colas y hechizos. Solo lectura. */
   function renderResumenRecruit() {
     if (overviewReady()) for (const id of allTownIds()) pruneRecruitGoals(id);
-    const towns = allTownIds().filter((id) => townRecruitCfg(id).goals.length)
-      .sort((a, b) => farmTownName(a).localeCompare(farmTownName(b), 'es'));
+    // En el orden de la cola de reclutamiento (el que eliges con ▲▼).
+    const towns = allTownIds().filter((id) => townRecruitCfg(id).goals.length).sort(recruitQueueCmp);
     const limit = buildQueueLimit();
     let pendingUnits = 0, readyLots = 0, waiting = 0;
     const cards = towns.map((id) => {
@@ -582,7 +582,7 @@
       let pos = 0;
       const rows = ordered.map((id, i) => {
         const inc = recruitIncluded(id) && recruitOnFor(id);
-        const tag = !inc ? 'desactivada' : recruitWaiting(id) ? 'en espera (hora)' : turn.has(id) ? '● reclutando' : `en cola${limited ? ` (${++pos}º)` : ''}`;
+        const tag = !inc ? 'desactivada' : recruitWaiting(id) ? 'en espera (hora)' : turn.has(id) ? '● reclutando' : recruitBenched.has(id) ? 'apartada: sin favor para hechizo (vuelve a probar al acabar otra)' : `en cola${limited ? ` (${++pos}º)` : ''}`;
         const sw = switchEl(recruitIncluded(id), (v) => { rc.excluded = { ...(rc.excluded || {}) }; if (v) delete rc.excluded[id]; else rc.excluded[id] = true; recruitTurnMemo.at = 0; saveState(); renderBody(); recruitLog(`${farmTownName(id)}: reclutamiento ${v ? 'activado' : 'desactivado'} en la cola.`); });
         return el('div', { class: 'nb-row' }, [
           el('span', { class: 'nb-row-label' }, [el('b', {}, `${i + 1}. ${farmTownName(id)}`), el('span', { class: `nb-ov-dim${turn.has(id) ? ' nb-ok' : ''}`, style: 'margin-left:8px' }, tag)]),
@@ -4310,16 +4310,31 @@
     const ia = q.indexOf(+a), ib = q.indexOf(+b);
     return ((ia < 0 ? 1e9 : ia) - (ib < 0 ? 1e9 : ib)) || farmTownName(a).localeCompare(farmTownName(b), 'es');
   }
+  /* Ciudad en turno que NO puede reclutar por un hechizo obligatorio sin favor: cede su
+     sitio (queda "apartada" en cabeza de la cola) y entra la siguiente. Cuando otra ciudad
+     acaba TODO lo que tenía pedido, las apartadas se vuelven a probar (primero ellas). */
+  const recruitBenched = new Map(); // townId -> motivo
+  function recruitBench(townId, why) {
+    if (!(+state.reclutamiento.maxActive > 0) || recruitBenched.has(+townId)) return;
+    if (!recruitActiveTurn.includes(+townId)) return;
+    recruitBenched.set(+townId, why);
+    recruitTurnMemo.at = 0;
+    recruitLog(`${farmTownName(townId)}: cede su turno (${why.split(':')[0]}); entra la siguiente de la cola. Se vuelve a probar cuando otra ciudad acabe.`, 'info');
+  }
   function recruitTurnSet() {
     if (Date.now() - recruitTurnMemo.at < 1000 && recruitTurnMemo.set) return recruitTurnMemo.set;
     const cfg = state.reclutamiento;
     const max = Math.max(0, Math.floor(+cfg.maxActive || 0));
     const cand = allTownIds().filter((id) => recruitOnFor(id) && recruitIncluded(id) && !recruitWaiting(id) && (cfg.towns[id]?.goals || []).length);
     let set;
-    if (!max) set = new Set(cand);
+    if (!max) { set = new Set(cand); recruitBenched.clear(); }
     else {
-      const prev = recruitActiveTurn.filter((id) => cand.includes(id));
-      const rest = cand.filter((id) => !prev.includes(id)).sort(recruitQueueCmp);
+      // ¿Alguna de las que reclutaban ha acabado todo lo pedido? → volver a probar las apartadas.
+      if (recruitActiveTurn.some((id) => !(cfg.towns[id]?.goals || []).length) && recruitBenched.size) recruitBenched.clear();
+      for (const id of [...recruitBenched.keys()]) if (!cand.includes(id)) recruitBenched.delete(id);
+      const prev = recruitActiveTurn.filter((id) => cand.includes(id) && !recruitBenched.has(id));
+      const benchedFirst = (a, b) => ((recruitBenched.has(b) ? 1 : 0) - (recruitBenched.has(a) ? 1 : 0)) || recruitQueueCmp(a, b);
+      const rest = cand.filter((id) => !prev.includes(id) && !recruitBenched.has(id)).sort(benchedFirst);
       const list = [...prev, ...rest].slice(0, max);
       recruitActiveTurn = list; // (solo en memoria: no se guarda, así nunca pisa lo guardado)
       set = new Set(list);
@@ -4327,6 +4342,7 @@
     recruitTurnMemo = { at: Date.now(), set };
     return set;
   }
+
   const recruitHasTurn = (townId) => recruitTurnSet().has(+townId);
   const recruitEnabledFor = (townId) => recruitOnFor(townId) && recruitIncluded(townId) && !recruitWaiting(townId) && recruitHasTurn(townId);
   const anyRecruitOn = () => allTownIds().some(recruitOnFor);
@@ -4683,7 +4699,7 @@
         if (b0 && !b0.reason) {
           const kinds = [...new Set(Object.keys(b0.units).map((u) => (isNavalUnit(u) ? 'naval' : 'ground')))];
           const why = recruitSpellBlock(townId, kinds, Date.now() + eta0 * 1000);
-          if (why) { if (recruitRuntime.wait.get(townId) !== why) recruitRuntime.wait.set(townId, why); continue; }
+          if (why) { if (recruitRuntime.wait.get(townId) !== why) recruitRuntime.wait.set(townId, why); recruitBench(townId, why); continue; }
           if (/^Sin favor de /.test(recruitRuntime.wait.get(townId) || '')) recruitRuntime.wait.delete(townId);
         }
       }
@@ -4959,7 +4975,7 @@
       const setWait = (why) => { if (recruitRuntime.wait.get(townId) !== why) { recruitRuntime.wait.set(townId, why); renderIfIdle('reclutamiento'); } };
       const lotKinds = [...new Set(Object.entries(b.units).filter(([, n]) => n > 0).map(([u]) => (isNavalUnit(u) ? 'naval' : 'ground')))];
       const plan = await planRecruitSpells(townId, lotKinds);
-      if (plan.wait) { setWait(plan.wait); continue; }
+      if (plan.wait) { setWait(plan.wait); if (/^Esperando favor/.test(plan.wait)) recruitBench(townId, plan.wait); continue; }
       if (plan.cast.length) {
         // Hay que gastar favor: antes, el juego confirma que el lote entra YA (si los
         // recursos aún vienen de camino, se espera sin lanzar nada).
@@ -7664,7 +7680,7 @@
       { t: 'Hechizo obligatorio sin favor: no se mandan recursos', tab: 'reclutamiento', find: () => TQ.card(/^Hechizos de reclutamiento/) || TQ.tab('reclutamiento'), h: `
         <p>Si una ciudad tiene un hechizo de reclutamiento <b>obligatorio</b> y no habrá favor para lanzarlo cuando lleguen los recursos (se calcula con lo que produce el dios), ya no se le mandan ni reservan recursos: no podría reclutar. En cuanto vaya a haber favor, se le vuelve a abastecer.</p>` },
       { t: 'Reclutar por turnos', tab: 'resumen', before: () => { if (state.resumenView !== 'reclutamiento') { state.resumenView = 'reclutamiento'; return true; } }, find: () => TQ.sel('.nb-rc-stats', bodyEl) || TQ.tab('resumen'), h: `
-        <p>En <b>Vista general → Reclutamiento</b> hay una <b>cola de reclutamiento</b>: eliges <b>cuántas ciudades reclutan a la vez</b> (todas, 1, 2, 3…), el <b>orden</b> con ▲▼ y con el interruptor de cada una si recluta (activado por defecto). Las que reclutan (●) siguen hasta acabar lo pedido y entonces entra la siguiente de la cola; las demás esperan sin pedir ni reservar recursos.</p>` },
+        <p>En <b>Vista general → Reclutamiento</b> hay una <b>cola de reclutamiento</b>: eliges <b>cuántas ciudades reclutan a la vez</b> (todas, 1, 2, 3…), el <b>orden</b> con ▲▼ y con el interruptor de cada una si recluta (activado por defecto). Las que reclutan (●) siguen hasta acabar lo pedido y entonces entra la siguiente de la cola; las demás esperan sin pedir ni reservar recursos. Si una en turno no puede reclutar porque falta favor para un hechizo <b>obligatorio</b>, cede su sitio a la siguiente y queda apartada en cabeza de la cola: se vuelve a probar en cuanto otra ciudad acabe todo lo suyo.</p>` },
       { t: 'Ataques desde cualquier PC', tab: 'ataques', find: () => TQ.tab('ataques'), h: `
         <p>Con la nube, los ataques programados en otro PC ya los envía el que tenga el juego abierto (una cuenta solo puede estar en un PC a la vez).</p>` },
       { t: 'Si falta plata, cambiar por plata', tab: 'granjas', find: () => TQ.card(/^Intercambio con aldeas/) || TQ.tab('granjas'), h: `
