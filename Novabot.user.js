@@ -511,7 +511,7 @@
       const now = Date.now();
       let st, cls;
       if (!recruitOnFor(id)) { st = 'Desactivado'; cls = 'off'; }
-      else if (!recruitIncluded(id)) { st = 'No incluida (desmarcada)'; cls = 'off'; }
+      else if (!recruitIncluded(id)) { st = 'Desactivada en la cola'; cls = 'off'; }
       else if (!recruitWaiting(id) && !recruitHasTurn(id)) { st = 'Esperando turno'; cls = 'wait'; }
       else if (cfg.hold) { st = 'En espera SIN hora (no empieza sola)'; cls = 'wait'; }
       else if (+cfg.startAt > now) { st = ['Empieza en ', el('b', { 'data-nb-until': Math.round(cfg.startAt / 1000) }, formatLeft(Math.round(cfg.startAt / 1000)))]; cls = 'wait'; }
@@ -564,22 +564,58 @@
         el('div', { class: 'nb-rc-foot' }, [qInfo(false), qInfo(true), spells.length ? el('span', { class: 'nb-rc-spells' }, spells) : null])
       ]);
     });
-    // Turnos: cuántas a la vez y cuáles reclutan.
+    // Cola de ciudades: cuántas reclutan a la vez, en qué orden y cuáles (interruptor).
     {
       const rc = state.reclutamiento;
       const sel = el('select', { class: 'nb-input nb-input-inline' });
       for (const v of [0, 1, 2, 3, 4, 5, 6, 8, 10]) { const o = el('option', { value: v }, v ? String(v) : 'Todas'); if ((+rc.maxActive || 0) === v) o.selected = true; sel.appendChild(o); }
       sel.addEventListener('change', () => { rc.maxActive = +sel.value; recruitTurnMemo.at = 0; saveState(); renderBody(); recruitLog(`Ciudades reclutando a la vez: ${+sel.value || 'todas'}.`); });
       const turn = recruitTurnSet();
-      const chips = towns.map((id) => {
-        const cb = el('input', { type: 'checkbox' }); cb.checked = recruitIncluded(id);
-        cb.addEventListener('change', () => { rc.excluded = { ...(rc.excluded || {}) }; if (cb.checked) delete rc.excluded[id]; else rc.excluded[id] = true; recruitTurnMemo.at = 0; saveState(); renderBody(); });
-        return el('label', { class: 'nb-res', style: 'cursor:pointer;margin-right:10px' }, [cb, ` ${farmTownName(id)}${turn.has(id) && (+rc.maxActive || 0) ? ' ●' : ''}`]);
+      const ordered = towns.slice().sort(recruitQueueCmp);
+      const move = (id, d) => {
+        const list = ordered.slice(); const i = list.indexOf(id), j = i + d;
+        if (j < 0 || j >= list.length) return;
+        [list[i], list[j]] = [list[j], list[i]];
+        rc.queueOrder = list; recruitTurnMemo.at = 0; saveState(); renderBody();
+      };
+      const limited = (+rc.maxActive || 0) > 0;
+      let pos = 0;
+      const rows = ordered.map((id, i) => {
+        const inc = recruitIncluded(id) && recruitOnFor(id);
+        const tag = !inc ? 'desactivada' : recruitWaiting(id) ? 'en espera (hora)' : turn.has(id) ? '● reclutando' : `en cola${limited ? ` (${++pos}º)` : ''}`;
+        const sw = switchEl(recruitIncluded(id), (v) => { rc.excluded = { ...(rc.excluded || {}) }; if (v) delete rc.excluded[id]; else rc.excluded[id] = true; recruitTurnMemo.at = 0; saveState(); renderBody(); recruitLog(`${farmTownName(id)}: reclutamiento ${v ? 'activado' : 'desactivado'} en la cola.`); });
+        return el('div', { class: 'nb-row' }, [
+          el('span', { class: 'nb-row-label' }, [el('b', {}, `${i + 1}. ${farmTownName(id)}`), el('span', { class: `nb-ov-dim${turn.has(id) ? ' nb-ok' : ''}`, style: 'margin-left:8px' }, tag)]),
+          el('span', { class: 'nb-stepper' }, [
+            el('span', { class: `nb-mini${i === 0 ? ' nb-mini-off' : ''}`, title: 'Subir en la cola', onclick: () => move(id, -1) }, '▲'),
+            el('span', { class: `nb-mini${i === ordered.length - 1 ? ' nb-mini-off' : ''}`, title: 'Bajar en la cola', onclick: () => move(id, 1) }, '▼'),
+            sw
+          ])
+        ]);
       });
       bodyEl.appendChild(el('div', { class: 'nb-card' }, [
-        el('div', { class: 'nb-row' }, [el('div', { class: 'nb-option-text' }, [el('span', { class: 'nb-option-label' }, 'Ciudades reclutando a la vez'), el('span', { class: 'nb-option-hint' }, 'Las que están en turno (●) siguen hasta acabar; luego entra la siguiente. Las demás esperan sin pedir recursos')]), sel]),
-        towns.length ? el('div', { class: 'nb-res-list nb-mt' }, chips) : null,
-        el('p', { class: 'nb-placeholder' }, 'Marcadas = reclutan con el bot (todas por defecto). Desmarca las que no quieras que recluten ahora.')
+        el('div', { class: 'nb-row' }, [el('div', { class: 'nb-option-text' }, [el('span', { class: 'nb-option-label' }, 'Ciudades reclutando a la vez'), el('span', { class: 'nb-option-hint' }, 'Con un máximo, van por turnos en el orden de la cola: cuando una acaba, entra la siguiente')]), sel]),
+        el('div', { class: 'nb-card-title nb-mt' }, 'Cola de reclutamiento'),
+        ...(rows.length ? rows : [el('p', { class: 'nb-placeholder' }, 'Ninguna ciudad tiene tropas pedidas.')]),
+        el('p', { class: 'nb-placeholder' }, 'Interruptor activado (por defecto) = recluta con el bot; desactivado = no recluta ni pide recursos. ▲▼ = orden de la cola. Las que están reclutando siguen hasta acabar.')
+      ]));
+    }
+    // Quitados hace poco (cumplidos: lo que faltaba ya está en la cola del juego o hecho).
+    {
+      const rc = state.reclutamiento;
+      const list = (rc.removed || []).filter((r) => Date.now() - r.at < 24 * 3600000).slice().reverse();
+      if (list.length) bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+        el('div', { class: 'nb-card-title' }, `Quitados hace poco (${list.length})`),
+        ...list.map((r) => el('div', { class: 'nb-row' }, [
+          el('span', { class: 'nb-row-label' }, `${farmTownName(r.townId)} · ${r.target} ${unitName(r.id)} · ${srvClock(r.at)}`),
+          el('span', { class: 'nb-btn nb-btn-sm', title: 'Volver a ponerlo en el bot (si faltan, se reclutan)', onclick: () => {
+            const t = townRecruitCfg(r.townId); const g = t.goals.find((x) => x.id === r.id);
+            if (g) g.target = Math.max(g.target, r.target); else t.goals.push({ id: r.id, target: r.target });
+            rc.removed = (rc.removed || []).filter((x) => x !== r && !(x.townId === r.townId && x.id === r.id && x.at === r.at));
+            saveState(); renderBody(); recruitLog(`${farmTownName(r.townId)}: devuelto ${r.target} ${unitName(r.id)} al bot.`, 'ok');
+          } }, 'Devolver')
+        ])),
+        el('p', { class: 'nb-placeholder' }, 'Se quitan solos cuando lo que faltaba ya está en la cola del juego (o hecho). Si los devuelves y ya están todos, se volverán a quitar; si murieron tropas, se reclutan.')
       ]));
     }
     bodyEl.appendChild(el('div', { class: 'nb-stats nb-rc-stats' }, [
@@ -4266,7 +4302,14 @@
      turno siguen hasta acabar lo pedido; cuando una acaba (o la quitas), entra la siguiente.
      Las que esperan turno no reclutan ni piden ni reservan recursos. */
   const recruitIncluded = (townId) => !state.reclutamiento.excluded?.[townId];
-  let recruitTurnMemo = { at: 0, set: null };
+  let recruitTurnMemo = { at: 0, set: null }, recruitActiveTurn = [];
+  // Orden de la cola (lo eliges con ▲▼ en Vista general → Reclutamiento); las que no están
+  // en la lista van detrás, por nombre.
+  function recruitQueueCmp(a, b) {
+    const q = (state.reclutamiento.queueOrder || []).map(Number);
+    const ia = q.indexOf(+a), ib = q.indexOf(+b);
+    return ((ia < 0 ? 1e9 : ia) - (ib < 0 ? 1e9 : ib)) || farmTownName(a).localeCompare(farmTownName(b), 'es');
+  }
   function recruitTurnSet() {
     if (Date.now() - recruitTurnMemo.at < 1000 && recruitTurnMemo.set) return recruitTurnMemo.set;
     const cfg = state.reclutamiento;
@@ -4275,10 +4318,10 @@
     let set;
     if (!max) set = new Set(cand);
     else {
-      const prev = (Array.isArray(cfg.activeTurn) ? cfg.activeTurn : []).map(Number).filter((id) => cand.includes(id));
-      const rest = cand.filter((id) => !prev.includes(id)).sort((a, b) => farmTownName(a).localeCompare(farmTownName(b), 'es'));
+      const prev = recruitActiveTurn.filter((id) => cand.includes(id));
+      const rest = cand.filter((id) => !prev.includes(id)).sort(recruitQueueCmp);
       const list = [...prev, ...rest].slice(0, max);
-      if (JSON.stringify(list) !== JSON.stringify(cfg.activeTurn || [])) { cfg.activeTurn = list; try { saveState(); } catch {} }
+      recruitActiveTurn = list; // (solo en memoria: no se guarda, así nunca pisa lo guardado)
       set = new Set(list);
     }
     recruitTurnMemo = { at: Date.now(), set };
@@ -4873,6 +4916,9 @@
     const done = cfg.goals.filter((g) => (+have[g.id] || 0) + (+queued[g.id] || 0) >= g.target && !goalMetOnlyByFlight(townId, g, have, queued));
     if (!done.length) return;
     cfg.goals = cfg.goals.filter((g) => !done.includes(g));
+    // Se apuntan (con botón para devolverlos en Vista general → Reclutamiento).
+    const rm = state.reclutamiento.removed = [...(state.reclutamiento.removed || []), ...done.map((g) => ({ townId: +townId, id: g.id, target: g.target, at: Date.now() }))].slice(-20);
+    void rm;
     saveState();
     recruitLog(`${farmTownName(townId)}: ${done.map((g) => `${g.target} ${unitName(g.id)}`).join(', ')} ya en cola del juego o hechas (se quita del bot).`, 'ok');
   }
@@ -7323,7 +7369,7 @@
     // ------------------------------------------------------------------ Granjas
     add('Granjas', 'granjas', [
       { t: 'Granjas (aldeas)', find: () => TQ.tab('granjas'), h: `<p>Recolecta recursos de las <b>aldeas</b> de todas tus islas y cambia recursos con ellas.</p>
-        <p>Arriba eliges <b>cuántas ciudades reclutan a la vez</b> y <b>cuáles</b> (todas marcadas por defecto). Las que esperan turno salen como «Esperando turno».</p>` },
+        <p>Arriba está la <b>cola de reclutamiento</b>: cuántas ciudades reclutan a la vez, su orden (▲▼) y un interruptor por ciudad (activado por defecto; desactivado = no recluta). Las que esperan salen como «Esperando turno».</p>` },
       { t: 'Recolección automática', find: () => TQ.card(/^Recolección automática/), h: `
         <p>Enciéndelo y el bot recolecta todas tus aldeas en cuanto están listas. Debajo, la <b>cuenta atrás</b> hasta la próxima recolección.</p>
         ${AUTO(`<ul>
@@ -7613,10 +7659,12 @@
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
     { v: '1.14.6', items: [
+      { t: 'Quitados hace poco', tab: 'resumen', before: () => { if (state.resumenView !== 'reclutamiento') { state.resumenView = 'reclutamiento'; return true; } }, find: () => TQ.card(/^Quitados hace poco/) || TQ.tab('resumen'), h: `
+        <p>En Vista general → Reclutamiento salen las tropas que el bot quitó por estar cumplidas (lo que faltaba ya estaba en la cola del juego), con un botón <b>Devolver</b>.</p>` },
       { t: 'Hechizo obligatorio sin favor: no se mandan recursos', tab: 'reclutamiento', find: () => TQ.card(/^Hechizos de reclutamiento/) || TQ.tab('reclutamiento'), h: `
         <p>Si una ciudad tiene un hechizo de reclutamiento <b>obligatorio</b> y no habrá favor para lanzarlo cuando lleguen los recursos (se calcula con lo que produce el dios), ya no se le mandan ni reservan recursos: no podría reclutar. En cuanto vaya a haber favor, se le vuelve a abastecer.</p>` },
       { t: 'Reclutar por turnos', tab: 'resumen', before: () => { if (state.resumenView !== 'reclutamiento') { state.resumenView = 'reclutamiento'; return true; } }, find: () => TQ.sel('.nb-rc-stats', bodyEl) || TQ.tab('resumen'), h: `
-        <p>En <b>Vista general → Reclutamiento</b>: eliges <b>cuántas ciudades reclutan a la vez</b> (todas, 1, 2, 3…) y <b>cuáles</b> (casillas, todas marcadas por defecto). Las que están en turno (●) siguen hasta acabar lo pedido y entonces entra la siguiente; las demás esperan sin pedir ni reservar recursos.</p>` },
+        <p>En <b>Vista general → Reclutamiento</b> hay una <b>cola de reclutamiento</b>: eliges <b>cuántas ciudades reclutan a la vez</b> (todas, 1, 2, 3…), el <b>orden</b> con ▲▼ y con el interruptor de cada una si recluta (activado por defecto). Las que reclutan (●) siguen hasta acabar lo pedido y entonces entra la siguiente de la cola; las demás esperan sin pedir ni reservar recursos.</p>` },
       { t: 'Ataques desde cualquier PC', tab: 'ataques', find: () => TQ.tab('ataques'), h: `
         <p>Con la nube, los ataques programados en otro PC ya los envía el que tenga el juego abierto (una cuenta solo puede estar en un PC a la vez).</p>` },
       { t: 'Si falta plata, cambiar por plata', tab: 'granjas', find: () => TQ.card(/^Intercambio con aldeas/) || TQ.tab('granjas'), h: `
