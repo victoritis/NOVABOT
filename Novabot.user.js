@@ -776,13 +776,13 @@
       // Ataques del bot que salen de esta ciudad
       const atks = atk.queue.filter((a) => +a.source === id && a.status === 'pending').sort((a, b) => a.executeAt - b.executeAt);
       const attacks = el('div', { class: 'nb-ov-cell' }, [atks.length ? el('div', {}, [el('span', { class: 'nb-ov-count' }, String(atks.length)), ' · sale ', el('b', { 'data-atk-at': atks[0].executeAt }, fmtCount(atks[0].executeAt - srvNow()))]) : dim('—')]);
-      // Recursos: % del almacén de cada uno (y la cantidad). ≥ 90 % en amarillo.
+      // Recursos: % del almacén de cada uno (y la cantidad). ≥ 90 % en amarillo, ≥ 95 % (o lleno) en rojo.
       const rs = townResources(id), cap = townStorage(id) || 0;
       const kfmt = (n) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(Math.floor(n)));
       const resources = el('div', { class: 'nb-ov-cell' }, RES.map((k) => {
         const pct = cap ? Math.min(100, Math.floor(rs[k] / cap * 100)) : null;
         return el('div', { title: `${Math.floor(rs[k]).toLocaleString('es-ES')}${cap ? ` de ${cap.toLocaleString('es-ES')}` : ''}` }, [resIcon(k),
-          el('span', { class: `nb-ov-count${pct >= 90 ? ' nb-warn-txt' : ''}` }, pct == null ? '—' : `${pct} %`), dim(kfmt(rs[k]))]);
+          el('span', { class: `nb-ov-count${pct >= 90 && pct < 95 ? ' nb-warn-txt' : ''}`, style: pct >= 95 ? 'color:#e5484d' : '' }, pct == null ? '—' : `${pct} %`), dim(kfmt(rs[k]))]);
       }));
       const cur = +UW.Game?.townId === id;
       return el('tr', { class: cur ? 'nb-ov-current' : '' }, [
@@ -7192,7 +7192,7 @@
         <p>Arriba eliges la vista: <b>Ciudades</b> (una fila por ciudad) o lo que lleva el bot en <b>Construcción</b>, <b>Investigación</b> y <b>Reclutamiento</b>, ciudad a ciudad.</p>` },
       { t: 'Ciudades', find: () => TQ.card(/^Vista general/), wide: true, h: `
         <p>Una fila por ciudad (la tuya resaltada):</p>
-        <ul><li><b>Recursos</b>: madera, piedra y plata en <b>% del almacén</b> (en amarillo desde el 90 %) y la cantidad.</li>
+        <ul><li><b>Recursos</b>: madera, piedra y plata en <b>% del almacén</b> (amarillo desde el 90 %, <b>rojo</b> desde el 95 % o lleno) y la cantidad.</li>
         <li><b>Construcción</b>: órdenes en la cola del juego / huecos y lo primero que termina; cuántos objetivos tiene el bot.</li>
         <li><b>Reclutamiento</b>: cola del Cuartel y del Puerto y el estado del bot en esa ciudad.</li>
         <li><b>Festival</b>: en curso (cuenta atrás) o si puede hacerlo.</li>
@@ -7499,6 +7499,8 @@
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
     { v: '1.14.5', items: [
+      { t: 'Vista general: recursos en rojo', tab: 'resumen', before: () => { if ((state.resumenView || 'ciudades') !== 'ciudades') { state.resumenView = 'ciudades'; return true; } }, find: () => TQ.card(/^Vista general/) || TQ.tab('resumen'), h: `
+        <p>En la columna <b>Recursos</b>, el % sale en <b>rojo</b> desde el 95 % (o lleno), en amarillo desde el 90 %.</p>` },
       { t: 'Construcción sin intercalar: en orden de verdad', tab: 'construccion', find: () => TQ.tab('construccion'), h: `
         <p>Sin <b>Intercalar edificios</b>, si al primer edificio de la lista le faltaban recursos, el bot saltaba al siguiente (y parecía que intercalaba). Ahora espera a que lleguen los recursos del primero. Solo salta los que no se arreglan con recursos (requisitos, nivel máximo, almacén pequeño, población).</p>` },
       { t: 'Islas con varias ciudades', tab: 'granjas', find: () => TQ.card(/^Islas con varias ciudades/) || TQ.tab('granjas'), h: `
