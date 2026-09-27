@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.14.8
+// @version      1.14.9
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.14.8';
+  const VERSION = '1.14.9';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -587,7 +587,7 @@
       let pos = 0;
       const rows = ordered.map((id, i) => {
         const inc = recruitIncluded(id) && recruitOnFor(id);
-        const tag = !inc ? 'desactivada' : recruitWaiting(id) ? 'en espera (hora)' : turn.has(id) ? '● reclutando' : recruitSkip.has(id) ? `se salta: ${recruitSkip.get(id).split(':')[0].replace(/^Sin favor/, 'sin favor')} (vuelve en cuanto lo haya)` : `en cola${limited ? ` (${++pos}º)` : ''}`;
+        const tag = !inc ? 'desactivada' : recruitWaiting(id) ? 'en espera (hora)' : recruitSkip.has(id) ? `se salta: ${recruitSkip.get(id).split(':')[0].replace(/^Sin favor/, 'sin favor')} (vuelve en cuanto lo haya)` : turn.has(id) ? '● reclutando' : `en cola${limited ? ` (${++pos}º)` : ''}`;
         const sw = switchEl(recruitIncluded(id), (v) => { rc.excluded = { ...(rc.excluded || {}) }; if (v) delete rc.excluded[id]; else rc.excluded[id] = true; recruitTurnMemo.at = 0; saveState(); renderBody(); recruitLog(`${farmTownName(id)}: reclutamiento ${v ? 'activado' : 'desactivado'} en la cola.`); });
         return el('div', { class: 'nb-row' }, [
           el('span', { class: 'nb-row-label' }, [el('b', {}, `${i + 1}. ${farmTownName(id)}`), el('span', { class: `nb-ov-dim${turn.has(id) ? ' nb-ok' : ''}`, style: 'margin-left:8px' }, tag)]),
@@ -4357,37 +4357,71 @@
      favor para un hechizo OBLIGATORIO: entra la siguiente. En cuanto tenga el favor, vuelve
      a su puesto y la de abajo deja su sitio. */
   const recruitSkip = new Map(); // townId -> motivo (se recalcula en cada cálculo de turnos)
-  function recruitBlockedNow(townId) {
-    const cfg = townRecruitCfg(townId);
-    if (!Object.values(cfg.spells || {}).includes('required')) return null;
-    // Sin leer aún los hechizos de todas las ciudades no se salta a nadie por "sin favor"
-    // (el juego solo tiene los de la ciudad que estás viendo): se decide al leerlos.
-    if (!spellsKnown()) { kickSpellRefresh(0); return null; }
+  /* Favor de los hechizos OBLIGATORIOS repartido POR ORDEN de la cola: si varias ciudades
+     esperan el mismo hechizo (p. ej. Crecimiento, Hera) y solo hay favor para uno, se lo
+     queda la primera de la cola; las de detrás no reciben recursos ni lo lanzan hasta que
+     haya favor para ellas también (su favor = el del dios − lo reservado por las de delante). */
+  const favorAhead = new Map(); // townId -> { dios: favor reservado por las de delante }
+  const favorOwn = new Map();   // townId -> { dios: favor que se reserva esa ciudad }
+  let favorReserved = {};       // dios -> total reservado (para los opcionales)
+  // Por cola (tierra/mar) con tropas aún por pedir: favor que hace falta para sus hechizos
+  // obligatorios que NO están activos. { ground: { hera: 80 }, naval: {} }
+  function recruitSpellNeeds(townId, atMs = Date.now()) {
+    const cfg = townRecruitCfg(townId); const out = {};
+    if (!Object.values(cfg.spells || {}).includes('required')) return out;
     const have = townUnitsHave(townId), queued = queuedUnits(townId);
     const kinds = [...new Set(cfg.goals.filter((g) => g.target - (+have[g.id] || 0) - (+queued[g.id] || 0) > 0)
       .map((g) => (isNavalUnit(g.id) ? 'naval' : 'ground')))];
-    if (!kinds.length) return null;
-    const whys = kinds.map((k) => recruitSpellBlock(townId, [k], Date.now()));
-    return whys.every(Boolean) ? whys[0] : null; // bloqueada solo si no puede reclutar NADA
+    for (const k of kinds) {
+      const need = {};
+      for (const sd of RECRUIT_SPELLS) {
+        if (sd.kind !== k || cfg.spells?.[sd.id] !== 'required' || spellEnd(townId, sd.id) > atMs + 30000) continue;
+        const p = UW.GameData?.powers?.[sd.id]; if (!p) continue;
+        need[p.god_id] = (need[p.god_id] || 0) + (+p.favor || 0);
+      }
+      out[k] = need;
+    }
+    return out;
   }
+  const godLabel = (god) => UW.GameData?.gods?.[god]?.name || god;
   function recruitTurnSet() {
     if (Date.now() - recruitTurnMemo.at < 1000 && recruitTurnMemo.set) return recruitTurnMemo.set;
     const cfg = state.reclutamiento;
     const max = Math.max(0, Math.floor(+cfg.maxActive || 0));
     const cand = allTownIds().filter((id) => recruitOnFor(id) && recruitIncluded(id) && !recruitWaiting(id) && (cfg.towns[id]?.goals || []).length);
-    let set;
-    recruitSkip.clear();
-    if (!max) set = new Set(cand);
-    else {
-      const list = [];
-      for (const id of cand.slice().sort(recruitQueueCmp)) {
-        if (list.length >= max) break;
-        let why = null; try { why = recruitBlockedNow(id); } catch {}
-        if (why) { recruitSkip.set(id, why); continue; }
-        list.push(id);
+    recruitSkip.clear(); favorAhead.clear(); favorOwn.clear();
+    const reserved = {}, list = [], now = Date.now();
+    // Sin leer aún los hechizos de todas las ciudades no se salta a nadie por "sin favor"
+    // (el juego solo tiene los de la ciudad que estás viendo): se decide al leerlos.
+    const known = spellsKnown(); if (!known) kickSpellRefresh(0);
+    for (const id of cand.slice().sort(recruitQueueCmp)) {
+      favorAhead.set(id, { ...reserved });
+      if (max && list.length >= max) continue;
+      let take = {}, why = null;
+      if (known) {
+        try {
+          const nd = recruitSpellNeeds(id, now);
+          const kinds = Object.keys(nd);
+          let okAny = !kinds.length;
+          for (const k of kinds) {
+            const tent = { ...take };
+            for (const [g, c] of Object.entries(nd[k])) tent[g] = (tent[g] || 0) + c;
+            const bad = Object.entries(tent).find(([g, c]) => godFavorAt(g, now) - (reserved[g] || 0) < c);
+            if (!bad) { take = tent; okAny = true; }
+            else if (!why) {
+              const [g, c] = bad, f = Math.floor(godFavorAt(g, now)), r = reserved[g] || 0;
+              why = `Sin favor de ${godLabel(g)} (${f}${r ? `, ${r} ya reservado para las de delante en la cola` : ''}; necesita ${c})`;
+            }
+          }
+          if (okAny) why = null;
+        } catch { take = {}; why = null; }
       }
-      set = new Set(list);
+      if (why) { recruitSkip.set(id, why); if (max) continue; }
+      else { favorOwn.set(id, take); for (const [g, c] of Object.entries(take)) reserved[g] = (reserved[g] || 0) + c; }
+      list.push(id);
     }
+    favorReserved = reserved;
+    const set = new Set(max ? list : cand);
     recruitTurnMemo = { at: Date.now(), set };
     return set;
   }
@@ -4726,9 +4760,11 @@
       const p = UW.GameData?.powers?.[sd.id]; if (!p) continue;
       need[p.god_id] = (need[p.god_id] || 0) + (+p.favor || 0); names.push(p.name);
     }
+    recruitTurnSet(); // reparto del favor por orden de la cola
+    const ahead = favorAhead.get(+townId) || {};
     for (const [god, cost] of Object.entries(need)) {
-      const f = godFavorAt(god, atMs);
-      if (f < cost) return `Sin favor de ${UW.GameData?.gods?.[god]?.name || god} para ${names.join(' y ')} (${Math.floor(f)}/${cost}): no se le mandan recursos hasta que lo haya`;
+      const f = godFavorAt(god, atMs) - (ahead[god] || 0);
+      if (f < cost) return `Sin favor de ${godLabel(god)} para ${names.join(' y ')} (${Math.max(0, Math.floor(f))}/${cost}${ahead[god] ? `; ${ahead[god]} reservado para las de delante en la cola` : ''}): no se le mandan recursos hasta que lo haya`;
     }
     return null;
   }
@@ -4872,10 +4908,16 @@
       if (spellActive(townId, sd.id)) continue;
       const mode = cfg[sd.id];
       const p = UW.GameData?.powers?.[sd.id]; if (!p) continue;
-      const cost = +p.favor || 0, fav = godFavor(p.god_id);
+      // Favor disponible para ESTA ciudad: el del dios menos lo reservado por las de delante
+      // en la cola (obligatorio) o por cualquier otra con turno (opcional: nunca les quita el
+      // favor a los obligatorios de otras ciudades).
+      recruitTurnSet();
+      const own = favorOwn.get(+townId)?.[p.god_id] || 0;
+      const held = mode === 'required' ? (favorAhead.get(+townId)?.[p.god_id] || 0) : Math.max(0, (favorReserved[p.god_id] || 0) - own);
+      const cost = +p.favor || 0, fav = godFavor(p.god_id) - held;
       const key = `${townId}:${sd.id}`;
       if ((recruitRuntime.cooldown.get(key) || 0) > Date.now()) { if (mode === 'required') return { cast: [], wait: `${p.name}: reintentando en unos minutos` }; continue; }
-      if (fav < cost) { if (mode === 'required') return { cast: [], wait: `Esperando favor de ${UW.GameData?.gods?.[p.god_id]?.name || p.god_id} para ${p.name} (${Math.floor(fav)}/${cost})` }; continue; }
+      if (fav < cost) { if (mode === 'required') return { cast: [], wait: `Esperando favor de ${godLabel(p.god_id)} para ${p.name} (${Math.max(0, Math.floor(fav))}/${cost}${held ? `; ${held} reservado para ${mode === 'required' ? 'las de delante en la cola' : 'otras ciudades'}` : ''})` }; continue; }
       cast.push({ sd, p, mode, cost, key });
     }
     return { cast, wait: null };
@@ -4908,6 +4950,7 @@
         if (!spellInfo.active.has(+townId)) spellInfo.active.set(+townId, {});
         spellInfo.active.get(+townId)[sd.id] = Date.now() + (+p.lifetime || 3600) * 1000;
         recruitLog(`${farmTownName(townId)}: hechizo ${p.name} lanzado (${cost} favor).`, 'ok');
+        recruitTurnMemo.at = 0; // ya no reserva ese favor: se reparte de nuevo
         setTimeout(refreshCastedPowers, 3000);
       } catch (e) {
         // Si el juego dice que ya está activo, se da por activo (no bloquea el reclutamiento).
@@ -7598,6 +7641,7 @@
         <ul><li><b>No</b>: no se usa.</li><li><b>Opcional</b>: se lanza si hay favor.</li><li><b>Obligatorio</b>: no recluta hasta tenerlo activo (espera al favor y lo lanza solo).</li></ul>
         ${AUTO('Se lanzan <b>justo antes de mandar la orden</b>: primero el juego confirma que el lote ya se puede reclutar (recursos y población en la ciudad) y entonces van el hechizo y la orden seguidos. Mientras los recursos vienen de camino no se lanza, para no gastar su duración con la cola vacía.')}
         ${AUTO('Con uno <b>obligatorio</b>: si cuando lleguen los recursos no habrá favor para lanzarlo, no se le mandan ni reservan recursos a esa ciudad (no podría reclutar).')}
+        ${AUTO('Si varias ciudades esperan el mismo hechizo obligatorio y el favor no llega para todas, se reparte <b>por orden de la cola</b>: la primera se lo queda y las de detrás no reciben recursos ni lo lanzan hasta que haya favor también para ellas. Los opcionales nunca gastan el favor reservado para los obligatorios.')}
         ${AUTO('Los hechizos activos de <b>todas</b> las ciudades se leen de la vista general de dioses (al cargar y cada minuto), no solo los de la ciudad que estás viendo. Hasta leerlos no se salta a ninguna ciudad ni se mandan recursos a las que tienen uno obligatorio.')}` },
       { t: 'Siguiente lote', find: () => TQ.card(/^Siguiente lote/), h: `
         <p>Qué tropa y cuántas, población y favor que usa, y barras con los recursos que tiene la ciudad frente a lo que cuesta.</p>
@@ -7766,6 +7810,11 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.14.9', items: [
+      { t: 'Favor de hechizos por orden de la cola', tab: 'resumen', before: () => { if (state.resumenView !== 'reclutamiento') { state.resumenView = 'reclutamiento'; return true; } }, find: () => TQ.card(/^Ciudades reclutando/) || TQ.tab('resumen'), h: `
+        <p>Arreglado: si varias ciudades esperaban el mismo hechizo obligatorio, al haber favor para uno se les mandaban recursos a <b>todas</b>.</p>
+        ${AUTO('Ahora el favor se reparte por orden de la cola: la primera se lo queda; las de detrás esperan (sin recursos) hasta que haya favor también para ellas, y en la cola sale «ya reservado para las de delante». Los opcionales no tocan el favor reservado.')}` }
+    ] },
     { v: '1.14.8', items: [
       { t: 'Recuento de tropas al día', tab: 'resumen', before: () => { if (state.resumenView !== 'reclutamiento') { state.resumenView = 'reclutamiento'; return true; } }, find: () => TQ.sel('.nb-rc-stats', bodyEl) || TQ.tab('resumen'), h: `
         <p>Arreglado: en las ciudades que no estabas viendo, las tropas que terminaba la cola no se contaban hasta entrar en ellas (el juego no las suma antes). El bot veía de menos y podía <b>reclutar de más</b>.</p>
