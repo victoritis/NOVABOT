@@ -1464,16 +1464,36 @@
      Se manda una ciudad por isla: la que MENOS pierde con el botín (recurso a
      recurso), y a igualdad la de almacén más vacío. Se excluyen las que ya llegaron
      al % de almacén configurado. */
+  /* Una sola ciudad por isla recoge las aldeas (el botín va a ella). Con varias ciudades en
+     la misma isla hay una PRINCIPAL (la eliges en Granjas; si no, la de más almacén):
+       · recoge la principal mientras su almacén esté por debajo del % de cambio (70 %);
+       · por encima, recoge otra de la isla SIEMPRE QUE esa no esté más llena que la
+         principal (la más vacía); si todas lo están, sigue la principal;
+       · la que llega al tope de "No recolectar si el almacén llega a" no recoge. */
+  function islandMainOf(key, group) {
+    const set = +(state.granjas.islandMain || {})[key];
+    if (set && group.includes(set)) return set;
+    return group.slice().sort((a, b) => ((townStorage(b) || 0) - (townStorage(a) || 0)) || farmTownName(a).localeCompare(farmTownName(b), 'es'))[0];
+  }
   function pickTownsForClaim() {
     const towns = [], full = [];
-    for (const [, group] of townsByIsland()) {
+    const sw = clamp(pos(state.granjas.switchPct, 70), 10, 100) / 100;
+    for (const [key, group] of townsByIsland()) {
       const ok = group.filter((id) => !isTownStorageAtThreshold(id))
         .map((id) => ({ id, waste: claimWaste(id), fill: townFill(id) }))
         .sort((a, b) => (a.waste - b.waste) || (a.fill - b.fill));
-      if (ok.length) towns.push(ok[0].id); else full.push(...group);
+      if (!ok.length) { full.push(...group); continue; }
+      const main = ok.find((o) => o.id === islandMainOf(key, group));
+      let pick = ok[0];
+      if (main) {
+        if (main.fill < sw) pick = main;
+        else pick = ok.find((o) => o !== main && o.fill <= main.fill) || main;
+      }
+      towns.push(pick.id);
     }
     return { towns, full };
   }
+
 
   async function farmTick() {
     if (!state.granjas.enabled || Date.now() < farmRuntime.nextCycleAt) return;
@@ -1655,6 +1675,28 @@
       stopRow,
       el('p', { class: 'nb-placeholder' }, 'Se comprueba madera, piedra y plata; si a alguna le falta para llegar, se sigue recolectando igual.')
     ]));
+
+    // Islas con varias ciudades: cuál recoge (principal) y desde qué % cambia a otra.
+    const shared = [...townsByIsland()].filter(([, g]) => g.length > 1);
+    if (shared.length) {
+      const swIn = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '10', max: '100', value: String(clamp(pos(cfg.switchPct, 70), 10, 100)) });
+      swIn.addEventListener('change', () => { cfg.switchPct = clamp(pos(swIn.value, 70), 10, 100); saveState(); renderBody(); });
+      const rows = shared.map(([key, group]) => {
+        const sel = el('select', { class: 'nb-input' });
+        const main = islandMainOf(key, group);
+        for (const id of group.slice().sort((a, b) => farmTownName(a).localeCompare(farmTownName(b), 'es'))) {
+          const o = el('option', { value: id }, `${farmTownName(id)} (${Math.round(townFill(id) * 100)} %)`); if (id === main) o.selected = true; sel.appendChild(o);
+        }
+        sel.addEventListener('change', () => { (cfg.islandMain ||= {})[key] = +sel.value; saveState(); renderBody(); });
+        return el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, `Isla ${key.replace('_', ',')}: principal`), sel]);
+      });
+      bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+        el('div', { class: 'nb-card-title' }, 'Islas con varias ciudades'),
+        el('div', { class: 'nb-row' }, [el('div', { class: 'nb-option-text' }, [el('span', { class: 'nb-option-label' }, 'Cambiar a otra ciudad desde'), el('span', { class: 'nb-option-hint' }, 'Si la principal pasa de este %, recoge otra de la isla que no esté más llena que ella')]), el('span', {}, [swIn, ' %'])]),
+        ...rows,
+        el('p', { class: 'nb-placeholder' }, 'Solo una ciudad por isla recoge las aldeas. Recoge la principal; por encima del % de cambio, la más vacía de la isla si no está más llena que la principal; si no, sigue la principal hasta el tope de arriba.')
+      ]));
+    }
 
     bodyEl.appendChild(renderExchangeCard());
     bodyEl.appendChild(renderVillageLevelCard());
@@ -7178,6 +7220,9 @@
       { t: 'No recolectar si el almacén está lleno', find: () => TQ.card(/^No recolectar/), h: `
         <p>Si en una ciudad <b>madera, piedra y plata</b> han llegado todas a ese %, no recolecta en ella (se perdería). Si a alguna le falta, sí recolecta.</p>
         ${TIP('Con el <b>Equilibrio</b> del Comercio activo casi nunca llegarás a esto: antes de cada recolección mueve lo que no cabría.')}` },
+      { t: 'Islas con varias ciudades', find: () => TQ.card(/^Islas con varias ciudades/) || TQ.card(/^No recolectar/), h: `
+        <p>Solo aparece si tienes varias ciudades en la misma isla (solo una puede recoger sus aldeas). Eliges la <b>principal</b> de cada isla y el <b>% de cambio</b> (70 % por defecto).</p>
+        ${AUTO('Recoge la principal mientras su almacén esté por debajo de ese %. Por encima, recoge la ciudad más vacía de la isla siempre que no esté más llena que la principal; si todas lo están, sigue la principal hasta el tope de «No recolectar». Si no eliges principal, es la de más almacén.')}` },
       { t: 'Intercambio con aldeas', find: () => TQ.card(/^Intercambio con aldeas/), wide: true, h: `
         <p>Las aldeas cambian un recurso por otro con una <b>tasa</b> (ej. 1,25 = por 100 que das te dan 125).</p>
         ${AUTO(`<ul>
@@ -7449,6 +7494,8 @@
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
     { v: '1.14.5', items: [
+      { t: 'Islas con varias ciudades', tab: 'granjas', find: () => TQ.card(/^Islas con varias ciudades/) || TQ.tab('granjas'), h: `
+        <p>Nueva tarjeta en Granjas: en cada isla con varias ciudades eliges la <b>principal</b> (la que recoge las aldeas). Cuando pasa del <b>70 %</b> de almacén (lo cambias), recoge otra de la isla siempre que no esté más llena que la principal; si no hay ninguna así, sigue la principal hasta el tope que tengas puesto.</p>` },
       { t: 'Almacén lleno: con todos los comerciantes', tab: 'comercio', find: () => TQ.card(/^Equilibrio entre ciudades/) || TQ.tab('comercio'), h: `
         <p>Una ciudad con el almacén lleno solo podía usar el 20–30 % de sus comerciantes para repartir lo que sobra: con un envío ya en camino no mandaba más y seguía perdiendo recursos. Ahora, para <b>no perder</b>, usa todos los comerciantes libres; para igualar ciudades sigue usando solo la parte configurada.</p>` }
     ] },
