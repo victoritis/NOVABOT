@@ -201,7 +201,7 @@
         bulkRatio: 0.6,       // …y se acepta hasta esta tasa
         ironLow: true,        // si la plata del imperio baja de ironLowPct %, cambiar por plata en todas las aldeas
         ironLowPct: 25,
-        ironLowRatio: 0.5
+        ironLowRatio: 0.7
       },
       aldeasNivel: {
         enabled: false,       // subir las aldeas (de todas tus islas) hasta un nivel con puntos de combate
@@ -1878,7 +1878,7 @@
     // plata aunque la tasa no sea buena (desde la mínima elegida), para poder reclutar.
     // Se deja siempre un 20 % del almacén del recurso que se da.
     if (!mode && cfg.ironLow !== false && Y === 'iron' && X !== 'iron' && (M.F.iron || 0) < clamp(+cfg.ironLowPct || 25, 5, 60) / 100
-        && ratio + 1e-9 >= clamp(+cfg.ironLowRatio || 0.5, 0.3, 1.5)) {
+        && ratio + 1e-9 >= clamp(+cfg.ironLowRatio || 0.7, 0.3, 1.5)) {
       const others = Math.max(0, (M.globalMiss[X] || 0) - t.miss[X]);
       const room = Math.floor(Math.min(avail - others, t.lvl[X] - S * 0.2));
       if (room >= 100) { mode = 'falta plata'; rank = 2.5; pref = (M.F[X] || 0) - (M.F.iron || 0) + t.lvl[X] / S; amount = room; }
@@ -1917,6 +1917,14 @@
       }
     }
     if (!mode) return null;
+    // Falta plata: cada cambio baja la tasa de la aldea, así que se cambia SIEMPRE lo máximo
+    // que admite la aldea (p. ej. 3000). Si lo que limita son los comerciantes ocupados, se
+    // ESPERA a tenerlos (no se manda un cambio pequeño); solo se cambia menos si lo que falta
+    // es recurso o sitio en el almacén (eso no se arregla esperando).
+    if (mode === 'falta plata') {
+      const full = Math.floor(Math.min(amount, exMaxAmount(v.rel), roomY / ratio));
+      if (cap < Math.min(full, +t.maxCap || full)) return null; // (con mercado pequeño, lo máximo es su capacidad total)
+    }
     amount = Math.floor(Math.min(amount, cap, exMaxAmount(v.rel), roomY / ratio));
     if (amount < (mode === 'equilibrar' || mode === 'exceso' || mode === 'falta plata' ? EX_MIN_GAIN : 100)) return null;
     return { amount, receive: Math.round(amount * ratio), mode, score: rank * 1e9 + pref * 1e6 + ratio * 1e4 + amount / 1000 };
@@ -2397,7 +2405,7 @@
       optionRow('Cambiar con pérdida si sobra mucho', 'Si una ciudad pasa del % de abajo en un recurso y en todo el imperio sobra ese recurso mucho más que otro (p. ej. madera 80 % y plata 45 %), lo cambia por el que falta aunque la tasa sea baja', cfg.bulk !== false, (v) => { cfg.bulk = v; saveState(); renderBody(); }),
       cfg.bulk !== false ? el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Sobra mucho a partir de (% del almacén) · tasa mínima'), el('span', {}, [numIn('bulkPct', 50, 100, 5, 85, false), ' % · ', numIn('bulkRatio', 0.3, 1.35, 0.05, 0.6)])]) : null,
       optionRow('Si falta plata en el imperio, cambiar por plata', 'Si la plata de todas tus ciudades juntas está por debajo del % de abajo, en todas las aldeas que dan plata se cambia madera/piedra por plata aunque la tasa no sea buena (para poder reclutar). Deja siempre un 20 % del recurso que da', cfg.ironLow !== false, (v) => { cfg.ironLow = v; saveState(); renderBody(); }),
-      cfg.ironLow !== false ? el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Falta plata por debajo de (% del imperio) · tasa mínima'), el('span', {}, [numIn('ironLowPct', 5, 60, 5, 25, false), ' % · ', numIn('ironLowRatio', 0.3, 1.35, 0.05, 0.5)])]) : null,
+      cfg.ironLow !== false ? el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Falta plata por debajo de (% del imperio) · tasa mínima'), el('span', {}, [numIn('ironLowPct', 5, 60, 5, 25, false), ' % · ', numIn('ironLowRatio', 0.3, 1.35, 0.05, 0.7)])]) : null,
       optionRow('Traer de otras ciudades', 'Si una aldea con buena tasa pide un recurso que su isla no tiene, el comercio lo trae de donde sobra y aquí se cambia al llegar (necesita Comercio y Equilibrio)', cfg.feed !== false, (v) => { cfg.feed = v; saveState(); renderBody(); }),
       el('p', { class: 'nb-placeholder' }, 'Cada minuto, en todas las islas: con tasa alta da lo que más sobra (en la ciudad y en el imperio) por lo que menos hay. Con tasa baja solo si ese recurso rebosaría en la próxima recolección y no cabe en otra ciudad. La tasa se recupera sola y a ritmo fijo, así que cambiar solo con tasa alta da bastante más por lo mismo. Nunca da lo reservado para encargos ni hace rebosar lo que recibe.'),
       caveOn() ? el('div', { class: 'nb-alert nb-alert-info nb-mt' }, [
@@ -7251,7 +7259,7 @@
           <li>La tasa baja 0,03 por cada 100 que cambias y se recupera sola (0,02 × velocidad por hora, hasta 1,25). La <b>Oficina comercial</b> suma +0,1 a la ciudad que la tiene: el bot calcula la tasa real de cada ciudad.</li>
           <li>Nunca da lo reservado para encargos, ni lo que otra ciudad está esperando, ni hace rebosar lo que recibe. Mínimo 100 y máximo 3000 por cambio.</li>
           <li>Si hay ciudades esperando recursos, los cambios normales no usan más que la parte pequeña de comerciantes (la misma que el equilibrio, 20 %), para no frenar al comercio.</li></ul>`)}
-        ${AUTO('<b>Si falta plata</b> (la de todo el imperio por debajo del 25 %, ajustable): cambia madera y piedra por plata en todas las aldeas que dan plata aunque la tasa sea baja (desde 0,5), dejando un 20 % del recurso que da.')}` },
+        ${AUTO('<b>Si falta plata</b> (la de todo el imperio por debajo del 25 %, ajustable): cambia madera y piedra por plata en todas las aldeas que dan plata aunque la tasa no sea buena (nunca por debajo de la tasa mínima que pongas, 0,7 por defecto), dejando un 20 % del recurso que da. Siempre el máximo que admite la aldea: si faltan comerciantes, espera a tenerlos.')}` },
       { t: 'Tasa para equilibrar', find: inCard(/^Intercambio con aldeas/, /^Tasa para equilibrar/), h: `
         <p>Los cambios normales solo se hacen con la tasa <b>así de alta</b> (por defecto 1,2).</p>
         <p>¿Por qué alta? La tasa se recupera a ritmo fijo: cambiar 3000 a 0,85 o a 1,25 "gasta" lo mismo, pero a 1,25 recibes un 47 % más. Esperar a la tasa alta rinde mucho más.</p>` },
@@ -7516,7 +7524,7 @@
   const TOUR_NEWS = [
     { v: '1.14.6', items: [
       { t: 'Si falta plata, cambiar por plata', tab: 'granjas', find: () => TQ.card(/^Intercambio con aldeas/) || TQ.tab('granjas'), h: `
-        <p>En <b>Intercambio con aldeas</b>: si la plata de todo el imperio baja del <b>25 %</b> del almacén (lo cambias), en todas las aldeas que dan plata se cambia madera y piedra por plata aunque la tasa no sea buena (desde 0,5), para poder reclutar. Deja siempre un 20 % del recurso que da. Necesita el intercambio activado.</p>` },
+        <p>En <b>Intercambio con aldeas</b>: si la plata de todo el imperio baja del <b>25 %</b> del almacén (lo cambias), en todas las aldeas que dan plata se cambia madera y piedra por plata aunque la tasa no sea buena (nunca por debajo de la tasa mínima que pongas, <b>0,7</b> por defecto), para poder reclutar. Deja siempre un 20 % del recurso que da. Cada cambio es <b>el máximo que admite la aldea</b> (p. ej. 3000): si los comerciantes están ocupados, espera a tenerlos en vez de mandar un cambio pequeño. Necesita el intercambio activado.</p>` },
       { t: 'Mercado bajo: solo su isla', tab: 'comercio', find: () => TQ.card(/^Comercio automático/) || TQ.tab('comercio'), h: `
         <p>Las ciudades con el <b>mercado a nivel 5 o menos</b> ya no intentan mandar ni recibir recursos de <b>otras islas</b> (el juego no deja y daba error). Con las de su misma isla sí comercian. (Antes el bot miraba el almacén por error.)</p>` }
     ] },
