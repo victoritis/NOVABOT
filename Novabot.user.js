@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.14.5
+// @version      1.14.6
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.14.5';
+  const VERSION = '1.14.6';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -3464,17 +3464,19 @@
     return txt.length > 3 ? `${txt.slice(0, 3).join(', ')} y ${txt.length - 3} más` : txt.join(', ');
   }
 
-  /* El juego no deja comerciar entre ciudades con el almacén por debajo de nivel 5 (aviso
-     del juego al intentarlo). Por si acaso, el bot deja fuera del comercio entre ciudades
-     (encargos, equilibrio y alimentar aldeas) las que lo tienen por debajo de nivel 6: ni
-     donan ni reciben. (El intercambio con las aldeas de su isla no cambia.) */
-  const TRADE_MIN_STORAGE_LEVEL = 6;
-  function storageLevel(id) { try { return +UW.ITowns.getTown(+id)?.getBuildings?.()?.attributes?.storage || 0; } catch { return 0; } }
-  const tradeTownOk = (id) => { const l = storageLevel(id); return !l || l >= TRADE_MIN_STORAGE_LEVEL; };
+  /* El juego no deja que una ciudad con el MERCADO a nivel 5 o menos comercie con ciudades
+     de OTRA isla (aviso del juego al intentarlo). En la misma isla sí. El bot no plantea
+     esos envíos (encargos, equilibrio y alimentar aldeas): si alguna de las dos ciudades
+     tiene el mercado por debajo de nivel 6 y están en islas distintas, no se envía. */
+  const TRADE_MIN_MARKET_LEVEL = 6;
+  function marketLevel(id) { try { return +UW.ITowns.getTown(+id)?.getBuildings?.()?.attributes?.market || 0; } catch { return 0; } }
+  function islandKeyOf(id) { try { const d = farmTownData(id); return d && d.island_x != null ? `${d.island_x}_${d.island_y}` : ''; } catch { return ''; } }
+  const lowMarket = (id) => { const l = marketLevel(id); return l > 0 && l < TRADE_MIN_MARKET_LEVEL; };
+  const tradePairOk = (a, b) => !(lowMarket(a) || lowMarket(b)) || (islandKeyOf(a) !== '' && islandKeyOf(a) === islandKeyOf(b));
 
   function planTrades() {
     const cfg = state.comercio;
-    const towns = allTownIds().filter(tradeTownOk);
+    const towns = allTownIds();
     const transit = transitRows();
     const demands = collectDemands();
     const now = Date.now();
@@ -3536,7 +3538,7 @@
     const needy = new Map(needs.map((n) => [n.townId, n.missInit]));
     const canGive = (id, k) => !needy.has(id) || (needy.get(id)[k] || 0) <= 0;
     const donorsFor = (n) => towns
-      .filter((id) => id !== n.townId && st[id].cap > 0 && RES.some((k) => canGive(id, k) && st[id].surplus[k] > 0 && n.miss[k] > 0))
+      .filter((id) => id !== n.townId && tradePairOk(id, n.townId) && st[id].cap > 0 && RES.some((k) => canGive(id, k) && st[id].surplus[k] > 0 && n.miss[k] > 0))
       .filter((id) => (tradeRuntime.pairCooldown.get(`${id}>${n.townId}`) || 0) < now)
       .sort((a, b) => donorCost(a, n) - donorCost(b, n));
     // Coste de usar un donante = tiempo de viaje, rebajado hasta a la mitad si el
@@ -3847,7 +3849,7 @@
     const maxTravel = Math.max(1, +cfg.maxTravelMin || 45) * 60;
     // Parte de los comerciantes que puede usar cada ciudad (lo demás queda libre para encargos).
     const capPct = clamp(free ? (+cfg.maxCapPct || 60) : (+cfg.busyCapPct || 20), 0, 100) / 100;
-    const ids = M.towns.filter(tradeTownOk); // almacén < nivel 6: fuera del comercio entre ciudades
+    const ids = M.towns;
     const moves = new Map();
     const capLeft = {};
     // Para NO PERDER recursos (almacén lleno) se pueden usar todos los comerciantes libres;
@@ -3866,7 +3868,7 @@
     // cada 12 min de viaje cuenta como un 10 % más lleno.
     const score = (d, r, k) => fill(r, k) + travelSec(d, r) / 7200 - (lack(r, k) > 0 ? 1 : 0);
     const receivers = (d, k, maxT, cond) => ids
-      .filter((r) => r !== d && !onCooldown(d, r) && travelSec(d, r) <= maxT && cond(r))
+      .filter((r) => r !== d && tradePairOk(d, r) && !onCooldown(d, r) && travelSec(d, r) <= maxT && cond(r))
       .sort((a, b) => score(d, a, k) - score(d, b, k));
     function add(d, r, k, x, kind, feed = null) {
       const key = `${d}>${r}`;
@@ -3908,10 +3910,9 @@
       for (const [r, u] of ctx.up) for (const k of resList) { const l = lack(r, k); if (l >= 100) wants.push({ r, k, l, at: u.at }); }
       wants.sort((a, b) => a.at - b.at || b.l - a.l);
       for (const w of wants) {
-        if (!tradeTownOk(w.r)) continue;
         let need = Math.min(lack(w.r, w.k), room(w.r, w.k, 0));
         const donors = ids
-          .filter((d) => d !== w.r && !onCooldown(d, w.r) && travelSec(d, w.r) <= maxTravel && !ctx.up.has(d))
+          .filter((d) => d !== w.r && tradePairOk(d, w.r) && !onCooldown(d, w.r) && travelSec(d, w.r) <= maxTravel && !ctx.up.has(d))
           .map((d) => ({ d, x: Math.floor(Math.min(giveable(d, w.k), M.T[d].lvl[w.k] - (M.F[w.k] + tol / 2) * M.T[d].storage)) }))
           .filter((o) => o.x >= 100)
           .sort((a, b) => travelSec(a.d, w.r) - travelSec(b.d, w.r));
@@ -3929,9 +3930,8 @@
     if (free && !ctx.urgentOnly && state.aldeas.enabled && state.aldeas.feed) {
       for (const w of exFeedWants(M)) {
         const X = w.give, e = w.townId;
-        if (!tradeTownOk(e)) continue;
         const donor = ids
-          .filter((d) => d !== e && !onCooldown(d, e) && travelSec(d, e) <= maxTravel)
+          .filter((d) => d !== e && tradePairOk(d, e) && !onCooldown(d, e) && travelSec(d, e) <= maxTravel)
           .map((d) => ({ d, x: Math.floor(Math.min(giveable(d, X), M.T[d].lvl[X] - M.F[X] * M.T[d].storage, capLeft[d])) }))
           .filter((o) => o.x >= Math.max(500, w.amount * 0.5))
           .sort((a, b) => travelSec(a.d, e) - travelSec(b.d, e))[0];
@@ -4148,7 +4148,7 @@
       optionRow('Abastecer reclutamiento', 'Envía lo que falta para completar los lotes de tropas', !!cfg.forRecruit, (v) => { cfg.forRecruit = v; saveState(); renderBody(); }),
       optionRow('Abastecer investigación', 'Solo cuando la ciudad tiene puntos de investigación para esa investigación', cfg.forResearch !== false, (v) => { cfg.forResearch = v; saveState(); renderBody(); }),
       optionRow('Abastecer festivales', 'Envía justo lo que falta para el festival (Academia 30+)', cfg.forFestival !== false, (v) => { cfg.forFestival = v; saveState(); renderBody(); }),
-      (() => { const low = allTownIds().filter((id) => !tradeTownOk(id)); return low.length ? el('div', { class: 'nb-alert nb-alert-warn' }, `Fuera del comercio entre ciudades (almacén por debajo de nivel ${TRADE_MIN_STORAGE_LEVEL}, el juego no deja): ${low.map((id) => `${farmTownName(id)} (nv ${storageLevel(id)})`).join(', ')}. Ni donan ni reciben hasta subirlo.`) : null; })(),
+      (() => { const low = allTownIds().filter(lowMarket); return low.length ? el('div', { class: 'nb-alert nb-alert-warn' }, `Mercado por debajo de nivel ${TRADE_MIN_MARKET_LEVEL}: solo comercian con ciudades de su misma isla (el juego no deja con otras islas): ${low.map((id) => `${farmTownName(id)} (nv ${marketLevel(id)})`).join(', ')}.`) : null; })(),
       el('p', { class: 'nb-placeholder' }, 'Aquí se elige a qué módulos manda recursos el comercio (es el único sitio). Revisa cada 10 s. Abastece todos los encargos que caben en la cola de cada ciudad. Nunca dona lo que la donante va a gastar y nunca hace que se pierda recurso al llegar.')
     ]));
 
@@ -7357,7 +7357,7 @@
         <li>Reparto justo: las ciudades lejanas no se quedan olvidadas (cuanto más esperan, más prioridad).</li>
         <li>Simula el almacén de destino: puede mandar más de lo que cabe si se va a gastar antes de llegar, pero <b>nunca</b> hace que se pierda nada. Descuenta lo que la ciudad producirá mientras viaja el envío.</li>
         <li>Aprende la velocidad real de los comerciantes con cada envío.</li>
-        <li>Las ciudades con el <b>almacén por debajo de nivel 6</b> quedan fuera del comercio entre ciudades (el juego no deja comerciar por debajo de nivel 5): ni donan ni reciben, y te lo avisa aquí.</li></ul>`)}` },
+        <li>Las ciudades con el <b>mercado por debajo de nivel 6</b> solo comercian con ciudades de su <b>misma isla</b> (el juego no deja con otras islas si el mercado es de nivel 5 o menos): no se les plantean esos envíos, y te lo avisa aquí.</li></ul>`)}` },
       { t: 'Ajustes', find: () => TQ.card(/^Ajustes/), h: `
         <ul><li><b>Envío mínimo</b>: no manda envíos más pequeños (salvo que completen lo que falta).</li>
         <li><b>Margen almacén %</b>: hueco que deja libre en el almacén de destino.</li>
@@ -7498,6 +7498,10 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.14.6', items: [
+      { t: 'Mercado bajo: solo su isla', tab: 'comercio', find: () => TQ.card(/^Comercio automático/) || TQ.tab('comercio'), h: `
+        <p>Las ciudades con el <b>mercado a nivel 5 o menos</b> ya no intentan mandar ni recibir recursos de <b>otras islas</b> (el juego no deja y daba error). Con las de su misma isla sí comercian. (Antes el bot miraba el almacén por error.)</p>` }
+    ] },
     { v: '1.14.5', items: [
       { t: 'Vista general: recursos en rojo', tab: 'resumen', before: () => { if ((state.resumenView || 'ciudades') !== 'ciudades') { state.resumenView = 'ciudades'; return true; } }, find: () => TQ.card(/^Vista general/) || TQ.tab('resumen'), h: `
         <p>En la columna <b>Recursos</b>, el % sale en <b>rojo</b> desde el 95 % (o lleno), en amarillo desde el 90 %.</p>` },
@@ -7533,8 +7537,8 @@
       { t: 'Almacén lleno: se reparte siempre', tab: 'comercio', find: () => TQ.card(/^Equilibrio entre ciudades/) || TQ.tab('comercio'), h: `
         <p>Antes, con el comercio ocupado en encargos (reclutamiento, construcción…), el equilibrio no actuaba y las ciudades con el almacén lleno perdían recursos. Ahora lo que se va a perder se reparte cada 30 s igualmente, aunque otras ciudades estén esperando ese recurso (se les da a ellas primero).</p>
         <p>Y para eso usa <b>todos los comerciantes libres</b> de la ciudad llena (antes solo el 20–30 % reservado al equilibrio, y en cuanto había un envío en camino ya no mandaba más).</p>` },
-      { t: 'Comercio: almacén pequeño fuera', tab: 'comercio', find: () => TQ.card(/^Comercio automático/) || TQ.tab('comercio'), h: `
-        <p>Las ciudades con el <b>almacén por debajo de nivel 6</b> ya no mandan ni reciben recursos de otras ciudades (el juego no deja comerciar por debajo de nivel 5 y daba error). Salen avisadas en Comercio.</p>` },
+      { t: 'Comercio: mercado bajo, solo su isla', tab: 'comercio', find: () => TQ.card(/^Comercio automático/) || TQ.tab('comercio'), h: `
+        <p>Corregido: el límite del juego es el <b>mercado</b> (nivel 5 o menos), no el almacén, y solo impide comerciar con <b>otras islas</b>. Ahora esas ciudades comercian normal con las de su misma isla y el bot ya no intenta envíos a otras islas que daban error. Salen avisadas en Comercio.</p>` },
       { t: 'Vista general: % de recursos', tab: 'resumen', before: () => { if ((state.resumenView || 'ciudades') !== 'ciudades') { state.resumenView = 'ciudades'; return true; } }, find: () => TQ.card(/^Vista general/) || TQ.tab('resumen'), h: `
         <p>Nueva columna <b>Recursos</b> en Vista general → Ciudades: madera, piedra y plata de cada ciudad en <b>% del almacén</b> (amarillo desde el 90 %) y la cantidad.</p>` }
     ] },
