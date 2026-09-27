@@ -6320,6 +6320,103 @@
     renderBody();
   }
 
+  /* ---- Renovar "Estrategia divina de combate" al instante (TEMPORAL, desactivado) ----
+     Mientras está activado, vigila la ciudad elegida: en cuanto el efecto de estrategia
+     de combate deja de estar activo (se acabó el tiempo o se llenaron sus puntos de combate
+     con un ataque), usa otro del inventario premium con la MISMA acción del juego
+     (PremiumInventoryItem.utilize, como pulsar «Usar»).
+       · Mira el dato del propio juego cada 0,2 s (gratis) y además pregunta al servidor
+         cada 0,4 s (vista de dioses, solo lectura) mientras está activado: así se entera en
+         menos de 1 s aunque el aviso del juego tarde.
+       · Tras usar uno, no usa otro hasta ver el nuevo activo (o 8 s): nunca gasta dos.
+       · Actívalo justo antes del ataque que llenará los puntos; sigue renovando mientras
+         esté activado y queden objetos. */
+  const STRAT_RE = /battle_strategy/;
+  const strat = { busy: false, castAt: 0, lastPoll: 0, polled: new Map(), timer: null, log: [] };
+  const stratCfg = () => (state.estrategia ||= { enabled: false, townId: null });
+  function stratItems() {
+    try { return [].concat(UW.MM.getCollections().PremiumInventoryItem || []).flatMap((c) => c?.models || []).filter((m) => STRAT_RE.test(m.attributes?.properties?.power_id || '')); } catch { return []; }
+  }
+  // Estrategia activa en la ciudad: { power_id, end (ms), progress, limit } o null.
+  function stratActiveLocal(townId) {
+    try {
+      for (const c of [].concat(UW.MM.getCollections().CastedPowers || [])) for (const m of c?.models || []) {
+        const a = m.attributes;
+        if (+a.town_id !== +townId || !STRAT_RE.test(a.power_id || '')) continue;
+        if (+a.end_at * 1000 <= srvNow()) continue;
+        const lim = +a.configuration?.limit?.battlepoints || 0, prog = +a.configuration?.progress?.battlepoints || 0;
+        if (lim && prog >= lim) continue;
+        return { power_id: a.power_id, end: +a.end_at * 1000, progress: prog, limit: lim };
+      }
+    } catch {}
+    return null;
+  }
+  function stratTownGuess() {
+    try { for (const c of [].concat(UW.MM.getCollections().CastedPowers || [])) for (const m of c?.models || []) if (STRAT_RE.test(m.attributes.power_id || '')) return +m.attributes.town_id; } catch {}
+    return null;
+  }
+  function stratLog(text, kind = 'info') { atkLog(`Estrategia: ${text}`, kind); }
+  async function stratPoll(townId) {
+    // Servidor (solo lectura): ¿sigue activa en esa ciudad?
+    const d = await gpGet('town_overviews', 'gods_overview', { nl_init: true });
+    const t = (d?.data?.towns || []).find((x) => +x.id === +townId);
+    if (!t) return null;
+    const cp = t.casted_powers || {};
+    const key = Object.keys(cp).find((k) => STRAT_RE.test(k));
+    return key ? { power_id: key, end: +cp[key] * 1000 } : false;
+  }
+  async function stratTick() {
+    const cfg = stratCfg();
+    if (!cfg.enabled || strat.busy || !isRunner()) return;
+    const townId = +cfg.townId || stratTownGuess();
+    if (!townId) return;
+    strat.busy = true;
+    try {
+      const local = stratActiveLocal(townId);
+      // Tras usar uno: esperar a verlo activo (máx. 8 s) antes de plantearse otro.
+      if (strat.castAt && Date.now() - strat.castAt < 8000) {
+        if (Date.now() - strat.lastPoll >= 700) { strat.lastPoll = Date.now(); const srv = await stratPoll(townId).catch(() => null); if (srv) strat.castAt = 0; }
+        return;
+      }
+      // Lo decide SIEMPRE el servidor (el dato del juego puede ser solo de la ciudad
+      // abierta): se le pregunta cada 0,4 s y al momento si el dato del juego dice que se acabó.
+      if (local && Date.now() - strat.lastPoll < 400) return;
+      strat.lastPoll = Date.now();
+      const srv = await stratPoll(townId).catch(() => null);
+      if (srv !== false) return; // sigue activa (o no se pudo leer: no se hace nada)
+      const items = stratItems();
+      if (!items.length) { if (!strat.noneLogged) { strat.noneLogged = true; stratLog('no quedan objetos de estrategia en el inventario premium.', 'error'); } return; }
+      strat.noneLogged = false;
+      // Preferir el mismo tipo que la que había (épica divina, etc.).
+      const m = items.sort((a, b) => ((b.attributes.properties.power_id === 'divine_battle_strategy_epic') - (a.attributes.properties.power_id === 'divine_battle_strategy_epic')))[0];
+      const prev = UW.Game.townId;
+      strat.castAt = Date.now();
+      try { UW.Game.townId = townId; m.utilize(() => stratLog('el juego no dejó usar el objeto.', 'error')); } finally { UW.Game.townId = prev; }
+      stratLog(`${UW.GameData?.powers?.[m.attributes.properties.power_id]?.name || m.attributes.properties.power_id} usada en ${farmTownName(townId)} (quedan ${items.length - 1}).`, 'ok');
+    } finally { strat.busy = false; }
+  }
+  function startStratEngine() {
+    if (strat.timer) return;
+    strat.timer = setInterval(() => { stratTick().catch(() => {}); }, 200);
+  }
+  function renderStratCard(towns) {
+    const cfg = stratCfg();
+    const guess = stratTownGuess();
+    if (!cfg.townId && guess) cfg.townId = guess;
+    const sel = el('select', { class: 'nb-input' });
+    for (const id of towns) { const o = el('option', { value: id }, farmTownName(id)); if (+id === +cfg.townId) o.selected = true; sel.appendChild(o); }
+    sel.addEventListener('change', () => { stratCfg().townId = +sel.value; saveState(); renderBody(); });
+    const act = cfg.townId ? stratActiveLocal(cfg.townId) : null;
+    const sw = switchEl(!!cfg.enabled, (v) => { stratCfg().enabled = v; if (!cfg.townId) stratCfg().townId = +sel.value; saveState(); renderBody(); stratLog(v ? `renovación al instante ACTIVADA en ${farmTownName(+sel.value)}.` : 'renovación desactivada.'); }, false);
+    return el('div', { class: 'nb-card' }, [
+      el('div', { class: 'nb-row' }, [el('div', { class: 'nb-option-text' }, [el('b', {}, 'Renovar Estrategia divina al instante'), el('span', { class: 'nb-option-hint nb-warn-txt' }, 'Temporal · actívalo justo antes del ataque que llenará los puntos')]), sw]),
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Ciudad'), sel]),
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Ahora'), el('span', { class: 'nb-row-value' }, act ? `activa · ${act.limit ? `${act.progress}/${act.limit} puntos · ` : ''}hasta ${fmtWhen(act.end)}` : 'sin estrategia activa')]),
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'En el inventario premium'), el('span', { class: 'nb-row-value' }, String(stratItems().length))]),
+      el('p', { class: 'nb-placeholder' }, 'Mientras está activado: en cuanto la estrategia de esa ciudad se acaba (tiempo o puntos de combate llenos), usa otra del inventario en menos de 1 s. Nunca usa dos seguidas sin ver la primera activa.')
+    ]);
+  }
+
   function renderAtaquesTab() {
     atkLoadWorld();
     installClockSync();
@@ -6353,6 +6450,7 @@
       atkQueueEl = null;
       renderAtkForm(towns);
     }
+    bodyEl.appendChild(renderStratCard(towns));
 
     const logBox = el('div', { class: 'nb-log' });
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [el('div', { class: 'nb-card-title' }, 'Actividad'), logBox]));
@@ -7499,6 +7597,8 @@
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
     { v: '1.14.5', items: [
+      { t: 'Renovar Estrategia divina (temporal)', tab: 'ataques', find: () => TQ.card(/^Renovar Estrategia divina/) || TQ.tab('ataques'), h: `
+        <p>Abajo en Ataques: <b>Renovar Estrategia divina al instante</b> (desactivado). Actívalo justo antes del ataque que va a llenar los puntos de combate: en cuanto la estrategia de esa ciudad se acaba, usa otra del inventario premium en menos de 1 s, y sigue así mientras esté activado.</p>` },
       { t: 'Vista general: recursos en rojo', tab: 'resumen', before: () => { if ((state.resumenView || 'ciudades') !== 'ciudades') { state.resumenView = 'ciudades'; return true; } }, find: () => TQ.card(/^Vista general/) || TQ.tab('resumen'), h: `
         <p>En la columna <b>Recursos</b>, el % sale en <b>rojo</b> desde el 95 % (o lleno), en amarillo desde el 90 %.</p>` },
       { t: 'Construcción sin intercalar: en orden de verdad', tab: 'construccion', find: () => TQ.tab('construccion'), h: `
@@ -8335,6 +8435,7 @@
     startCaveEngine();
     startRecruitEngine();
     startAttackEngine();
+    startStratEngine();
     startFestivalEngine();
     if (cloudOn()) startCloudSync(true);
 
