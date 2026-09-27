@@ -2571,6 +2571,11 @@
       const reason = s.down ? (cur <= 0 ? 'ya está a 0' : null) : buildBlockReason(townId, info);
       if (!reason) return { id: s.id, level: s.level, gi: s.gi, down: !!s.down };
       if (state.construccion.strictOrder) return { reason: `${buildingName(s.id)}: ${reason}`, blockedGi: s.gi };
+      // Sin intercalar, el orden se respeta: si al primero solo le FALTAN RECURSOS (o están
+      // reservados), se espera a que lleguen en vez de saltar al siguiente edificio (eso
+      // parecía intercalar). Solo se salta lo que no se arregla con recursos (requisitos,
+      // nivel máximo, almacén pequeño, población…).
+      if (!townInterleave(townId) && !buildHardBlock(info, townId)) return { reason: `${buildingName(s.id)}: ${reason} (en orden: espera)`, blockedGi: s.gi };
       skip.add(s.id);
     }
     return { reason: 'nada pendiente' };
@@ -2673,7 +2678,7 @@
       el('div', { class: 'nb-row' }, [el('div', { class: 'nb-option-text' }, [el('b', {}, 'Construcción automática'), el('span', { class: 'nb-option-hint' }, `Todas las ciudades${excCount ? ` · ${excCount} excepción(es)` : ''}`)]), sw]),
       el('div', { class: 'nb-row nb-option' }, [el('div', { class: 'nb-option-text' }, [el('span', { class: 'nb-option-label' }, `Solo ${farmTownName(townId)}`),
         el('span', { class: `nb-option-hint${isExc ? ' nb-warn-txt' : ''}` }, isExc ? `Excepción: ${tcfg.enabled ? 'activada' : 'desactivada'} aunque el general esté ${cfg.enabled ? 'activado' : 'desactivado'}` : 'Sigue al general')]), townSw]),
-      optionRow('Intercalar edificios', `Solo en ${farmTownName(townId)} · un nivel de cada uno por turnos, en el orden en que los añades`, townInterleave(townId), (v) => {
+      optionRow('Intercalar edificios', `Solo en ${farmTownName(townId)} · un nivel de cada uno por turnos. Sin intercalar va en orden: si al primero le faltan recursos, espera (no salta al siguiente)`, townInterleave(townId), (v) => {
         tcfg.interleave = v; saveState(); renderBody();
         buildLog(`${farmTownName(townId)}: intercalar ${v ? 'activado' : 'desactivado'}.`);
       }),
@@ -7283,7 +7288,7 @@
       { t: 'Qué hace solo', find: () => TQ.lastCard(/^Actividad/), h: `
         ${AUTO(`<ul>
           <li>Cada 15 s, en todas las ciudades con la construcción activa, encarga el siguiente nivel si hay hueco en la cola (<b>7</b> con Administrador, si no <b>2</b>) y recursos que no estén reservados por la prioridad.</li>
-          <li>Salta los edificios bloqueados (requisitos, almacén pequeño, población, nivel máximo) salvo con orden estricto.</li>
+          <li>Salta los edificios bloqueados (requisitos, almacén pequeño, población, nivel máximo) salvo con orden estricto. Sin intercalar, si al primero solo le faltan recursos, <b>espera</b> a que lleguen (no salta al siguiente).</li>
           <li>El <b>Comercio</b> le manda lo que falta para <b>todos los niveles que caben en la cola</b>, en el orden en que los va a construir.</li></ul>`)}` }
     ]);
 
@@ -7494,6 +7499,8 @@
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
     { v: '1.14.5', items: [
+      { t: 'Construcción sin intercalar: en orden de verdad', tab: 'construccion', find: () => TQ.tab('construccion'), h: `
+        <p>Sin <b>Intercalar edificios</b>, si al primer edificio de la lista le faltaban recursos, el bot saltaba al siguiente (y parecía que intercalaba). Ahora espera a que lleguen los recursos del primero. Solo salta los que no se arreglan con recursos (requisitos, nivel máximo, almacén pequeño, población).</p>` },
       { t: 'Islas con varias ciudades', tab: 'granjas', find: () => TQ.card(/^Islas con varias ciudades/) || TQ.tab('granjas'), h: `
         <p>Nueva tarjeta en Granjas: en cada isla con varias ciudades eliges la <b>principal</b> (la que recoge las aldeas). Cuando pasa del <b>70 %</b> de almacén (lo cambias), recoge otra de la isla siempre que no esté más llena que la principal; si no hay ninguna así, sigue la principal hasta el tope que tengas puesto.</p>` },
       { t: 'Almacén lleno: con todos los comerciantes', tab: 'comercio', find: () => TQ.card(/^Equilibrio entre ciudades/) || TQ.tab('comercio'), h: `
