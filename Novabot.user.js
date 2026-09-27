@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.14.9
+// @version      1.14.10
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.14.9';
+  const VERSION = '1.14.10';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -524,6 +524,7 @@
       else if (b.reason) { st = b.reason; cls = 'wait'; }
       else if (RES.every((k) => cur[k] >= b.cost[k])) { st = 'Lote listo para reclutar'; cls = 'ok'; readyLots++; }
       else { st = 'Reuniendo recursos'; cls = 'run'; }
+      if (b?.spellWait && (cls === 'run' || cls === 'ok')) st = [st, el('span', { class: 'nb-ov-dim' }, ` · ${b.spellWait}`)];
       if (cls === 'wait') waiting++;
       // Tropas pedidas
       const rows = cfg.goals.map((g) => {
@@ -4704,6 +4705,19 @@
       return { rows: pending, units: {}, cost: { wood: 0, stone: 0, iron: 0 }, queueFull: true, nextFree: Number.isFinite(next) ? next : 0,
         reason: `Cola de reclutamiento llena${Number.isFinite(next) ? ` hasta ${srvClock(next)}` : ''}: no se piden recursos.` };
     }
+    // Hechizo OBLIGATORIO sin favor para una cola (p. ej. Cuartel sin Crecimiento) pero la
+    // otra sí puede (Puerto): se recluta lo de la que puede, en vez de quedarse parada
+    // guardando el turno. (Si ninguna puede, sigue igual y se espera al favor.)
+    let spellWait = null;
+    {
+      const t = atMs || Date.now(), why = {};
+      for (const k of new Set(open.map((r) => kindOf(r.id)))) { try { why[k] = recruitSpellBlock(townId, [k], t); } catch { why[k] = null; } }
+      const ok = open.filter((r) => !why[kindOf(r.id)]);
+      if (ok.length && ok.length < open.length) {
+        spellWait = `${why.ground ? 'Cuartel' : 'Puerto'} esperando favor (${(why.ground || why.naval).replace(/^Sin favor de /, '').replace(/: no se le mandan.*$/, '')})`;
+        open.splice(0, open.length, ...ok);
+      }
+    }
     rows.splice(0, rows.length, ...open);
     const pick = rows.find((r) => r.fit > 0 && r.rem >= r.fit)   // falta al menos un lote completo
       || rows.filter((r) => r.fit > 0).sort((a, b) => b.rem * b.c.pop - a.rem * a.c.pop)[0]; // restos: el más grande primero
@@ -4713,7 +4727,7 @@
     if (n <= 0) return { rows, units: {}, cost: { wood: 0, stone: 0, iron: 0 }, reason: 'sin población libre' };
     const full = n === Math.min(pick.rem, pick.fit);
     return {
-      rows, units: { [pick.id]: n }, full, tail: pick.rem < pick.fit,
+      rows, units: { [pick.id]: n }, full, tail: pick.rem < pick.fit, spellWait,
       // El juego cobra el coste exacto por unidad (p. ej. 49,5) y redondea el TOTAL hacia arriba:
       // 323 honderos = 15 988,5 → 15 989 de madera (visto en una orden real).
       cost: { wood: Math.ceil(n * pick.c.wood), stone: Math.ceil(n * pick.c.stone), iron: Math.ceil(n * pick.c.iron) },
@@ -7641,6 +7655,7 @@
         <ul><li><b>No</b>: no se usa.</li><li><b>Opcional</b>: se lanza si hay favor.</li><li><b>Obligatorio</b>: no recluta hasta tenerlo activo (espera al favor y lo lanza solo).</li></ul>
         ${AUTO('Se lanzan <b>justo antes de mandar la orden</b>: primero el juego confirma que el lote ya se puede reclutar (recursos y población en la ciudad) y entonces van el hechizo y la orden seguidos. Mientras los recursos vienen de camino no se lanza, para no gastar su duración con la cola vacía.')}
         ${AUTO('Con uno <b>obligatorio</b>: si cuando lleguen los recursos no habrá favor para lanzarlo, no se le mandan ni reservan recursos a esa ciudad (no podría reclutar).')}
+        ${AUTO('Un obligatorio solo frena su cola: si al Cuartel le falta favor pero hay tropas pedidas en el Puerto, se recluta lo del Puerto mientras tanto (y al revés).')}
         ${AUTO('Si varias ciudades esperan el mismo hechizo obligatorio y el favor no llega para todas, se reparte <b>por orden de la cola</b>: la primera se lo queda y las de detrás no reciben recursos ni lo lanzan hasta que haya favor también para ellas. Los opcionales nunca gastan el favor reservado para los obligatorios.')}
         ${AUTO('Los hechizos activos de <b>todas</b> las ciudades se leen de la vista general de dioses (al cargar y cada minuto), no solo los de la ciudad que estás viendo. Hasta leerlos no se salta a ninguna ciudad ni se mandan recursos a las que tienen uno obligatorio.')}` },
       { t: 'Siguiente lote', find: () => TQ.card(/^Siguiente lote/), h: `
@@ -7810,6 +7825,10 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.14.10', items: [
+      { t: 'Hechizo obligatorio: la otra cola sigue', tab: 'resumen', before: () => { if (state.resumenView !== 'reclutamiento') { state.resumenView = 'reclutamiento'; return true; } }, find: () => TQ.sel('.nb-rc-grid', bodyEl) || TQ.tab('resumen'), h: `
+        <p>Si a una ciudad le falta favor para el hechizo obligatorio del <b>Cuartel</b> pero tiene tropas pedidas en el <b>Puerto</b> (o al revés), ahora recluta lo del Puerto en vez de quedarse parada ocupando su turno. En la tarjeta sale «Cuartel esperando favor (…)».</p>` }
+    ] },
     { v: '1.14.9', items: [
       { t: 'Favor de hechizos por orden de la cola', tab: 'resumen', before: () => { if (state.resumenView !== 'reclutamiento') { state.resumenView = 'reclutamiento'; return true; } }, find: () => TQ.card(/^Ciudades reclutando/) || TQ.tab('resumen'), h: `
         <p>Arreglado: si varias ciudades esperaban el mismo hechizo obligatorio, al haber favor para uno se les mandaban recursos a <b>todas</b>.</p>
