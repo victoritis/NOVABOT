@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.14.7
+// @version      1.14.8
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.14.7';
+  const VERSION = '1.14.8';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -496,6 +496,7 @@
   // Clic en la tarjeta = ir a la pestaña.
   /* Vista general · Reclutamiento del bot: por ciudad, qué tropas se piden, cuánto
      falta, el lote siguiente (y si está listo), colas y hechizos. Solo lectura. */
+  let recruitRemovedOpen = false;
   function renderResumenRecruit() {
     if (overviewReady()) for (const id of allTownIds()) pruneRecruitGoals(id);
     // Hechizos de TODAS las ciudades (recién recargado el juego solo trae los de la actual).
@@ -605,24 +606,6 @@
         el('p', { class: 'nb-placeholder' }, 'Interruptor activado (por defecto) = recluta con el bot; desactivado = no recluta ni pide recursos. ▲▼ = orden: las N de arriba son las que reclutan. Se salta la que no puede por falta de favor para un hechizo obligatorio (vuelve en cuanto lo tenga).')
       ]));
     }
-    // Quitados hace poco (cumplidos: lo que faltaba ya está en la cola del juego o hecho).
-    {
-      const rc = state.reclutamiento;
-      const list = (rc.removed || []).filter((r) => Date.now() - r.at < 24 * 3600000).slice().reverse();
-      if (list.length) bodyEl.appendChild(el('div', { class: 'nb-card' }, [
-        el('div', { class: 'nb-card-title' }, `Quitados hace poco (${list.length})`),
-        ...list.map((r) => el('div', { class: 'nb-row' }, [
-          el('span', { class: 'nb-row-label' }, `${farmTownName(r.townId)} · ${r.target} ${unitName(r.id)} · ${srvClock(r.at)}`),
-          el('span', { class: 'nb-btn nb-btn-sm', title: 'Volver a ponerlo en el bot (si faltan, se reclutan)', onclick: () => {
-            const t = townRecruitCfg(r.townId); const g = t.goals.find((x) => x.id === r.id);
-            if (g) g.target = Math.max(g.target, r.target); else t.goals.push({ id: r.id, target: r.target });
-            rc.removed = (rc.removed || []).filter((x) => x !== r && !(x.townId === r.townId && x.id === r.id && x.at === r.at));
-            saveState(); renderBody(); recruitLog(`${farmTownName(r.townId)}: devuelto ${r.target} ${unitName(r.id)} al bot.`, 'ok');
-          } }, 'Devolver')
-        ])),
-        el('p', { class: 'nb-placeholder' }, 'Se quitan solos cuando lo que faltaba ya está en la cola del juego (o hecho). Si los devuelves y ya están todos, se volverán a quitar; si murieron tropas, se reclutan.')
-      ]));
-    }
     bodyEl.appendChild(el('div', { class: 'nb-stats nb-rc-stats' }, [
       el('div', { class: 'nb-stat' }, [el('span', {}, 'Ciudades reclutando'), el('b', {}, String(towns.length))]),
       el('div', { class: 'nb-stat' }, [el('span', {}, 'Tropas por reclutar'), el('b', {}, pendingUnits.toLocaleString('es-ES'))]),
@@ -631,6 +614,35 @@
     ]));
     bodyEl.appendChild(towns.length ? el('div', { class: 'nb-rc-grid' }, cards)
       : el('div', { class: 'nb-card' }, [el('p', { class: 'nb-placeholder' }, 'Ninguna ciudad tiene tropas pedidas en el bot.')]));
+    // Historial (plegado): tropas que el bot quitó porque ya estaban cumplidas. No es
+    // nada pendiente; solo sirve para comprobarlo o devolverlo.
+    {
+      const rc = state.reclutamiento;
+      const list = (rc.removed || []).filter((r) => Date.now() - r.at < 24 * 3600000).slice().reverse();
+      if (list.length) {
+        const det = el('details', { class: 'nb-card' });
+        if (recruitRemovedOpen) det.open = true;
+        det.addEventListener('toggle', () => { recruitRemovedOpen = det.open; });
+        det.appendChild(el('summary', { class: 'nb-card-title', style: 'cursor:pointer' }, `Historial: cumplidos y quitados del bot (${list.length}, últimas 24 h)`));
+        det.appendChild(el('p', { class: 'nb-placeholder' }, 'Ya NO están pendientes: el bot los quitó porque tus tropas + las de la cola del juego ya llegaban al objetivo. Lo que sigue pendiente está solo en las tarjetas de arriba.'));
+        for (const r of list) {
+          const h = +townUnitsHave(r.townId)[r.id] || 0, q = +queuedUnits(r.townId)[r.id] || 0;
+          const pend = townRecruitCfg(r.townId).goals.find((g) => g.id === r.id);
+          const now = pend ? `otra vez en el bot (${pend.target})` : h + q >= r.target ? `ahora ${h}${q ? ` + ${q} en cola` : ''} ✓` : `ahora ${h}${q ? ` + ${q} en cola` : ''}: faltan ${r.target - h - q}`;
+          det.appendChild(el('div', { class: 'nb-row' }, [
+            el('span', { class: 'nb-row-label' }, [el('b', {}, `${farmTownName(r.townId)} · ${r.target} ${unitName(r.id)}`), el('span', { class: 'nb-ov-dim', style: 'margin-left:8px' }, `quitado ${srvClock(r.at)} · ${now}`)]),
+            pend ? null : el('span', { class: 'nb-btn nb-btn-sm', title: 'Volver a ponerlo en el bot (si faltan, se reclutan)', onclick: () => {
+              const t = townRecruitCfg(r.townId); const g = t.goals.find((x) => x.id === r.id);
+              if (g) g.target = Math.max(g.target, r.target); else t.goals.push({ id: r.id, target: r.target });
+              rc.removed = (rc.removed || []).filter((x) => x !== r && !(x.townId === r.townId && x.id === r.id && x.at === r.at));
+              saveState(); renderBody(); recruitLog(`${farmTownName(r.townId)}: devuelto ${r.target} ${unitName(r.id)} al bot.`, 'ok');
+            } }, 'Devolver')
+          ]));
+        }
+        det.appendChild(el('div', { class: 'nb-row' }, [el('span', {}, ''), el('span', { class: 'nb-btn nb-btn-sm', onclick: () => { rc.removed = []; saveState(); renderBody(); } }, 'Vaciar historial')]));
+        bodyEl.appendChild(det);
+      }
+    }
     updateCountdown();
   }
 
@@ -3244,6 +3256,7 @@
           const units = {};
           for (const u of t.units || []) units[u.id] = { count: +u.count || 0, total: +u.total || 0, rf: +u.research_factor || 1 };
           map.set(+t.id, { orders, units, freePop: +t.free_population, storage: +t.storage_volume || 0 });
+          if (orders.length) unitSync.dirty.add(+t.id);
         }
         overview.recruit = map;
         overview.recruitAt = Date.now();
@@ -3262,6 +3275,28 @@
     if (!typing && bodyEl && ['inicio', 'comercio', 'reclutamiento'].includes(state.activeTab)) renderBody();
   }
   const overviewReady = () => overview.at > 0;
+
+  /* Tropas de ciudades que NO estás viendo: el servidor solo suma a la ciudad las tropas
+     que va terminando su cola cuando "toca" esa ciudad (al abrirla o hacer algo en ella).
+     Hasta entonces la vista de reclutamiento da la cifra VIEJA, mientras que lo que queda
+     en cola sí está al día → faltan tropas en la cuenta (comprobado en 03. NOVA: 247
+     jinetes; tras abrir su Cuartel, 281). Con eso el bot creía que faltaban tropas y podía
+     reclutar DE MÁS. Solución: leer el Cuartel de esas ciudades (solo lectura, como abrir
+     la ventana) antes de decidir, y cada 2 min las que tienen cola. */
+  const unitSync = { touched: new Map(), dirty: new Set() };
+  const unitsStale = (townId, maxAge) => +townId !== +UW.Game?.townId && unitSync.dirty.has(+townId) && Date.now() - (unitSync.touched.get(+townId) || 0) > maxAge;
+  async function touchTownUnits(townId) {
+    unitSync.touched.set(+townId, Date.now()); unitSync.dirty.delete(+townId);
+    try { await gpGetAs(townId, 'building_barracks', 'index', { nl_init: true }); } catch {}
+  }
+  // Pone al día las ciudades con cola (y tropas pedidas) y relee la vista de reclutamiento.
+  async function freshenRecruitUnits(ids, maxAge) {
+    const list = ids.filter((id) => unitsStale(id, maxAge));
+    if (!list.length) return false;
+    for (let i = 0; i < list.length; i++) { if (i) await sleep(300 + Math.random() * 300); await touchTownUnits(list[i]); }
+    await refreshOverviews();
+    return true;
+  }
 
   function startOverviewSync() {
     if (overview.timer) return;
@@ -4568,7 +4603,7 @@
   }
   function queuedUnits(townId) {
     const out = {};
-    for (const o of townUnitOrders(townId)) out[o.unit_type] = (out[o.unit_type] || 0) + (+o.units_left || +o.count || 0);
+    for (const o of townUnitOrders(townId)) out[o.unit_type] = (out[o.unit_type] || 0) + (o.units_left != null && Number.isFinite(+o.units_left) ? +o.units_left : +o.count || 0);
     return out;
   }
   // Cuartel (tierra) y Puerto (mar) tienen colas separadas.
@@ -4992,6 +5027,8 @@
     const starting = allTownIds().filter((id) => { const t = state.reclutamiento.towns[id]; return t && +t.startAt > 0 && +t.startAt <= Date.now() && recruitOnFor(id); });
     if (starting.length) { await refreshOverviews(); await refreshRecruitFlight(true); }
     else if (allTownIds().some((id) => recruitOnFor(id) && townRecruitCfg(id).goals.length)) await refreshRecruitFlight(false);
+    // Tropas al día en las ciudades con cola (si no, faltan las ya terminadas: ver unitSync).
+    await freshenRecruitUnits(allTownIds().filter((id) => recruitOnFor(id) && townRecruitCfg(id).goals.length), 120000);
     for (const id of allTownIds()) pruneRecruitGoals(id);
     // Hechizos de todas las ciudades: ANTES de decidir turnos, envíos o lotes. (Se mira
     // cualquier ciudad con reclutamiento y hechizos, no solo las que tienen turno: el turno
@@ -5014,6 +5051,14 @@
       const fr = reserveAbove(townId, 'reclutamiento');
       if (RES.some((k) => cur[k] - fr[k] < b.cost[k])) continue;
       if (b.favor && godFavor(townGod(townId)) < b.favor) continue;
+      // Justo antes de reclutar: tropas de la ciudad al día (si terminó cola desde la última
+      // lectura y no se cuenta, se reclutaría de más). Si el lote cambia, se decide en el
+      // siguiente ciclo con los datos buenos.
+      if (await freshenRecruitUnits([townId], 20000)) {
+        pruneRecruitGoals(townId);
+        const b2 = townRecruitCfg(townId).goals.length ? recruitBatch(townId) : null;
+        if (!b2 || b2.reason || JSON.stringify(b2.units) !== JSON.stringify(b.units)) continue;
+      }
       // Hechizos del cuartel / puerto: se lanzan pegados a la orden (los obligatorios
       // deben estar activos antes de reclutar).
       const setWait = (why) => { if (recruitRuntime.wait.get(townId) !== why) { recruitRuntime.wait.set(townId, why); renderIfIdle('reclutamiento'); } };
@@ -7423,7 +7468,9 @@
         <p>Vista <b>Investigación</b>: por ciudad, la cola del bot con el estado de cada investigación (siguiente, requisitos, faltan puntos…), la <b>siguiente</b> con sus recursos, la cola de la Academia y los <b>puntos</b> libres.</p>` },
       { t: 'Reclutamiento del bot', before: () => { if (state.resumenView !== 'reclutamiento') { state.resumenView = 'reclutamiento'; return true; } }, find: () => TQ.sel('.nb-rc-stats', bodyEl) || TQ.sel('.nb-seg-main', bodyEl), h: `
         <p>Vista <b>Reclutamiento</b>: por ciudad, qué tropas le has pedido al bot, cuánto falta (barra), el <b>siguiente lote</b> con sus recursos, las colas y los hechizos.</p>
-        <p>Colores del estado: <b>listo</b> para reclutar, reuniendo recursos, en espera (cola llena, programado, falta población…), desactivado o completo.</p>` }
+        <p>Colores del estado: <b>listo</b> para reclutar, reuniendo recursos, en espera (cola llena, programado, falta población…), desactivado o completo.</p>
+        <p>Lo pendiente está <b>solo en las tarjetas</b>. Abajo, plegado, el <b>Historial</b>: lo que el bot ya quitó por estar cumplido (tus tropas + la cola del juego llegan al objetivo), con cómo está ahora y un botón para devolverlo.</p>
+        ${AUTO('Las tropas de las ciudades que no estás viendo se ponen al día leyendo su Cuartel (el juego no suma lo que termina la cola hasta que “tocas” la ciudad): cada 2 min las que tienen cola y siempre justo antes de reclutar, para no reclutar de más.')}` }
     ]);
 
     // ------------------------------------------------------------------ Granjas
@@ -7719,13 +7766,20 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.14.8', items: [
+      { t: 'Recuento de tropas al día', tab: 'resumen', before: () => { if (state.resumenView !== 'reclutamiento') { state.resumenView = 'reclutamiento'; return true; } }, find: () => TQ.sel('.nb-rc-stats', bodyEl) || TQ.tab('resumen'), h: `
+        <p>Arreglado: en las ciudades que no estabas viendo, las tropas que terminaba la cola no se contaban hasta entrar en ellas (el juego no las suma antes). El bot veía de menos y podía <b>reclutar de más</b>.</p>
+        ${AUTO('Ahora lee el Cuartel de esas ciudades (solo lectura) cada 2 min y siempre justo antes de reclutar.')}` },
+      { t: 'Historial plegado', tab: 'resumen', before: () => { if (state.resumenView !== 'reclutamiento') { state.resumenView = 'reclutamiento'; return true; } }, find: () => TQ.card(/^Historial/) || TQ.tab('resumen'), h: `
+        <p>“Quitados hace poco” pasa a ser un <b>Historial</b> plegado al final: lo que el bot ya quitó por estar cumplido, con cómo está ahora (✓ o cuántas faltan) y <b>Devolver</b>. Lo pendiente está solo en las tarjetas. Botón para vaciarlo.</p>` }
+    ] },
     { v: '1.14.7', items: [
       { t: 'Hechizos activos de todas las ciudades', tab: 'resumen', before: () => { if (state.resumenView !== 'reclutamiento') { state.resumenView = 'reclutamiento'; return true; } }, find: () => TQ.card(/^Ciudades reclutando/) || TQ.tab('resumen'), h: `
         <p>Arreglado: al recargar, los hechizos activos de las ciudades que no estabas viendo no salían (hasta entrar en cada una) y la cola podía <b>saltarse</b> una ciudad con su hechizo obligatorio ya activo, o quedarse esperando para siempre.</p>
         ${AUTO('Ahora se leen los de <b>todas</b> las ciudades nada más cargar (y cada minuto). Mientras se leen, el icono sale con borde discontinuo y no se salta a ninguna ni se le mandan recursos a las que tienen hechizo obligatorio. Pasando el ratón por el icono ves cuánto le queda.')}` }
     ] },
     { v: '1.14.6', items: [
-      { t: 'Quitados hace poco', tab: 'resumen', before: () => { if (state.resumenView !== 'reclutamiento') { state.resumenView = 'reclutamiento'; return true; } }, find: () => TQ.card(/^Quitados hace poco/) || TQ.tab('resumen'), h: `
+      { t: 'Quitados hace poco', tab: 'resumen', before: () => { if (state.resumenView !== 'reclutamiento') { state.resumenView = 'reclutamiento'; return true; } }, find: () => TQ.card(/^Historial/) || TQ.tab('resumen'), h: `
         <p>En Vista general → Reclutamiento salen las tropas que el bot quitó por estar cumplidas (lo que faltaba ya estaba en la cola del juego), con un botón <b>Devolver</b>.</p>` },
       { t: 'Hechizo obligatorio sin favor: no se mandan recursos', tab: 'reclutamiento', find: () => TQ.card(/^Hechizos de reclutamiento/) || TQ.tab('reclutamiento'), h: `
         <p>Si una ciudad tiene un hechizo de reclutamiento <b>obligatorio</b> y no habrá favor para lanzarlo cuando lleguen los recursos (se calcula con lo que produce el dios), ya no se le mandan ni reservan recursos: no podría reclutar. En cuanto vaya a haber favor, se le vuelve a abastecer.</p>` },
