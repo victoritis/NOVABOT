@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.14.6
+// @version      1.14.7
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.14.6';
+  const VERSION = '1.14.7';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -498,6 +498,8 @@
      falta, el lote siguiente (y si está listo), colas y hechizos. Solo lectura. */
   function renderResumenRecruit() {
     if (overviewReady()) for (const id of allTownIds()) pruneRecruitGoals(id);
+    // Hechizos de TODAS las ciudades (recién recargado el juego solo trae los de la actual).
+    kickSpellRefresh();
     // En el orden de la cola de reclutamiento (el que eliges con ▲▼).
     const towns = allTownIds().filter((id) => townRecruitCfg(id).goals.length).sort(recruitQueueCmp);
     const limit = buildQueueLimit();
@@ -512,7 +514,7 @@
       let st, cls;
       if (!recruitOnFor(id)) { st = 'Desactivado'; cls = 'off'; }
       else if (!recruitIncluded(id)) { st = 'Desactivada en la cola'; cls = 'off'; }
-      else if (!recruitWaiting(id) && !recruitHasTurn(id)) { st = 'Esperando turno'; cls = 'wait'; }
+      else if (!recruitWaiting(id) && !recruitHasTurn(id)) { st = recruitSkip.get(id) ? `Se salta: ${recruitSkip.get(id).replace(/: no se le mandan.*$/, '')}` : 'Esperando turno'; cls = 'wait'; }
       else if (cfg.hold) { st = 'En espera SIN hora (no empieza sola)'; cls = 'wait'; }
       else if (+cfg.startAt > now) { st = ['Empieza en ', el('b', { 'data-nb-until': Math.round(cfg.startAt / 1000) }, formatLeft(Math.round(cfg.startAt / 1000)))]; cls = 'wait'; }
       else if (recruitRuntime.wait.get(id)) { st = recruitRuntime.wait.get(id); cls = 'wait'; }
@@ -551,8 +553,10 @@
       const orders = townUnitOrders(id);
       const qInfo = (naval) => { const n = orders.filter((o) => (o.kind === 'naval') === naval).length; return el('span', { class: 'nb-rc-q-item' }, [buildingIcon(naval ? 'docks' : 'barracks', true), `${n}/${limit}`]); };
       const spells = Object.entries(cfg.spells || {}).map(([sid, mode]) => {
-        const on = spellEnd(id, sid) > now;
-        return el('span', { class: `nb-rc-spell${on ? ' on' : ''}`, title: `${UW.GameData?.powers?.[sid]?.name || sid} · ${mode === 'required' ? 'obligatorio' : 'opcional'} · ${on ? 'activo' : 'inactivo'}` }, [el('span', { class: `nb-icon nb-icon-25 power_icon30x30 ${sid}` })]);
+        const end = spellEnd(id, sid), on = end > now;
+        const known = on || spellsKnown();
+        const left = on ? ` (quedan ${fmtDur(end - now)})` : '';
+        return el('span', { class: `nb-rc-spell${on ? ' on' : ''}`, style: known ? '' : 'opacity:.6;filter:grayscale(.5);outline:1px dashed currentColor;outline-offset:1px', title: `${UW.GameData?.powers?.[sid]?.name || sid} · ${mode === 'required' ? 'obligatorio' : 'opcional'} · ${on ? `activo${left}` : known ? 'inactivo' : 'leyendo hechizos…'}` }, [el('span', { class: `nb-icon nb-icon-25 power_icon30x30 ${sid}` })]);
       });
       return el('div', { class: `nb-rc-card nb-rc-${cls}${+UW.Game?.townId === id ? ' nb-rc-current' : ''}` }, [
         el('div', { class: 'nb-rc-head' }, [
@@ -596,6 +600,7 @@
       bodyEl.appendChild(el('div', { class: 'nb-card' }, [
         el('div', { class: 'nb-row' }, [el('div', { class: 'nb-option-text' }, [el('span', { class: 'nb-option-label' }, 'Ciudades reclutando a la vez'), el('span', { class: 'nb-option-hint' }, 'Con un máximo N, reclutan siempre las N primeras de la cola que puedan (sube o baja con ▲▼)')]), sel]),
         el('div', { class: 'nb-card-title nb-mt' }, 'Cola de reclutamiento'),
+        spellsKnown() ? null : el('p', { class: 'nb-placeholder' }, 'Leyendo los hechizos activos de todas las ciudades… (hasta entonces no se salta a ninguna ni se le mandan recursos a las que tienen hechizo obligatorio)'),
         ...(rows.length ? rows : [el('p', { class: 'nb-placeholder' }, 'Ninguna ciudad tiene tropas pedidas.')]),
         el('p', { class: 'nb-placeholder' }, 'Interruptor activado (por defecto) = recluta con el bot; desactivado = no recluta ni pide recursos. ▲▼ = orden: las N de arriba son las que reclutan. Se salta la que no puede por falta de favor para un hechizo obligatorio (vuelve en cuanto lo tenga).')
       ]));
@@ -4320,6 +4325,9 @@
   function recruitBlockedNow(townId) {
     const cfg = townRecruitCfg(townId);
     if (!Object.values(cfg.spells || {}).includes('required')) return null;
+    // Sin leer aún los hechizos de todas las ciudades no se salta a nadie por "sin favor"
+    // (el juego solo tiene los de la ciudad que estás viendo): se decide al leerlos.
+    if (!spellsKnown()) { kickSpellRefresh(0); return null; }
     const have = townUnitsHave(townId), queued = queuedUnits(townId);
     const kinds = [...new Set(cfg.goals.filter((g) => g.target - (+have[g.id] || 0) - (+queued[g.id] || 0) > 0)
       .map((g) => (isNavalUnit(g.id) ? 'naval' : 'ground')))];
@@ -4697,6 +4705,9 @@
       // Con inicio programado, hasta que llegue la hora la ciudad NO pide ni reserva
       // nada: queda totalmente libre (incluso para donar a otras).
       if (!recruitEnabledFor(townId) || !townRecruitCfg(townId).goals.length) continue;
+      // Con hechizo OBLIGATORIO y aún sin leer los hechizos de todas las ciudades (recién
+      // recargado): no se pide nada hasta saber si está activo (se lee en segundos).
+      if (!spellsKnown() && Object.values(townRecruitCfg(townId).spells || {}).includes('required')) { kickSpellRefresh(0); continue; }
       // Hechizo obligatorio sin favor para cuando lleguen los recursos: no se le manda nada
       // (ni se le reserva) — no podría reclutar y los recursos se quedarían parados allí.
       {
@@ -4748,13 +4759,29 @@
     { id: 'fertility_improvement', kind: 'ground' },
     { id: 'call_of_the_ocean', kind: 'naval' }
   ];
-  const spellInfo = { at: 0, busy: false, active: new Map() }; // townId -> { power_id: endMs }
+  const spellInfo = { at: 0, tryAt: 0, busy: null, fails: 0, active: new Map() }; // townId -> { power_id: endMs }
+  // ¿Ya se han leído los hechizos de TODAS las ciudades? Nada más recargar, el juego solo
+  // tiene cargados los de la ciudad que estás viendo: hasta leer la vista de dioses no se
+  // decide nada que dependa de ellos (ni se pinta "inactivo" como si se supiera).
+  const spellsKnown = () => spellInfo.at > 0;
   // Hechizos activos de TODAS las ciudades: vista general de dioses (solo lectura,
   // lo mismo que abrir esa ventana): data.towns[].casted_powers = { power_id: fin (s) }.
   // (Comprobado: el "refetch" de CastedPowers devuelve vacío aunque haya hechizos.)
-  async function refreshCastedPowers() {
-    if (spellInfo.busy) return;
-    spellInfo.busy = true;
+  // Si ya hay una lectura en marcha se devuelve esa (quien haga await espera a los datos).
+  function refreshCastedPowers() {
+    if (spellInfo.busy) return spellInfo.busy;
+    spellInfo.busy = refreshCastedPowersImpl().finally(() => { spellInfo.busy = null; });
+    return spellInfo.busy;
+  }
+  // Lanza la lectura si los datos tienen más de maxAge ms (o no hay) y, al llegar, repinta.
+  function kickSpellRefresh(maxAge = 60000) {
+    if (spellInfo.busy || (spellsKnown() && Date.now() - spellInfo.at < maxAge)) return;
+    if (spellInfo.fails && Date.now() - spellInfo.tryAt < 10000) return; // tras un fallo, no insistir en bucle
+    refreshCastedPowers().then(() => { renderIfIdle('resumen'); renderIfIdle('reclutamiento'); });
+  }
+  async function refreshCastedPowersImpl() {
+    let ok = false;
+    spellInfo.tryAt = Date.now();
     try {
       const d = await gpGet('town_overviews', 'gods_overview', { nl_init: true });
       const towns = d?.data?.towns;
@@ -4769,9 +4796,16 @@
         }
         // Los recién lanzados por el bot que la vista aún no trae se mantienen.
         for (const [t, o] of spellInfo.active) for (const [k, end] of Object.entries(o)) if (end > Date.now() && !(map.get(t)?.[k] > 0)) { if (!map.has(t)) map.set(t, {}); map.get(t)[k] = end; }
-        spellInfo.active = map; spellInfo.at = Date.now();
+        spellInfo.active = map; spellInfo.at = Date.now(); spellInfo.fails = 0; ok = true;
       }
-    } catch {} finally { spellInfo.busy = false; }
+    } catch {}
+    if (!ok) {
+      // Si la vista de dioses no se puede leer varias veces seguidas, se sigue con lo que
+      // haya (la ciudad actual + los lanzados por el bot) para no parar el reclutamiento.
+      if (++spellInfo.fails === 3) recruitLog('No se pudo leer la vista de dioses: los hechizos de otras ciudades pueden no verse bien hasta que vuelva a leerse.', 'error');
+      if (spellInfo.fails >= 3 && !spellsKnown()) spellInfo.at = Date.now() - 45000; // reintenta en ~15 s
+    }
+    recruitTurnMemo.at = 0; // la cola (quién se salta por falta de favor) se recalcula con esto
   }
   function spellEnd(townId, id) {
     let end = spellInfo.active.get(+townId)?.[id] || 0;
@@ -4959,8 +4993,11 @@
     if (starting.length) { await refreshOverviews(); await refreshRecruitFlight(true); }
     else if (allTownIds().some((id) => recruitOnFor(id) && townRecruitCfg(id).goals.length)) await refreshRecruitFlight(false);
     for (const id of allTownIds()) pruneRecruitGoals(id);
-    const anySpells = allTownIds().some((id) => recruitEnabledFor(id) && Object.values(townRecruitCfg(id).spells || {}).some(Boolean));
-    if (anySpells && Date.now() - spellInfo.at > 60000) await refreshCastedPowers();
+    // Hechizos de todas las ciudades: ANTES de decidir turnos, envíos o lotes. (Se mira
+    // cualquier ciudad con reclutamiento y hechizos, no solo las que tienen turno: el turno
+    // depende de esto y, si no, una ciudad saltada por "sin favor" nunca lo volvería a leer.)
+    const anySpells = allTownIds().some((id) => recruitOnFor(id) && townRecruitCfg(id).goals.length && Object.values(townRecruitCfg(id).spells || {}).some(Boolean));
+    if (anySpells && (!spellsKnown() || Date.now() - spellInfo.at > 60000) && !(spellInfo.fails && Date.now() - spellInfo.tryAt < 10000)) await refreshCastedPowers();
     for (const townId of allTownIds()) {
       if (!recruitEnabledFor(townId)) continue;
       const tc = townRecruitCfg(townId);
@@ -5125,7 +5162,7 @@
     if (prioWarn) bodyEl.appendChild(prioWarn);
 
     // Hechizos de reclutamiento de esta ciudad
-    if (Date.now() - spellInfo.at > 60000 && !spellInfo.busy) refreshCastedPowers().then(() => renderIfIdle('reclutamiento'));
+    kickSpellRefresh();
     const spellRows = RECRUIT_SPELLS.map((sd) => {
       const p = UW.GameData?.powers?.[sd.id]; if (!p) return null;
       const mode = tcfg.spells?.[sd.id] || '';
@@ -5139,7 +5176,7 @@
           el('div', { class: 'nb-goal-name' }, `${p.name} · ${sd.kind === 'naval' ? 'Puerto' : 'Cuartel'}`),
           el('div', { class: 'nb-goal-sub' }, [
             `${UW.GameData?.gods?.[p.god_id]?.name || p.god_id} · ${p.favor} favor (tienes ${fav}) · `,
-            end > Date.now() ? el('span', { class: 'nb-ok' }, ['activo ', el('b', { 'data-nb-until': Math.round(end / 1000) }, formatLeft(Math.round(end / 1000)))]) : 'inactivo'
+            end > Date.now() ? el('span', { class: 'nb-ok' }, ['activo ', el('b', { 'data-nb-until': Math.round(end / 1000) }, formatLeft(Math.round(end / 1000)))]) : spellsKnown() ? 'inactivo' : 'leyendo…'
           ])
         ]),
         seg
@@ -7513,7 +7550,8 @@
         <p>Por ciudad, para Entrenamiento espartano, Crecimiento de la población y La llamada del mar:</p>
         <ul><li><b>No</b>: no se usa.</li><li><b>Opcional</b>: se lanza si hay favor.</li><li><b>Obligatorio</b>: no recluta hasta tenerlo activo (espera al favor y lo lanza solo).</li></ul>
         ${AUTO('Se lanzan <b>justo antes de mandar la orden</b>: primero el juego confirma que el lote ya se puede reclutar (recursos y población en la ciudad) y entonces van el hechizo y la orden seguidos. Mientras los recursos vienen de camino no se lanza, para no gastar su duración con la cola vacía.')}
-        ${AUTO('Con uno <b>obligatorio</b>: si cuando lleguen los recursos no habrá favor para lanzarlo, no se le mandan ni reservan recursos a esa ciudad (no podría reclutar).')}` },
+        ${AUTO('Con uno <b>obligatorio</b>: si cuando lleguen los recursos no habrá favor para lanzarlo, no se le mandan ni reservan recursos a esa ciudad (no podría reclutar).')}
+        ${AUTO('Los hechizos activos de <b>todas</b> las ciudades se leen de la vista general de dioses (al cargar y cada minuto), no solo los de la ciudad que estás viendo. Hasta leerlos no se salta a ninguna ciudad ni se mandan recursos a las que tienen uno obligatorio.')}` },
       { t: 'Siguiente lote', find: () => TQ.card(/^Siguiente lote/), h: `
         <p>Qué tropa y cuántas, población y favor que usa, y barras con los recursos que tiene la ciudad frente a lo que cuesta.</p>
         <p>Si no hay lote, te dice por qué: cola llena (hasta qué hora), esperando investigación, sin población, en espera, reservado para otro módulo…</p>
@@ -7681,6 +7719,11 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.14.7', items: [
+      { t: 'Hechizos activos de todas las ciudades', tab: 'resumen', before: () => { if (state.resumenView !== 'reclutamiento') { state.resumenView = 'reclutamiento'; return true; } }, find: () => TQ.card(/^Ciudades reclutando/) || TQ.tab('resumen'), h: `
+        <p>Arreglado: al recargar, los hechizos activos de las ciudades que no estabas viendo no salían (hasta entrar en cada una) y la cola podía <b>saltarse</b> una ciudad con su hechizo obligatorio ya activo, o quedarse esperando para siempre.</p>
+        ${AUTO('Ahora se leen los de <b>todas</b> las ciudades nada más cargar (y cada minuto). Mientras se leen, el icono sale con borde discontinuo y no se salta a ninguna ni se le mandan recursos a las que tienen hechizo obligatorio. Pasando el ratón por el icono ves cuánto le queda.')}` }
+    ] },
     { v: '1.14.6', items: [
       { t: 'Quitados hace poco', tab: 'resumen', before: () => { if (state.resumenView !== 'reclutamiento') { state.resumenView = 'reclutamiento'; return true; } }, find: () => TQ.card(/^Quitados hace poco/) || TQ.tab('resumen'), h: `
         <p>En Vista general → Reclutamiento salen las tropas que el bot quitó por estar cumplidas (lo que faltaba ya estaba en la cola del juego), con un botón <b>Devolver</b>.</p>` },
