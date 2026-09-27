@@ -75,7 +75,8 @@
     { id: 'comercio',    label: 'Comercio',       icon: 'trade',  disabled: false },
     { id: 'festivales',  label: 'Festivales',     icon: 'star',   disabled: false },
     { id: 'cueva',       label: 'Cueva',          icon: 'cave',   disabled: false },
-    { id: 'ataques',     label: 'Ataques',        icon: 'sword',  disabled: false }
+    { id: 'ataques',     label: 'Ataques',        icon: 'sword',  disabled: false },
+    { id: 'estrategia',  label: 'Estrategia',     icon: 'star',   disabled: false }
   ];
 
   /* ---------------------------------------------------------------------------------
@@ -387,7 +388,7 @@
   const fmtResEl = (r) => el('span', { class: 'nb-res-list' }, RES.filter((k) => (+r?.[k] || 0) > 0)
     .map((k) => el('span', { class: 'nb-res' }, [resIcon(k), String(Math.round(r[k]))])));
   // Icono de cada módulo (edificio del juego que lo representa).
-  const MODULE_ICON = { granjas: 'farm', construccion: 'main', investigacion: 'academy', reclutamiento: 'barracks', comercio: 'market', festivales: 'place', cueva: 'hide', ataques: 'wall', inicio: 'main', prioridad: 'storage' };
+  const MODULE_ICON = { granjas: 'farm', construccion: 'main', investigacion: 'academy', reclutamiento: 'barracks', comercio: 'market', festivales: 'place', cueva: 'hide', ataques: 'wall', estrategia: 'temple', inicio: 'main', prioridad: 'storage' };
   // Títulos de tarjeta: icono pequeño del edificio correspondiente (adorno).
   const TITLE_ICON = [
     [/prioridad/i, 'storage'], [/en camino|necesidades/i, 'market'], [/lote|tropa/i, 'barracks'],
@@ -472,6 +473,8 @@
       renderInvestigacionTab();
     } else if (state.activeTab === 'ataques') {
       renderAtaquesTab();
+    } else if (state.activeTab === 'estrategia') {
+      renderEstrategiaTab();
     } else if (state.activeTab === 'reclutamiento') {
       renderReclutamientoTab();
     } else if (state.activeTab === 'comercio') {
@@ -6355,7 +6358,7 @@
     try { for (const c of [].concat(UW.MM.getCollections().CastedPowers || [])) for (const m of c?.models || []) if (STRAT_RE.test(m.attributes.power_id || '')) return +m.attributes.town_id; } catch {}
     return null;
   }
-  function stratLog(text, kind = 'info') { atkLog(`Estrategia: ${text}`, kind); }
+  function stratLog(text, kind = 'info') { atkLog(`Estrategia: ${text}`, kind); renderIfIdle('estrategia'); }
   async function stratPoll(townId) {
     // Servidor (solo lectura): ¿sigue activa en esa ciudad?
     const d = await gpGet('town_overviews', 'gods_overview', { nl_init: true });
@@ -6409,12 +6412,21 @@
     const act = cfg.townId ? stratActiveLocal(cfg.townId) : null;
     const sw = switchEl(!!cfg.enabled, (v) => { stratCfg().enabled = v; if (!cfg.townId) stratCfg().townId = +sel.value; saveState(); renderBody(); stratLog(v ? `renovación al instante ACTIVADA en ${farmTownName(+sel.value)}.` : 'renovación desactivada.'); }, false);
     return el('div', { class: 'nb-card' }, [
-      el('div', { class: 'nb-row' }, [el('div', { class: 'nb-option-text' }, [el('b', {}, 'Renovar Estrategia divina al instante'), el('span', { class: 'nb-option-hint nb-warn-txt' }, 'Temporal · actívalo justo antes del ataque que llenará los puntos')]), sw]),
+      el('div', { class: 'nb-row' }, [el('div', { class: 'nb-option-text' }, [el('b', {}, 'Renovar Estrategia divina al instante'), el('span', { class: 'nb-option-hint nb-warn-txt' }, 'Temporal · mientras esté activado lo revisa todo el rato')]), sw]),
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Ciudad'), sel]),
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Ahora'), el('span', { class: 'nb-row-value' }, act ? `activa · ${act.limit ? `${act.progress}/${act.limit} puntos · ` : ''}hasta ${fmtWhen(act.end)}` : 'sin estrategia activa')]),
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'En el inventario premium'), el('span', { class: 'nb-row-value' }, String(stratItems().length))]),
       el('p', { class: 'nb-placeholder' }, 'Mientras está activado: en cuanto la estrategia de esa ciudad se acaba (tiempo o puntos de combate llenos), usa otra del inventario en menos de 1 s. Nunca usa dos seguidas sin ver la primera activa.')
     ]);
+  }
+
+  // Pestaña propia (no tiene que ver con los ataques programados).
+  function renderEstrategiaTab() {
+    const towns = allTownIds().sort((a, b) => farmTownName(a).localeCompare(farmTownName(b), 'es'));
+    bodyEl.appendChild(renderStratCard(towns));
+    const logBox = el('div', { class: 'nb-log' });
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [el('div', { class: 'nb-card-title' }, 'Actividad'), logBox]));
+    paintLog(logBox, atk.log.filter((e) => /^Estrategia:/.test(e.text)));
   }
 
   function renderAtaquesTab() {
@@ -6450,7 +6462,6 @@
       atkQueueEl = null;
       renderAtkForm(towns);
     }
-    bodyEl.appendChild(renderStratCard(towns));
 
     const logBox = el('div', { class: 'nb-log' });
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [el('div', { class: 'nb-card-title' }, 'Actividad'), logBox]));
@@ -7597,8 +7608,8 @@
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
     { v: '1.14.5', items: [
-      { t: 'Renovar Estrategia divina (temporal)', tab: 'ataques', find: () => TQ.card(/^Renovar Estrategia divina/) || TQ.tab('ataques'), h: `
-        <p>Abajo en Ataques: <b>Renovar Estrategia divina al instante</b> (desactivado). Actívalo justo antes del ataque que va a llenar los puntos de combate: en cuanto la estrategia de esa ciudad se acaba, usa otra del inventario premium en menos de 1 s, y sigue así mientras esté activado.</p>` },
+      { t: 'Renovar Estrategia divina (temporal)', tab: 'estrategia', find: () => TQ.card(/^Renovar Estrategia divina/) || TQ.tab('estrategia'), h: `
+        <p>Nueva pestaña <b>Estrategia</b>: <b>Renovar Estrategia divina al instante</b> (desactivado). Actívalo cuando quieras que vigile: en cuanto la estrategia de esa ciudad se acaba, usa otra del inventario premium en menos de 1 s, y sigue así mientras esté activado.</p>` },
       { t: 'Vista general: recursos en rojo', tab: 'resumen', before: () => { if ((state.resumenView || 'ciudades') !== 'ciudades') { state.resumenView = 'ciudades'; return true; } }, find: () => TQ.card(/^Vista general/) || TQ.tab('resumen'), h: `
         <p>En la columna <b>Recursos</b>, el % sale en <b>rojo</b> desde el 95 % (o lleno), en amarillo desde el 90 %.</p>` },
       { t: 'Construcción sin intercalar: en orden de verdad', tab: 'construccion', find: () => TQ.tab('construccion'), h: `
