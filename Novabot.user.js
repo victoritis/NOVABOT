@@ -182,6 +182,8 @@
         enabled: true,
         fillPct: 95,          // tamaño del lote = % del almacén
         lotsAhead: 2,         // lotes que se piden al comercio por adelantado
+        maxActive: 0,         // ciudades reclutando a la vez (0 = todas)
+        excluded: {},         // townId -> true: ciudad que NO recluta con el bot (desmarcada)
         towns: {}             // townId -> { goals: [{id, target}] }
       },
       cueva: {
@@ -509,6 +511,8 @@
       const now = Date.now();
       let st, cls;
       if (!recruitOnFor(id)) { st = 'Desactivado'; cls = 'off'; }
+      else if (!recruitIncluded(id)) { st = 'No incluida (desmarcada)'; cls = 'off'; }
+      else if (!recruitWaiting(id) && !recruitHasTurn(id)) { st = 'Esperando turno'; cls = 'wait'; }
       else if (cfg.hold) { st = 'En espera SIN hora (no empieza sola)'; cls = 'wait'; }
       else if (+cfg.startAt > now) { st = ['Empieza en ', el('b', { 'data-nb-until': Math.round(cfg.startAt / 1000) }, formatLeft(Math.round(cfg.startAt / 1000)))]; cls = 'wait'; }
       else if (recruitRuntime.wait.get(id)) { st = recruitRuntime.wait.get(id); cls = 'wait'; }
@@ -560,6 +564,24 @@
         el('div', { class: 'nb-rc-foot' }, [qInfo(false), qInfo(true), spells.length ? el('span', { class: 'nb-rc-spells' }, spells) : null])
       ]);
     });
+    // Turnos: cuántas a la vez y cuáles reclutan.
+    {
+      const rc = state.reclutamiento;
+      const sel = el('select', { class: 'nb-input nb-input-inline' });
+      for (const v of [0, 1, 2, 3, 4, 5, 6, 8, 10]) { const o = el('option', { value: v }, v ? String(v) : 'Todas'); if ((+rc.maxActive || 0) === v) o.selected = true; sel.appendChild(o); }
+      sel.addEventListener('change', () => { rc.maxActive = +sel.value; recruitTurnMemo.at = 0; saveState(); renderBody(); recruitLog(`Ciudades reclutando a la vez: ${+sel.value || 'todas'}.`); });
+      const turn = recruitTurnSet();
+      const chips = towns.map((id) => {
+        const cb = el('input', { type: 'checkbox' }); cb.checked = recruitIncluded(id);
+        cb.addEventListener('change', () => { rc.excluded = { ...(rc.excluded || {}) }; if (cb.checked) delete rc.excluded[id]; else rc.excluded[id] = true; recruitTurnMemo.at = 0; saveState(); renderBody(); });
+        return el('label', { class: 'nb-res', style: 'cursor:pointer;margin-right:10px' }, [cb, ` ${farmTownName(id)}${turn.has(id) && (+rc.maxActive || 0) ? ' ●' : ''}`]);
+      });
+      bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+        el('div', { class: 'nb-row' }, [el('div', { class: 'nb-option-text' }, [el('span', { class: 'nb-option-label' }, 'Ciudades reclutando a la vez'), el('span', { class: 'nb-option-hint' }, 'Las que están en turno (●) siguen hasta acabar; luego entra la siguiente. Las demás esperan sin pedir recursos')]), sel]),
+        towns.length ? el('div', { class: 'nb-res-list nb-mt' }, chips) : null,
+        el('p', { class: 'nb-placeholder' }, 'Marcadas = reclutan con el bot (todas por defecto). Desmarca las que no quieras que recluten ahora.')
+      ]));
+    }
     bodyEl.appendChild(el('div', { class: 'nb-stats nb-rc-stats' }, [
       el('div', { class: 'nb-stat' }, [el('span', {}, 'Ciudades reclutando'), el('b', {}, String(towns.length))]),
       el('div', { class: 'nb-stat' }, [el('span', {}, 'Tropas por reclutar'), el('b', {}, pendingUnits.toLocaleString('es-ES'))]),
@@ -4239,7 +4261,31 @@
   // En espera: "Empezar más tarde" activado (aún sin hora) o con la hora sin llegar.
   // Mientras tanto la ciudad no pide ni reserva nada (y puede donar).
   const recruitWaiting = (townId) => { const t = state.reclutamiento.towns[townId]; return !!t && ((!!t.hold && !(+t.startAt > 0)) || (+t.startAt || 0) > Date.now()); };
-  const recruitEnabledFor = (townId) => recruitOnFor(townId) && !recruitWaiting(townId);
+  /* Turnos de reclutamiento: en Vista general → Reclutamiento eliges qué ciudades reclutan
+     (todas marcadas por defecto) y cuántas a la vez (1, 2, 3… o todas). Las que están en
+     turno siguen hasta acabar lo pedido; cuando una acaba (o la quitas), entra la siguiente.
+     Las que esperan turno no reclutan ni piden ni reservan recursos. */
+  const recruitIncluded = (townId) => !state.reclutamiento.excluded?.[townId];
+  let recruitTurnMemo = { at: 0, set: null };
+  function recruitTurnSet() {
+    if (Date.now() - recruitTurnMemo.at < 1000 && recruitTurnMemo.set) return recruitTurnMemo.set;
+    const cfg = state.reclutamiento;
+    const max = Math.max(0, Math.floor(+cfg.maxActive || 0));
+    const cand = allTownIds().filter((id) => recruitOnFor(id) && recruitIncluded(id) && !recruitWaiting(id) && (cfg.towns[id]?.goals || []).length);
+    let set;
+    if (!max) set = new Set(cand);
+    else {
+      const prev = (Array.isArray(cfg.activeTurn) ? cfg.activeTurn : []).map(Number).filter((id) => cand.includes(id));
+      const rest = cand.filter((id) => !prev.includes(id)).sort((a, b) => farmTownName(a).localeCompare(farmTownName(b), 'es'));
+      const list = [...prev, ...rest].slice(0, max);
+      if (JSON.stringify(list) !== JSON.stringify(cfg.activeTurn || [])) { cfg.activeTurn = list; try { saveState(); } catch {} }
+      set = new Set(list);
+    }
+    recruitTurnMemo = { at: Date.now(), set };
+    return set;
+  }
+  const recruitHasTurn = (townId) => recruitTurnSet().has(+townId);
+  const recruitEnabledFor = (townId) => recruitOnFor(townId) && recruitIncluded(townId) && !recruitWaiting(townId) && recruitHasTurn(townId);
   const anyRecruitOn = () => allTownIds().some(recruitOnFor);
 
   function townRecruitCfg(townId) {
@@ -4551,6 +4597,33 @@
     return out;
   }
 
+  // Favor que tendrá un dios en el instante atMs (el actual + lo que produce hasta entonces).
+  function godFavorAt(god, atMs) {
+    try {
+      const a = Object.values(UW.MM.getModels().PlayerGods || {})[0]?.attributes || {};
+      const o = a.production_overview?.[god];
+      const hrs = Math.max(0, (atMs - Date.now()) / 3600000);
+      return Math.min(+a.max_favor || Infinity, godFavor(god) + (+o?.production || 0) * hrs);
+    } catch { return godFavor(god); }
+  }
+  // ¿Un hechizo OBLIGATORIO de esa cola (tierra/mar) impedirá reclutar en atMs? (no estará
+  // activo y para entonces no habrá favor para lanzarlo) → texto del motivo, o null.
+  function recruitSpellBlock(townId, kinds, atMs) {
+    const cfg = townRecruitCfg(townId).spells || {};
+    const need = {}; const names = [];
+    for (const sd of RECRUIT_SPELLS) {
+      if (!kinds.includes(sd.kind) || cfg[sd.id] !== 'required') continue;
+      if (spellEnd(townId, sd.id) > atMs + 30000) continue; // seguirá activo
+      const p = UW.GameData?.powers?.[sd.id]; if (!p) continue;
+      need[p.god_id] = (need[p.god_id] || 0) + (+p.favor || 0); names.push(p.name);
+    }
+    for (const [god, cost] of Object.entries(need)) {
+      const f = godFavorAt(god, atMs);
+      if (f < cost) return `Sin favor de ${UW.GameData?.gods?.[god]?.name || god} para ${names.join(' y ')} (${Math.floor(f)}/${cost}): no se le mandan recursos hasta que lo haya`;
+    }
+    return null;
+  }
+
   tradeDemandProviders.push(function recruitDemands() {
     if (!anyRecruitOn()) return [];
     const out = [];
@@ -4558,6 +4631,19 @@
       // Con inicio programado, hasta que llegue la hora la ciudad NO pide ni reserva
       // nada: queda totalmente libre (incluso para donar a otras).
       if (!recruitEnabledFor(townId) || !townRecruitCfg(townId).goals.length) continue;
+      // Hechizo obligatorio sin favor para cuando lleguen los recursos: no se le manda nada
+      // (ni se le reserva) — no podría reclutar y los recursos se quedarían parados allí.
+      {
+        const others0 = allTownIds().filter((id) => id !== townId);
+        const eta0 = others0.length ? Math.min(...others0.map((id) => travelSec(id, townId))) : 0;
+        const b0 = recruitBatch(townId, Date.now() + eta0 * 1000);
+        if (b0 && !b0.reason) {
+          const kinds = [...new Set(Object.keys(b0.units).map((u) => (isNavalUnit(u) ? 'naval' : 'ground')))];
+          const why = recruitSpellBlock(townId, kinds, Date.now() + eta0 * 1000);
+          if (why) { if (recruitRuntime.wait.get(townId) !== why) recruitRuntime.wait.set(townId, why); continue; }
+          if (/^Sin favor de /.test(recruitRuntime.wait.get(townId) || '')) recruitRuntime.wait.delete(townId);
+        }
+      }
       const res = recruitPendingReserve(townId);
       if (sumRes(res)) out.push({ townId, module: 'reclutamiento', label: 'reserva reclutamiento', reserveOnly: true, ...res });
       if (!state.comercio.forRecruit) continue;
@@ -5748,7 +5834,9 @@
      el primer intento sale N s ANTES de lo ideal y se sigue probando hasta N s DESPUÉS,
      aunque un intento llegue tarde (el siguiente puede caer dentro). */
   // Nube en 2 PCs: cada ataque lo envía solo el PC donde se programó (si no, salía dos veces).
-  const atkOtherPc = (a) => { try { return !!a.pc && cloudOn() && a.pc !== cloud.pcId; } catch { return false; } };
+  // (Una cuenta solo puede estar abierta en un PC a la vez: el ataque lo envía el PC que
+  // tenga el juego abierto, lo programaras donde lo programaras.)
+  const atkOtherPc = () => false;
   const atkIsRetry = (a) => !!a.windowEnd && (a.method === 'ultra' || a.method === 'human');
   const atkJitterMs = (a) => (atkIsRetry(a) ? clamp(Math.round(+a.jitter || 0), 0, 15) * 1000 : 0);
   const atkLastSend = (a) => (a.windowEnd ? a.windowEnd + 999 - a.duration + atkJitterMs(a) : a.executeAt + ATK_MISS_TOLERANCE_MS);
@@ -7203,7 +7291,7 @@
         <li>Al conectar: si ya hay datos en la nube se cargan; si no, se suben los de este PC.</li></ul>
         ${AUTO('Cada cambio se sube a los 8 s y cada 60 s baja lo del otro PC. Al arrancar, primero sincroniza y después empieza a trabajar.')}
         ${WARN('Aun con la nube, usa el bot en <b>un solo PC a la vez</b>: si está abierto en dos, los dos enviarían recursos.')}
-        ${AUTO('Los <b>ataques</b> programados solo los envía el PC donde los programaste (en el otro salen con el aviso «Lo envía el otro PC»); para que salga desde otro, edítalo y guárdalo allí.')}` },
+        ${AUTO('Los <b>ataques</b> programados los envía el PC que tenga el juego abierto, da igual en cuál los programaras (una cuenta solo puede estar en un PC a la vez).')}` },
       { t: 'Módulos', find: () => TQ.sel('.nb-tiles', bodyEl), h: `
         <p>Una ficha por módulo con su dato principal. El interruptor lo activa o desactiva para <b>todas</b> las ciudades; pulsa la ficha para ir a su pestaña.</p>` }
     ]);
@@ -7234,7 +7322,8 @@
 
     // ------------------------------------------------------------------ Granjas
     add('Granjas', 'granjas', [
-      { t: 'Granjas (aldeas)', find: () => TQ.tab('granjas'), h: `<p>Recolecta recursos de las <b>aldeas</b> de todas tus islas y cambia recursos con ellas.</p>` },
+      { t: 'Granjas (aldeas)', find: () => TQ.tab('granjas'), h: `<p>Recolecta recursos de las <b>aldeas</b> de todas tus islas y cambia recursos con ellas.</p>
+        <p>Arriba eliges <b>cuántas ciudades reclutan a la vez</b> y <b>cuáles</b> (todas marcadas por defecto). Las que esperan turno salen como «Esperando turno».</p>` },
       { t: 'Recolección automática', find: () => TQ.card(/^Recolección automática/), h: `
         <p>Enciéndelo y el bot recolecta todas tus aldeas en cuanto están listas. Debajo, la <b>cuenta atrás</b> hasta la próxima recolección.</p>
         ${AUTO(`<ul>
@@ -7354,7 +7443,8 @@
       { t: 'Hechizos de reclutamiento', find: () => TQ.card(/^Hechizos de reclutamiento/), h: `
         <p>Por ciudad, para Entrenamiento espartano, Crecimiento de la población y La llamada del mar:</p>
         <ul><li><b>No</b>: no se usa.</li><li><b>Opcional</b>: se lanza si hay favor.</li><li><b>Obligatorio</b>: no recluta hasta tenerlo activo (espera al favor y lo lanza solo).</li></ul>
-        ${AUTO('Se lanzan <b>justo antes de mandar la orden</b>: primero el juego confirma que el lote ya se puede reclutar (recursos y población en la ciudad) y entonces van el hechizo y la orden seguidos. Mientras los recursos vienen de camino no se lanza, para no gastar su duración con la cola vacía.')}` },
+        ${AUTO('Se lanzan <b>justo antes de mandar la orden</b>: primero el juego confirma que el lote ya se puede reclutar (recursos y población en la ciudad) y entonces van el hechizo y la orden seguidos. Mientras los recursos vienen de camino no se lanza, para no gastar su duración con la cola vacía.')}
+        ${AUTO('Con uno <b>obligatorio</b>: si cuando lleguen los recursos no habrá favor para lanzarlo, no se le mandan ni reservan recursos a esa ciudad (no podría reclutar).')}` },
       { t: 'Siguiente lote', find: () => TQ.card(/^Siguiente lote/), h: `
         <p>Qué tropa y cuántas, población y favor que usa, y barras con los recursos que tiene la ciudad frente a lo que cuesta.</p>
         <p>Si no hay lote, te dice por qué: cola llena (hasta qué hora), esperando investigación, sin población, en espera, reservado para otro módulo…</p>
@@ -7523,6 +7613,12 @@
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
     { v: '1.14.6', items: [
+      { t: 'Hechizo obligatorio sin favor: no se mandan recursos', tab: 'reclutamiento', find: () => TQ.card(/^Hechizos de reclutamiento/) || TQ.tab('reclutamiento'), h: `
+        <p>Si una ciudad tiene un hechizo de reclutamiento <b>obligatorio</b> y no habrá favor para lanzarlo cuando lleguen los recursos (se calcula con lo que produce el dios), ya no se le mandan ni reservan recursos: no podría reclutar. En cuanto vaya a haber favor, se le vuelve a abastecer.</p>` },
+      { t: 'Reclutar por turnos', tab: 'resumen', before: () => { if (state.resumenView !== 'reclutamiento') { state.resumenView = 'reclutamiento'; return true; } }, find: () => TQ.sel('.nb-rc-stats', bodyEl) || TQ.tab('resumen'), h: `
+        <p>En <b>Vista general → Reclutamiento</b>: eliges <b>cuántas ciudades reclutan a la vez</b> (todas, 1, 2, 3…) y <b>cuáles</b> (casillas, todas marcadas por defecto). Las que están en turno (●) siguen hasta acabar lo pedido y entonces entra la siguiente; las demás esperan sin pedir ni reservar recursos.</p>` },
+      { t: 'Ataques desde cualquier PC', tab: 'ataques', find: () => TQ.tab('ataques'), h: `
+        <p>Con la nube, los ataques programados en otro PC ya los envía el que tenga el juego abierto (una cuenta solo puede estar en un PC a la vez).</p>` },
       { t: 'Si falta plata, cambiar por plata', tab: 'granjas', find: () => TQ.card(/^Intercambio con aldeas/) || TQ.tab('granjas'), h: `
         <p>En <b>Intercambio con aldeas</b>: si la plata de todo el imperio baja del <b>25 %</b> del almacén (lo cambias), en todas las aldeas que dan plata se cambia madera y piedra por plata aunque la tasa no sea buena (nunca por debajo de la tasa mínima que pongas, <b>0,7</b> por defecto), para poder reclutar. Deja siempre un 20 % del recurso que da. Cada cambio es <b>el máximo que admite la aldea</b> (p. ej. 3000): si los comerciantes están ocupados, espera a tenerlos en vez de mandar un cambio pequeño. Necesita el intercambio activado.</p>` },
       { t: 'Mercado bajo: solo su isla', tab: 'comercio', find: () => TQ.card(/^Comercio automático/) || TQ.tab('comercio'), h: `
@@ -7555,7 +7651,7 @@
         <ul><li>Al llegar la hora vuelve a leer del juego las tropas antes de decidir (por si el combate fue justo antes).</li>
         <li>Si a esa hora aún van tropas <b>atacando</b>, espera a que lleguen: recluta las que murieron o quita el objetivo si volvieron todas. Debajo de cada tropa ves cuántas van atacando y cuándo llegan.</li></ul>` },
       { t: 'Una sola pestaña ejecuta el bot', tab: 'ataques', find: () => TQ.tab('ataques'), h: `
-        <p>Con el juego abierto en <b>varias pestañas</b>, solo una ejecuta el bot (las demás ponen abajo «Solo lectura»); lo que cambies en cualquiera llega a la que manda. Antes cada pestaña enviaba y cancelaba ataques, comerciaba y reclutaba por su cuenta. Con la nube en 2 PCs, cada ataque lo envía solo el PC donde lo programaste.</p>` },
+        <p>Con el juego abierto en <b>varias pestañas</b>, solo una ejecuta el bot (las demás ponen abajo «Solo lectura»); lo que cambies en cualquiera llega a la que manda. Antes cada pestaña enviaba y cancelaba ataques, comerciaba y reclutaba por su cuenta. Los ataques programados en otro PC (con la nube) los envía el que tenga el juego abierto.</p>` },
       { t: 'Ultra/Humano, más seguro', tab: 'ataques', before: () => { if (atk.view !== 'queue') { atk.view = 'queue'; return true; } }, find: () => TQ.card(/^Programados/) || TQ.tab('ataques'), h: `
         <ul><li>Tras cancelar un intento comprueba en el juego que se canceló de verdad.</li>
         <li>Antes de reintentar espera también al héroe.</li>
