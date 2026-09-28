@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.14.12
+// @version      1.14.14
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.14.12';
+  const VERSION = '1.14.14';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -4693,12 +4693,15 @@
     for (const [id, u] of Object.entries(units)) {
       if (!u || typeof u !== 'object' || u.is_npc_unit_only || id === 'militia') continue;
       if (+u.favor > 0 && (!u.god_id || u.god_id !== townGod(townId))) continue;
-      // Tropas sin investigar (o investigándose): se pueden pedir igual. No se reclutan ni
-      // se piden recursos para ellas hasta que estén investigadas; si tienen inicio
-      // programado, TÚ debes asegurarte de que para entonces ya lo estén.
-      void rs;
+      // Tropas sin investigar: solo si su investigación ya está en marcha (cola del juego)
+      // o en la cola del bot. No se reclutan ni se piden recursos para ellas hasta que estén
+      // investigadas; con inicio programado, TÚ debes asegurarte de que para entonces lo estén.
+      const needR = [].concat(u.research_dependencies || []);
+      if (needR.some((r) => !rs?.get?.(r) && !researchPending(townId, r))) continue;
+      // Edificios que pide (p. ej. Cuartel 10): vale si ya están, si se están construyendo
+      // en la cola del juego o si están en la cola del bot de Construcción de esta ciudad.
       const needB = u.building_dependencies || {};
-      if (Object.entries(needB).some(([b, l]) => (+bd?.building_data?.[b]?.level || 0) < +l)) continue;
+      if (Object.entries(needB).some(([b, l]) => (+bd?.building_data?.[b]?.level || 0) < +l && !buildingPlanned(townId, b, +l))) continue;
       out.push(id);
     }
     // Tierra, luego mar, luego míticas; alfabético dentro de cada grupo.
@@ -4780,11 +4783,13 @@
       return { id: g.id, c, rem, fit: Number.isFinite(fit) ? fit : 0 };
     });
     // Las tropas aún sin investigar esperan; las siguientes de la lista se adelantan.
-    const waitingR = rows.filter((r) => r.rem > 0 && !unitResearched(townId, r.id));
-    const pending = rows.filter((r) => r.rem > 0 && unitResearched(townId, r.id));
+    const unitReady = (id) => unitResearched(townId, id) && !unitMissingBuildings(townId, id).length;
+    const waitingR = rows.filter((r) => r.rem > 0 && !unitReady(r.id));
+    const pending = rows.filter((r) => r.rem > 0 && unitReady(r.id));
     if (!pending.length) {
       if (!waitingR.length) return null;
-      return { rows: waitingR, units: {}, cost: { wood: 0, stone: 0, iron: 0 }, reason: `Esperando a que se investigue: ${waitingR.map((r) => unitName(r.id)).join(', ')}.` };
+      const why = (id) => [!unitResearched(townId, id) ? 'investigación' : '', ...unitMissingBuildings(townId, id).map((x) => `${buildingName(x.b)} ${x.l}`)].filter(Boolean).join(', ');
+      return { rows: waitingR, units: {}, cost: { wood: 0, stone: 0, iron: 0 }, reason: `Esperando (${waitingR.map((r) => `${unitName(r.id)}: ${why(r.id)}`).join('; ')}).` };
     }
     // Solo tropas cuya cola (Cuartel / Puerto) tendrá hueco: si está llena no se
     // recluta ni se piden recursos para ella.
@@ -5489,14 +5494,14 @@
         if (!v || (v <= h && !recruitWaiting(townId))) { input.focus(); input.select?.(); return; }
         delete drafts[draftKey(id)];
         setTarget(id, v);
-        if (!unitResearched(townId, id)) recruitLog(`${farmTownName(townId)}: ${unitName(id)} aún no está investigada. No se recluta hasta que lo esté: asegúrate de que esté investigada cuando empiece el reclutamiento.`, 'error');
+        if (!unitResearched(townId, id) || unitMissingBuildings(townId, id).length) recruitLog(`${farmTownName(townId)}: ${unitName(id)} aún no está investigada o le falta el edificio. No se recluta hasta que lo esté: asegúrate de que esté lista cuando empiece el reclutamiento.`, 'error');
       };
       input.addEventListener('keydown', (e) => { if (e.key === 'Enter') add(); });
       (isNavalUnit(id) ? addListNaval : addList).appendChild(el('div', { class: 'nb-add-row' }, [
         unitIcon(id),
         el('div', { class: 'nb-add-name' }, [
           el('span', {}, unitName(id)),
-          el('span', { class: 'nb-add-level' }, `tienes ${h} · ${Math.round(c.wood)}/${Math.round(c.stone)}/${Math.round(c.iron)}${c.favor ? ` · ${Math.round(c.favor)} favor` : ''} · ${c.pop} pob${unitResearched(townId, id) ? '' : [].concat(UW.GameData?.units?.[id]?.research_dependencies || []).every((r) => researchPending(townId, r)) ? ' · investigándose' : ' · SIN investigar'}`)
+          el('span', { class: 'nb-add-level' }, `tienes ${h} · ${Math.round(c.wood)}/${Math.round(c.stone)}/${Math.round(c.iron)}${c.favor ? ` · ${Math.round(c.favor)} favor` : ''} · ${c.pop} pob${unitResearched(townId, id) ? '' : [].concat(UW.GameData?.units?.[id]?.research_dependencies || []).every((r) => researchPending(townId, r)) ? (isResearchQueued(townId, [].concat(UW.GameData?.units?.[id]?.research_dependencies || [])[0]) ? ' · investigándose' : ' · en la cola del bot de investigación') : ''}${unitMissingBuildings(townId, id).map((x) => ` · falta ${buildingName(x.b)} ${x.l} (${buildingPlanned(townId, x.b, x.l) === 'building' ? 'construyéndose' : 'en la cola del bot'})`).join('')}`)
         ]),
         el('div', { class: 'nb-stepper' }, [input, el('span', { class: 'nb-mini nb-mini-add', title: 'Añadir (total objetivo)', onclick: add }, '✓')])
       ]));
@@ -5505,7 +5510,7 @@
     const nAddNaval = avail.filter(isNavalUnit).length, nAddLand = avail.length - nAddNaval;
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
       el('div', { class: 'nb-card-title' }, [buildingIcon('barracks', true), 'Cuartel · añadir tropa']),
-      avail.some((id) => !unitResearched(townId, id)) ? el('div', { class: 'nb-alert nb-alert-warn' }, [el('span', {}, [el('b', {}, 'Tropas sin investigar: '), 'se pueden pedir, pero no se reclutan (ni se piden recursos) hasta que estén investigadas. Si programas el inicio, asegúrate de que para entonces ya lo estén.'])]) : null,
+      avail.some((id) => !unitResearched(townId, id) || unitMissingBuildings(townId, id).length) ? el('div', { class: 'nb-alert nb-alert-warn' }, [el('span', {}, [el('b', {}, 'Tropas sin investigar o sin el edificio: '), 'solo salen si su investigación o su edificio (p. ej. Cuartel) ya están en marcha en el juego o en la cola del bot de esta ciudad. Se pueden pedir, pero no se reclutan (ni se piden recursos) hasta que estén investigadas. Si programas el inicio, asegúrate de que para entonces ya lo estén.'])]) : null,
       nAddLand ? addList : el('p', { class: 'nb-placeholder' }, 'No hay más tropas de cuartel disponibles en esta ciudad.')
     ]));
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
@@ -7062,6 +7067,21 @@
   const isResearchQueued = (townId, r) => researchOrdersOf(townId).some((o) => o.research_type === r);
   // Investigada, en la cola del juego o en la del bot.
   const researchPending = (townId, r) => isResearched(townId, r) || isResearchQueued(townId, r) || townResearchCfg(townId).queue.includes(r);
+  // ¿Llegará ese edificio a ese nivel? (en construcción en el juego o en la cola del bot)
+  function buildingPlanned(townId, b, l) {
+    if (realBuildingLevel(townId, b) >= l) return 'ok';
+    let q = 0; try { q = townBuildOrders(townId).filter((o) => o.building_type === b).reduce((n, o) => n + (o.tear_down ? -1 : 1), 0); } catch {}
+    if (realBuildingLevel(townId, b) + q >= l) return 'building';
+    if ((townBuildCfg(townId).goals || []).some((g) => g.id === b && !g.demolish && +g.target >= l)) return 'bot';
+    return null;
+  }
+  // Edificios que le faltan a una tropa (nivel real): [{ b, l }]
+  function unitMissingBuildings(townId, unitId) {
+    const need = UW.GameData?.units?.[unitId]?.building_dependencies || {};
+    let known = false; try { known = !!UW.ITowns.getTown(townId)?.getBuildings?.()?.attributes; } catch {}
+    if (!known) return []; // sin datos: no bloquear
+    return Object.entries(need).filter(([b, l]) => realBuildingLevel(townId, b) < +l).map(([b, l]) => ({ b, l: +l }));
+  }
   function unitResearched(townId, unitId) {
     const deps = [].concat(UW.GameData?.units?.[unitId]?.research_dependencies || []);
     if (!deps.length) return true;
@@ -7718,7 +7738,7 @@
       { t: 'Cola del bot', find: () => TQ.card(/^Cola del bot/), h: `<p>Lo que quieres investigar, <b>en este orden</b>. Puedes reordenar y quitar; <b>Vaciar</b> la borra entera.</p>` },
       { t: 'Añadir investigación', find: () => TQ.card(/^Añadir investigación/), h: `
         <p>Las investigaciones que aún no tiene esta ciudad. Pulsa para añadirla al final de la cola.</p>
-        ${AUTO('Investiga en cuanto hay hueco, puntos y recursos. El comercio solo le manda recursos para una investigación si la ciudad <b>ya tiene puntos</b> (y Academia/requisitos) para ella. Una tropa sin investigar se puede pedir en Reclutamiento (aunque no esté en ninguna cola): no se recluta hasta que esté investigada.')}` }
+        ${AUTO('Investiga en cuanto hay hueco, puntos y recursos. El comercio solo le manda recursos para una investigación si la ciudad <b>ya tiene puntos</b> (y Academia/requisitos) para ella. Una tropa sin investigar se puede pedir en Reclutamiento si su investigación ya está en marcha o en esta cola: no se recluta hasta que esté investigada.')}` }
     ]);
 
     // ------------------------------------------------------------------ Reclutamiento
@@ -7922,9 +7942,9 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
-    { v: '1.14.12', items: [
+    { v: '1.14.14', items: [
       { t: 'Pedir tropas sin investigar', tab: 'reclutamiento', find: () => TQ.card(/añadir tropa/) || TQ.tab('reclutamiento'), h: `
-        <p>Ahora puedes pedir tropas que aún se están investigando (o sin investigar). Salen marcadas «investigándose» / «SIN investigar».</p>
+        <p>Puedes pedir tropas cuya investigación o cuyo edificio (p. ej. Cuartel del nivel que piden) ya están en marcha en el juego o en la cola del bot de esa ciudad. Salen marcadas («investigándose», «falta Cuartel 10 (construyéndose)»…).</p>
         ${WARN('No se reclutan ni se piden recursos para ellas hasta que estén investigadas: si programas el inicio, asegúrate de que para entonces ya lo estén.')}` }
     ] },
     { v: '1.14.11', items: [
