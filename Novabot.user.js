@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.14.14
+// @version      1.14.15
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.14.14';
+  const VERSION = '1.14.15';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -191,7 +191,8 @@
         keepPct: 25,          // plata que se deja SIEMPRE en el imperio (% de la suma de almacenes)
         cap: 0,               // tope de plata por cueva (0 = sin tope)
         minDeposit: 500,      // no mover menos de esto de una vez
-        fill: {}              // townId -> máximo: ciudad a LLENAR (las demás le mandan plata)
+        mode: 'todas',        // 'todas' = cada ciudad mete lo que le sobra · 'individual' = llenar las elegidas
+        fill: {}              // townId -> máximo: ciudad a LLENAR (modo individual; las demás le mandan plata)
       },
       aldeas: {
         enabled: false,       // intercambio de recursos con las aldeas de la isla
@@ -2245,7 +2246,9 @@
   --------------------------------------------------------------------------------- */
   const caveRuntime = { timer: null, running: false, log: [], info: new Map(), infoAt: 0, plan: null, planAt: 0, planning: false, cooldown: new Map() };
   let caveLogEl = null;
-  const caveOn = () => !!state.cueva?.enabled;
+  const caveOn = () => !!state.cueva?.enabled;                                  // Cuevas activadas (cualquier modo)
+  const caveAllOn = () => caveOn() && state.cueva.mode !== 'individual';         // modo "Todas"
+  const caveFillOn = () => caveOn() && state.cueva.mode === 'individual';        // modo "Individual" (llenar)
   const hideLevel = (townId) => { try { return +UW.ITowns.getTown(townId)?.getBuildings?.()?.attributes?.hide || 0; } catch { return 0; } };
   // Capacidad y lo guardado: el nivel manda (Cueva 10 = sin límite; si no, 1000/nivel).
   function caveInfo(townId) {
@@ -2259,7 +2262,7 @@
      el máximo puesto. Mientras alguna no llega, las demás no meten plata en su propia
      cueva (se la mandan a esas). */
   const fillMax = (townId) => { const v = +state.cueva?.fill?.[+townId]; return v > 0 ? v : 0; };
-  const fillTowns = () => Object.keys(state.cueva?.fill || {}).map(Number).filter((id) => fillMax(id) > 0 && allTownIds().includes(id));
+  const fillTowns = () => !caveFillOn() ? [] : Object.keys(state.cueva?.fill || {}).map(Number).filter((id) => fillMax(id) > 0 && allTownIds().includes(id));
   // Lo que le falta a la cueva de esa ciudad (null = cueva aún sin leer).
   function fillLeft(townId) {
     const ci = caveInfo(townId);
@@ -2267,7 +2270,7 @@
     return Math.max(0, Math.min(fillMax(townId), ci.max) - ci.stored);
   }
   const fillPending = () => fillTowns().some((id) => (fillLeft(id) ?? 1) > 0);
-  const caveEngineOn = () => caveOn() || fillTowns().length > 0;
+  const caveEngineOn = () => caveOn();
   function fillDefaultMax(townId) {
     const ci = caveInfo(townId);
     return ci.max === Infinity ? 100000 : Math.max(1000, ci.max);
@@ -2325,7 +2328,7 @@
     } finally { caveRuntime.planning = false; }
   }
   function cavePlanFor(townId) {
-    if (!caveOn()) return 0;
+    if (!caveAllOn()) return 0;
     const a = cavePlanAll().by.get(+townId) || 0;
     return a >= Math.max(1, +state.cueva.minDeposit || 0) ? a : 0;
   }
@@ -2362,13 +2365,13 @@
     if (Date.now() - caveRuntime.infoAt > 10 * 60000) { try { await refreshCaveInfo(); } catch (e) { caveLog(`No se pudo leer las cuevas: ${e.message}`, 'error'); return; } }
     const filled = fillTowns().length ? await fillTick() : 0;
     if (filled) setTimeout(() => refreshCaveInfo().catch(() => {}), 4000);
-    if (!caveOn() || (!force && Date.now() - (caveRuntime.globalAt || 0) < 115000)) { renderIfIdle('cueva'); return; }
+    if (!caveAllOn() || (!force && Date.now() - (caveRuntime.globalAt || 0) < 115000)) { renderIfIdle('cueva'); return; }
     caveRuntime.globalAt = Date.now();
     caveRuntime.planAt = 0;
     const plan = cavePlanAll();
     let done = 0;
     for (const [townId] of [...plan.by.entries()].sort((a, b) => b[1] - a[1])) {
-      if (!caveOn() || done >= 5) break;
+      if (!caveAllOn() || done >= 5) break;
       if ((caveRuntime.cooldown.get(townId) || 0) > Date.now()) continue;
       const amount = cavePlanFor(townId);
       if (!amount) continue;
@@ -2418,11 +2421,17 @@
     };
     bodyEl.appendChild(el('div', { class: 'nb-card', 'data-nb-card': 'cueva' }, [
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, [el('b', {}, 'Meter plata en las cuevas')]),
-        switchEl(!!cfg.enabled, (v) => { cfg.enabled = v; saveState(); caveRuntime.planAt = 0; caveLog(v ? 'Cueva activada.' : 'Cueva desactivada.'); renderBody(); if (v) { caveRuntime.infoAt = 0; runNow(); } }, false)]),
-      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Plata que se deja siempre en el imperio (% de la suma de almacenes)'), el('span', {}, [num('keepPct', 0, 100, 5, 25), ' %'])]),
-      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Tope por cueva (0 = sin tope)'), num('cap', 0, 100000000, 1000, 0)]),
-      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Mínimo por ingreso'), num('minDeposit', 100, 100000, 100, 500)]),
-      el('p', { class: 'nb-placeholder' }, 'Cada 2 min. Se mira la plata de TODAS las ciudades: siempre queda ese % para lo que venga, y lo que sobra se mete (aunque sea todo en una ciudad), sin tocar lo que esa ciudad necesita según la Prioridad de recursos. Cueva 10 = sin límite; si no, 1000 por nivel.')
+        switchEl(!!cfg.enabled, (v) => { cfg.enabled = v; saveState(); caveRuntime.planAt = 0; caveLog(v ? 'Cuevas activadas.' : 'Cuevas desactivadas.'); renderBody(); if (v) { caveRuntime.infoAt = 0; runNow(); } }, false)]),
+      el('div', { class: 'nb-seg nb-seg-sm nb-mt' }, [['todas', 'Todas las ciudades'], ['individual', 'Individual (llenar las que elija)']].map(([k, l]) =>
+        el('span', { class: `nb-seg-btn${(cfg.mode === 'individual' ? 'individual' : 'todas') === k ? ' active' : ''}`, onclick: () => { cfg.mode = k; saveState(); caveRuntime.planAt = 0; caveLog(`Cuevas: modo ${l.toLowerCase()}.`); renderBody(); if (cfg.enabled) runNow(); } }, l))),
+      ...(cfg.mode === 'individual' ? [
+        el('p', { class: 'nb-placeholder' }, 'Individual: en la lista de abajo activas «Llenar» en las ciudades que quieras y pones su máximo. Las demás les mandan su plata por el Comercio (solo las que no reclutan ni esperan recursos para nada: primero lo primero) y esa ciudad la mete en su cueva hasta el máximo.')
+      ] : [
+        el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Plata que se deja siempre en el imperio (% de la suma de almacenes)'), el('span', {}, [num('keepPct', 0, 100, 5, 25), ' %'])]),
+        el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Tope por cueva (0 = sin tope)'), num('cap', 0, 100000000, 1000, 0)]),
+        el('p', { class: 'nb-placeholder' }, 'Todas: cada 2 min se mira la plata de TODAS las ciudades: siempre queda ese % para lo que venga, y lo que sobra se mete (aunque sea todo en una ciudad), sin tocar lo que esa ciudad necesita según la Prioridad de recursos. Cueva 10 = sin límite; si no, 1000 por nivel.')
+      ]),
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Mínimo por ingreso'), num('minDeposit', 100, 100000, 100, 500)])
     ]));
     // Relación con el Intercambio con aldeas (Granjas)
     const exOn = !!state.aldeas?.enabled;
@@ -2435,7 +2444,7 @@
     ]));
 
     // Estado
-    const plan = cfg.enabled ? (caveRuntime.planAt = 0, cavePlanAll()) : null;
+    const plan = caveAllOn() ? (caveRuntime.planAt = 0, cavePlanAll()) : null;
     const list = el('div', { class: 'nb-goals' });
     const towns = allTownIds().map((id) => ({ id, name: farmTownName(id), ci: caveInfo(id), iron: townResources(id).iron })).sort((a, b) => a.name.localeCompare(b.name, 'es'));
     for (const t of towns) {
@@ -2448,13 +2457,12 @@
         : full ? 'Cueva llena (sube su nivel para meter más)'
         : capped ? 'Tope alcanzado'
         : next ? el('span', {}, ['Siguiente: ', el('b', {}, fmt(next)), ' de plata'])
-        : !cfg.enabled ? `${fmt(t.iron)} de plata en la ciudad`
-        : fillPending() && !fillMax(t.id) ? 'Guarda su plata para las cuevas a llenar'
+        : !caveAllOn() ? (caveFillOn() && !fillMax(t.id) ? `${fmt(t.iron)} de plata · ${(recruitOnFor(t.id) && townRecruitCfg(t.id).goals.length) ? 'recluta: no dona' : 'puede donar'}` : `${fmt(t.iron)} de plata en la ciudad`)
         : 'Nada que meter ahora';
       const pct = t.ci.max === Infinity ? null : Math.min(100, Math.round((stored || 0) / Math.max(1, t.ci.max) * 100));
       // Llenar esta cueva (las demás ciudades le mandan plata hasta el máximo).
       const fMax = fillMax(t.id), fLeft = fMax ? fillLeft(t.id) : null;
-      const fillSw = t.ci.lvl ? switchEl(!!fMax, (v) => {
+      const fillSw = t.ci.lvl && caveFillOn() ? switchEl(!!fMax, (v) => {
         cfg.fill = { ...(cfg.fill || {}) };
         if (v) cfg.fill[t.id] = fillDefaultMax(t.id); else delete cfg.fill[t.id];
         saveState(); caveRuntime.planAt = 0; renderBody();
@@ -2462,7 +2470,7 @@
         if (v) { caveRuntime.infoAt = 0; runNow(); }
       }, false) : null;
       let fillBox = null;
-      if (fMax) {
+      if (fMax && caveFillOn()) {
         const inp = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '1000', step: '1000', value: String(fMax), title: 'Máximo de plata en esta cueva' });
         inp.addEventListener('change', () => { cfg.fill = { ...(cfg.fill || {}) }; let v = Math.max(1000, Math.floor(pos(inp.value, fMax))); if (t.ci.max !== Infinity) v = Math.min(v, t.ci.max); cfg.fill[t.id] = v; saveState(); caveRuntime.planAt = 0; renderBody(); });
         fillBox = el('div', { class: 'nb-goal-sub' }, ['Llenar hasta ', inp, ' · ', fLeft === null ? 'leyendo cueva…' : fLeft > 0 ? el('span', {}, ['faltan ', el('b', {}, fmt(fLeft)), ' (se las mandan las demás ciudades)']) : el('span', { class: 'nb-ok' }, 'llena ✓')]);
@@ -2485,9 +2493,8 @@
       el('div', { class: 'nb-row nb-mt' }, [el('span', { class: 'nb-row-label' }, caveRuntime.infoAt ? `Datos de las cuevas: ${srvClock(caveRuntime.infoAt)}` : 'Datos de las cuevas: sin leer'),
         el('span', { class: 'nb-btn nb-btn-sm', onclick: () => refreshCaveInfo().then(() => renderIfIdle('cueva')).catch((e) => caveLog(e.message, 'error')) }, 'Actualizar')]),
       fillTowns().length ? el('div', { class: `nb-alert ${state.comercio?.enabled ? 'nb-alert-info' : 'nb-alert-warn'}` }, [el('span', {}, state.comercio?.enabled
-        ? [el('b', {}, 'Llenar cueva: '), `${fillTowns().map(farmTownName).join(', ')}. Las demás ciudades les mandan la plata que les sobra (después de sus encargos) y, mientras falte, no meten plata en su propia cueva.`]
+        ? [el('b', {}, 'Llenar cueva: '), `${fillTowns().map(farmTownName).join(', ')}. Les mandan plata solo las ciudades que no reclutan ni esperan recursos para nada.`]
         : [el('b', {}, 'Llenar cueva: el Comercio está desactivado. '), 'Actívalo para que las demás ciudades manden la plata; mientras, solo se mete la que ya tiene esa ciudad.'])]) : null,
-      el('p', { class: 'nb-placeholder' }, 'Llenar (por ciudad, desactivado por defecto): las demás ciudades le mandan plata por el Comercio y esa ciudad la mete en su cueva hasta el máximo que pongas.'),
       el('div', { class: 'nb-mt' }, [list])
     ]));
     const logBox = el('div', { class: 'nb-log' });
@@ -3450,7 +3457,7 @@
         if (chunk < 500) continue;
         for (let rest = left, n = 0; rest > 0 && n < 2; n++) {
           const v = Math.min(rest, chunk); rest -= v;
-          out.push({ townId, label: `llenar cueva (faltan ${left.toLocaleString('es-ES')})`, prio: 99, wood: 0, stone: 0, iron: v });
+          out.push({ townId, label: `llenar cueva (faltan ${left.toLocaleString('es-ES')})`, prio: 99, wood: 0, stone: 0, iron: v, caveFill: true });
         }
       }
       return out;
@@ -3750,8 +3757,11 @@
     // (nunca lo que le falta: así no manda lo suyo para luego pedirlo de vuelta).
     const needy = new Map(needs.map((n) => [n.townId, n.missInit]));
     const canGive = (id, k) => !needy.has(id) || (needy.get(id)[k] || 0) <= 0;
+    // Llenar cueva: primero lo primero. Solo donan ciudades que NO reclutan ni esperan
+    // nada (sin encargos propios); a las que reclutan no se les toca la plata.
+    const caveDonorOk = (id) => !itemsBy[id].length && !(recruitOnFor(id) && townRecruitCfg(id).goals.length);
     const donorsFor = (n) => towns
-      .filter((id) => id !== n.townId && tradePairOk(id, n.townId) && st[id].cap > 0 && RES.some((k) => canGive(id, k) && st[id].surplus[k] > 0 && n.miss[k] > 0))
+      .filter((id) => id !== n.townId && tradePairOk(id, n.townId) && (!n.items.every((i) => i.caveFill) || caveDonorOk(id)) && st[id].cap > 0 && RES.some((k) => canGive(id, k) && st[id].surplus[k] > 0 && n.miss[k] > 0))
       .filter((id) => (tradeRuntime.pairCooldown.get(`${id}>${n.townId}`) || 0) < now)
       .sort((a, b) => donorCost(a, n) - donorCost(b, n));
     // Coste de usar un donante = tiempo de viaje, rebajado hasta a la mitad si el
@@ -7858,8 +7868,8 @@
         <p>Con la Cueva activa, el <b>Intercambio con aldeas</b> solo cambia <b>por plata</b>: la madera o piedra que sobra se convierte en plata y la Cueva la guarda. El equilibrio entre ciudades deja de mover plata.</p>` },
       { t: 'Estado de las cuevas', find: () => TQ.card(/^Cuevas/), h: `<p>Por ciudad: nivel de la cueva, plata guardada / máximo y lo siguiente que meterá. <b>Actualizar</b> relee las cuevas del juego.</p>` },
       { t: 'Llenar la cueva de una ciudad', find: () => TQ.card(/^Cuevas/), h: `
-        <p>Cada ciudad tiene un interruptor <b>Llenar</b> (desactivado por defecto). Al activarlo pones el <b>máximo</b> de plata para esa cueva.</p>
-        ${AUTO('Las demás ciudades le mandan por el <b>Comercio</b> la plata que les sobra (después de sus propios encargos; es lo último que abastece) y esa ciudad la mete en su cueva cada 30 s hasta el máximo. Mientras falte, las demás no meten plata en su propia cueva.')}
+        <p>Con las Cuevas activadas eliges el modo: <b>Todas las ciudades</b> (cada una mete lo que le sobra) o <b>Individual</b>: en la lista activas <b>Llenar</b> en las ciudades que quieras (desactivado por defecto) con su <b>máximo</b>.</p>
+        ${AUTO('Individual: las demás le mandan por el <b>Comercio</b> su plata, pero <b>solo las que no reclutan ni esperan recursos para nada</b> (primero lo primero; es lo último que abastece el Comercio). Esa ciudad la mete en su cueva cada 30 s hasta el máximo.')}
         ${WARN('Necesita el Comercio activado.')}` }
     ]);
 
@@ -7942,14 +7952,14 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.14.15', items: [
+      { t: 'Llenar la cueva de una ciudad', tab: 'cueva', find: () => TQ.card(/^Meter plata/) || TQ.tab('cueva'), h: `
+        <p>En <b>Cueva</b>: activa «Meter plata en las cuevas» y elige <b>Todas las ciudades</b> o <b>Individual</b>. En Individual, cada ciudad tiene <b>Llenar</b> (desactivado por defecto) con un máximo; se lo mandan solo las ciudades que no reclutan ni esperan recursos.</p>` }
+    ] },
     { v: '1.14.14', items: [
       { t: 'Pedir tropas sin investigar', tab: 'reclutamiento', find: () => TQ.card(/añadir tropa/) || TQ.tab('reclutamiento'), h: `
         <p>Puedes pedir tropas cuya investigación o cuyo edificio (p. ej. Cuartel del nivel que piden) ya están en marcha en el juego o en la cola del bot de esa ciudad. Salen marcadas («investigándose», «falta Cuartel 10 (construyéndose)»…).</p>
         ${WARN('No se reclutan ni se piden recursos para ellas hasta que estén investigadas: si programas el inicio, asegúrate de que para entonces ya lo estén.')}` }
-    ] },
-    { v: '1.14.11', items: [
-      { t: 'Llenar la cueva de una ciudad', tab: 'cueva', find: () => TQ.card(/^Cuevas/) || TQ.tab('cueva'), h: `
-        <p>En <b>Cueva</b>, cada ciudad tiene un interruptor <b>Llenar</b> (desactivado por defecto) con un máximo. Las demás ciudades le mandan su plata sobrante y ella la mete en la cueva hasta llegar a ese máximo.</p>` }
     ] },
     { v: '1.14.10', items: [
       { t: 'Hechizo obligatorio: la otra cola sigue', tab: 'resumen', before: () => { if (state.resumenView !== 'reclutamiento') { state.resumenView = 'reclutamiento'; return true; } }, find: () => TQ.sel('.nb-rc-grid', bodyEl) || TQ.tab('resumen'), h: `
