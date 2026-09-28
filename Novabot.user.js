@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.14.15
+// @version      1.14.16
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.14.15';
+  const VERSION = '1.14.16';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -3070,6 +3070,16 @@
      pedir nada al comercio.
   --------------------------------------------------------------------------------- */
   const PRIO_MODULES = { construccion: 'Construcción', investigacion: 'Investigación', reclutamiento: 'Reclutamiento', festivales: 'Festivales', cueva: 'Cueva' };
+  // ¿Módulo apagado del todo en SU pestaña (ninguna ciudad activa)? Para que la Prioridad
+  // sea consistente con el interruptor de cada módulo (si lo apagas ahí, se ve aquí).
+  function prioModuleOff(mod) {
+    if (mod === 'construccion') return !allTownIds().some(buildEnabledFor);
+    if (mod === 'investigacion') return !allTownIds().some(researchEnabledFor);
+    if (mod === 'reclutamiento') return !anyRecruitOn();
+    if (mod === 'festivales') return !state.festivales?.enabled;
+    if (mod === 'cueva') return !caveOn();
+    return false;
+  }
   const PRIO_DEFAULT_ORDER = ['construccion', 'investigacion', 'reclutamiento', 'festivales', 'cueva'];
   const PRIO_MODES = {
     equilibrado: { label: 'Equilibrado', hint: 'El de siempre. Todos reciben a la vez; en cada ciudad gasta primero Construcción, luego Investigación, Reclutamiento y Festivales.' },
@@ -3242,6 +3252,7 @@
     const shown = cfg.mode === 'paralelo' ? cfg.ranked.slice().sort((a, b) => prioLevel(a, cfg) - prioLevel(b, cfg)) : cfg.ranked;
     shown.forEach((m, i) => {
       const included = cfg.inc.has(m);
+      const off = prioModuleOff(m);
       const move = (dir) => {
         const o = cfg.ranked.slice(); const j = i + dir;
         if (j < 0 || j >= o.length) return;
@@ -3249,12 +3260,13 @@
       };
       const lvl = prioLevel(m, cfg);
       const mates = cfg.ranked.filter((x) => x !== m && cfg.inc.has(x) && prioLevel(x, cfg) === lvl).map((x) => PRIO_MODULES[x]);
-      const sub = !included ? 'No incluido: solo usa lo que sobre · no pide recursos'
+      const sub = off ? 'Desactivado en su pestaña: no hace nada'
+        : !included ? 'No incluido: solo usa lo que sobre · no pide recursos'
         : cfg.mode === 'paralelo' ? (mates.length ? `Nivel ${lvl}: a la vez que ${mates.join(' y ')}` : `Nivel ${lvl}: solo`)
         : cfg.mode === 'orden' ? (i === 0 ? 'Tiene el turno mientras tenga hueco en su cola' : 'Recibe cuando los de arriba tienen la cola llena o nada que hacer')
         : (i === 0 ? 'Primero en recibir y en gastar' : 'Recibe y gasta después de los de arriba');
-      list.appendChild(el('div', { class: `nb-goal${included ? '' : ' nb-goal-done'}` }, [
-        el('span', { class: 'nb-goal-idx' }, included ? String(cfg.mode === 'paralelo' ? lvl : i + 1) : '–'),
+      list.appendChild(el('div', { class: `nb-goal${included && !off ? '' : ' nb-goal-done'}` }, [
+        el('span', { class: 'nb-goal-idx' }, included && !off ? String(cfg.mode === 'paralelo' ? lvl : i + 1) : '–'),
         el('div', { class: 'nb-goal-main' }, [el('div', { class: 'nb-goal-name' }, PRIO_MODULES[m]), el('div', { class: 'nb-goal-sub' }, sub)]),
         custom ? el('div', { class: 'nb-goal-actions' }, [
           cfg.mode === 'orden' ? el('span', { class: `nb-mini${i === 0 ? ' nb-mini-off' : ''}`, onclick: () => move(-1) }, '▲') : null,
@@ -7607,6 +7619,7 @@
       { t: 'Ciudad actual', find: () => TQ.card(/^Ciudad actual/), h: `<p>La ciudad que tienes abierta en el juego. Se actualiza sola al cambiar de ciudad.</p>` },
       { t: 'Prioridad de recursos', find: () => TQ.card(/^Prioridad de recursos/), wide: true, h: `
         <p>Decide <b>quién gasta primero</b> cuando los recursos no llegan para todo: Construcción, Investigación, Reclutamiento, Festivales y Cueva. Afecta a lo que cada módulo puede gastar en su ciudad y a qué abastece el Comercio.</p>
+        ${AUTO('Un módulo <b>desactivado en su propia pestaña</b> (ninguna ciudad activa) sale aquí como «Desactivado en su pestaña», aunque esté marcado como incluido: la Prioridad es consistente con el interruptor de cada módulo.')}
         <ul>
           <li><b>Equilibrado</b> (por defecto): todos reciben a la vez. En cada ciudad un módulo solo gasta lo que no necesita el <i>siguiente gasto</i> de los de arriba (orden fijo: Construcción → Investigación → Reclutamiento → Festivales).</li>
           <li><b>Personalizado · por orden</b>: tú pones el orden. El comercio abastece <b>primero al 1º en todas las ciudades</b>; cuando en ninguna puede hacer más (colas llenas o nada pendiente) pasa al 2º, y en cuanto el 1º vuelve a tener hueco recupera el turno.</li>
@@ -7952,6 +7965,10 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.14.16', items: [
+      { t: 'Prioridad consistente con cada módulo', tab: 'prioridad', find: () => TQ.card(/^Prioridad de recursos/) || TQ.tab('prioridad'), h: `
+        <p>Si desactivas un módulo en su propia pestaña (p. ej. Festivales), ahora en <b>Prioridad de recursos</b> sale como «Desactivado en su pestaña» en vez de seguir contando como incluido.</p>` }
+    ] },
     { v: '1.14.15', items: [
       { t: 'Llenar la cueva de una ciudad', tab: 'cueva', find: () => TQ.card(/^Meter plata/) || TQ.tab('cueva'), h: `
         <p>En <b>Cueva</b>: activa «Meter plata en las cuevas» y elige <b>Todas las ciudades</b> o <b>Individual</b>. En Individual, cada ciudad tiene <b>Llenar</b> (desactivado por defecto) con un máximo; se lo mandan solo las ciudades que no reclutan ni esperan recursos.</p>` }
