@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.14.10
+// @version      1.14.12
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.14.10';
+  const VERSION = '1.14.12';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -190,7 +190,8 @@
         enabled: false,       // meter plata en las cuevas
         keepPct: 25,          // plata que se deja SIEMPRE en el imperio (% de la suma de almacenes)
         cap: 0,               // tope de plata por cueva (0 = sin tope)
-        minDeposit: 500       // no mover menos de esto de una vez
+        minDeposit: 500,      // no mover menos de esto de una vez
+        fill: {}              // townId -> máximo: ciudad a LLENAR (las demás le mandan plata)
       },
       aldeas: {
         enabled: false,       // intercambio de recursos con las aldeas de la isla
@@ -2253,6 +2254,24 @@
     const max = lvl >= 10 ? Infinity : lvl * 1000;
     return { lvl, max, stored: i ? i.stored : null };
   }
+  /* Llenar la cueva de una ciudad (por ciudad, desactivado por defecto): las ciudades
+     marcadas reciben plata de las demás (por el Comercio) y la meten en su cueva hasta
+     el máximo puesto. Mientras alguna no llega, las demás no meten plata en su propia
+     cueva (se la mandan a esas). */
+  const fillMax = (townId) => { const v = +state.cueva?.fill?.[+townId]; return v > 0 ? v : 0; };
+  const fillTowns = () => Object.keys(state.cueva?.fill || {}).map(Number).filter((id) => fillMax(id) > 0 && allTownIds().includes(id));
+  // Lo que le falta a la cueva de esa ciudad (null = cueva aún sin leer).
+  function fillLeft(townId) {
+    const ci = caveInfo(townId);
+    if (!ci.lvl || ci.stored === null) return null;
+    return Math.max(0, Math.min(fillMax(townId), ci.max) - ci.stored);
+  }
+  const fillPending = () => fillTowns().some((id) => (fillLeft(id) ?? 1) > 0);
+  const caveEngineOn = () => caveOn() || fillTowns().length > 0;
+  function fillDefaultMax(townId) {
+    const ci = caveInfo(townId);
+    return ci.max === Infinity ? 100000 : Math.max(1000, ci.max);
+  }
   async function refreshCaveInfo() {
     const d = await gpGet('town_overviews', 'hides_overview', { nl_init: true });
     const html = String(d?.html || '');
@@ -2284,6 +2303,8 @@
         // Lo que esta ciudad necesita de plata según la Prioridad (módulos por encima de la Cueva).
         let need = 0;
         try { need = reserveAbove(id, 'cueva').iron || 0; } catch {}
+        // Con alguna cueva por llenar, las demás ciudades se guardan la plata para mandársela.
+        if (fillPending() && !fillMax(id)) room = 0;
         rows.push({ id, cur, room, avail: Math.max(0, Math.floor(cur - need)) });
       }
       const keep = Math.round(storTotal * clamp(+cfg.keepPct || 0, 0, 100) / 100);
@@ -2309,9 +2330,40 @@
     return a >= Math.max(1, +state.cueva.minDeposit || 0) ? a : 0;
   }
 
-  async function caveTick() {
-    if (!caveOn()) return;
+  // Ciudades a llenar: meten en su cueva la plata que tienen (sin tocar lo que necesitan
+  // según la Prioridad) hasta el máximo. Cada 30 s, para dejar sitio a lo que llega.
+  async function fillTick() {
+    let done = 0;
+    for (const townId of fillTowns()) {
+      const left = fillLeft(townId);
+      if (!left) continue;
+      if ((caveRuntime.cooldown.get(townId) || 0) > Date.now()) continue;
+      const cur = townResources(townId).iron;
+      let need = 0; try { need = reserveAbove(townId, 'cueva').iron || 0; } catch {}
+      const a = Math.floor(Math.min(left, cur - need));
+      if (a < Math.min(left, Math.max(1, +state.cueva.minDeposit || 0))) continue;
+      try {
+        const r = await gpPost('town_overviews', 'store_iron', { town_id: +townId, active_town_id: +UW.Game?.townId || +townId, iron_to_keep: 0, iron_to_store: a });
+        const prev = caveRuntime.info.get(+townId)?.stored || 0;
+        caveRuntime.info.set(+townId, { stored: Number.isFinite(+r?.iron_stored) && +r.iron_stored >= prev ? +r.iron_stored : prev + a });
+        caveRuntime.planAt = 0; done += 1;
+        caveLog(`${farmTownName(townId)}: ${a.toLocaleString('es-ES')} de plata a la cueva (llenar: faltan ${Math.max(0, left - a).toLocaleString('es-ES')}).`, 'ok');
+        if (left - a <= 0) caveLog(`${farmTownName(townId)}: cueva llena hasta el máximo (${fillMax(townId).toLocaleString('es-ES')}).`, 'ok');
+      } catch (e) {
+        caveRuntime.cooldown.set(townId, Date.now() + 10 * 60000);
+        caveLog(`${farmTownName(townId)}: ${e.message}`, 'error');
+      }
+      await sleep(700 + Math.random() * 700);
+    }
+    return done;
+  }
+  async function caveTick(force = false) {
+    if (!caveEngineOn()) return;
     if (Date.now() - caveRuntime.infoAt > 10 * 60000) { try { await refreshCaveInfo(); } catch (e) { caveLog(`No se pudo leer las cuevas: ${e.message}`, 'error'); return; } }
+    const filled = fillTowns().length ? await fillTick() : 0;
+    if (filled) setTimeout(() => refreshCaveInfo().catch(() => {}), 4000);
+    if (!caveOn() || (!force && Date.now() - (caveRuntime.globalAt || 0) < 115000)) { renderIfIdle('cueva'); return; }
+    caveRuntime.globalAt = Date.now();
     caveRuntime.planAt = 0;
     const plan = cavePlanAll();
     let done = 0;
@@ -2345,10 +2397,10 @@
     if (caveRuntime.timer) return;
     caveRuntime.timer = setInterval(() => {
       if (!isRunner()) return;
-      if (!caveOn() || caveRuntime.running) return;
+      if (!caveEngineOn() || caveRuntime.running) return;
       caveRuntime.running = true;
       caveTick().catch((e) => caveLog(`Error: ${e.message}`, 'error')).finally(() => { caveRuntime.running = false; });
-    }, 120000);
+    }, 30000);
   }
   function caveLog(text, kind = 'info') {
     caveRuntime.log.unshift({ at: Date.now(), text, kind });
@@ -2358,7 +2410,7 @@
   function renderCuevaTab() {
     const cfg = state.cueva;
     const fmt = (n) => (n === Infinity ? '∞' : Math.round(n).toLocaleString('es-ES'));
-    const runNow = () => { if (caveRuntime.running) return; caveRuntime.running = true; caveTick().catch((e) => caveLog(`Error: ${e.message}`, 'error')).finally(() => { caveRuntime.running = false; }); };
+    const runNow = () => { if (caveRuntime.running) return; caveRuntime.running = true; caveTick(true).catch((e) => caveLog(`Error: ${e.message}`, 'error')).finally(() => { caveRuntime.running = false; }); };
     const num = (key, min, max, step, def) => {
       const i = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: String(min), max: String(max), step: String(step), value: cfg[key] });
       i.addEventListener('change', () => { cfg[key] = clamp(pos(i.value, def), min, max); saveState(); caveRuntime.planAt = 0; renderBody(); });
@@ -2396,13 +2448,31 @@
         : full ? 'Cueva llena (sube su nivel para meter más)'
         : capped ? 'Tope alcanzado'
         : next ? el('span', {}, ['Siguiente: ', el('b', {}, fmt(next)), ' de plata'])
+        : !cfg.enabled ? `${fmt(t.iron)} de plata en la ciudad`
+        : fillPending() && !fillMax(t.id) ? 'Guarda su plata para las cuevas a llenar'
         : 'Nada que meter ahora';
       const pct = t.ci.max === Infinity ? null : Math.min(100, Math.round((stored || 0) / Math.max(1, t.ci.max) * 100));
-      list.appendChild(el('div', { class: `nb-goal${next ? ' nb-goal-next' : ''}` }, [
+      // Llenar esta cueva (las demás ciudades le mandan plata hasta el máximo).
+      const fMax = fillMax(t.id), fLeft = fMax ? fillLeft(t.id) : null;
+      const fillSw = t.ci.lvl ? switchEl(!!fMax, (v) => {
+        cfg.fill = { ...(cfg.fill || {}) };
+        if (v) cfg.fill[t.id] = fillDefaultMax(t.id); else delete cfg.fill[t.id];
+        saveState(); caveRuntime.planAt = 0; renderBody();
+        caveLog(`${t.name}: llenar cueva ${v ? `activado (máximo ${fmt(cfg.fill[t.id])})` : 'desactivado'}.`);
+        if (v) { caveRuntime.infoAt = 0; runNow(); }
+      }, false) : null;
+      let fillBox = null;
+      if (fMax) {
+        const inp = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '1000', step: '1000', value: String(fMax), title: 'Máximo de plata en esta cueva' });
+        inp.addEventListener('change', () => { cfg.fill = { ...(cfg.fill || {}) }; let v = Math.max(1000, Math.floor(pos(inp.value, fMax))); if (t.ci.max !== Infinity) v = Math.min(v, t.ci.max); cfg.fill[t.id] = v; saveState(); caveRuntime.planAt = 0; renderBody(); });
+        fillBox = el('div', { class: 'nb-goal-sub' }, ['Llenar hasta ', inp, ' · ', fLeft === null ? 'leyendo cueva…' : fLeft > 0 ? el('span', {}, ['faltan ', el('b', {}, fmt(fLeft)), ' (se las mandan las demás ciudades)']) : el('span', { class: 'nb-ok' }, 'llena ✓')]);
+      }
+      list.appendChild(el('div', { class: `nb-goal${next || (fLeft && fLeft > 0) ? ' nb-goal-next' : ''}` }, [
         buildingIcon('hide', true),
-        el('div', { class: 'nb-goal-main' }, [el('div', { class: 'nb-goal-name' }, `${t.name} · Cueva ${t.ci.lvl}`), el('div', { class: 'nb-goal-sub' }, [sub])]),
+        el('div', { class: 'nb-goal-main' }, [el('div', { class: 'nb-goal-name' }, `${t.name} · Cueva ${t.ci.lvl}`), el('div', { class: 'nb-goal-sub' }, [sub]), fillBox]),
         el('span', { class: 'nb-pill' }, `${stored === null ? '—' : fmt(stored)} / ${fmt(t.ci.max)}`),
-        pct === null ? null : el('div', { class: 'nb-bar nb-bar-mini' }, [el('div', { class: 'nb-bar-fill', style: `width:${pct}%` })])
+        pct === null ? null : el('div', { class: 'nb-bar nb-bar-mini' }, [el('div', { class: 'nb-bar-fill', style: `width:${pct}%` })]),
+        fillSw ? el('span', { title: 'Llenar esta cueva: las demás ciudades le mandan plata hasta el máximo' }, [el('span', { class: 'nb-ov-dim', style: 'margin-right:6px' }, 'Llenar'), fillSw]) : null
       ]));
     }
     const totalStored = towns.reduce((s, t) => s + (t.ci.stored || 0), 0);
@@ -2414,6 +2484,10 @@
       ]) : null,
       el('div', { class: 'nb-row nb-mt' }, [el('span', { class: 'nb-row-label' }, caveRuntime.infoAt ? `Datos de las cuevas: ${srvClock(caveRuntime.infoAt)}` : 'Datos de las cuevas: sin leer'),
         el('span', { class: 'nb-btn nb-btn-sm', onclick: () => refreshCaveInfo().then(() => renderIfIdle('cueva')).catch((e) => caveLog(e.message, 'error')) }, 'Actualizar')]),
+      fillTowns().length ? el('div', { class: `nb-alert ${state.comercio?.enabled ? 'nb-alert-info' : 'nb-alert-warn'}` }, [el('span', {}, state.comercio?.enabled
+        ? [el('b', {}, 'Llenar cueva: '), `${fillTowns().map(farmTownName).join(', ')}. Las demás ciudades les mandan la plata que les sobra (después de sus encargos) y, mientras falte, no meten plata en su propia cueva.`]
+        : [el('b', {}, 'Llenar cueva: el Comercio está desactivado. '), 'Actívalo para que las demás ciudades manden la plata; mientras, solo se mete la que ya tiene esa ciudad.'])]) : null,
+      el('p', { class: 'nb-placeholder' }, 'Llenar (por ciudad, desactivado por defecto): las demás ciudades le mandan plata por el Comercio y esa ciudad la mete en su cueva hasta el máximo que pongas.'),
       el('div', { class: 'nb-mt' }, [list])
     ]));
     const logBox = el('div', { class: 'nb-log' });
@@ -3364,6 +3438,23 @@
   }
 
   const tradeDemandProviders = [
+    // Cueva a llenar: pide plata a las demás ciudades (lo último de todo: solo con lo
+    // que les sobra tras sus encargos). En trozos que caben en el almacén; se va metiendo
+    // en la cueva según llega (ver fillTick).
+    function caveFillDemands() {
+      const out = [];
+      for (const townId of fillTowns()) {
+        const left = fillLeft(townId);
+        if (!left) continue;
+        const chunk = Math.floor((townStorage(townId) || 0) * 0.8);
+        if (chunk < 500) continue;
+        for (let rest = left, n = 0; rest > 0 && n < 2; n++) {
+          const v = Math.min(rest, chunk); rest -= v;
+          out.push({ townId, label: `llenar cueva (faltan ${left.toLocaleString('es-ES')})`, prio: 99, wood: 0, stone: 0, iron: v });
+        }
+      }
+      return out;
+    },
     // Construcción: todos los niveles que caben en los huecos libres de la cola
     // real (límite 7 contando lo que ya está en cola del juego), siguiendo el
     // orden de objetivos del bot.
@@ -4602,10 +4693,10 @@
     for (const [id, u] of Object.entries(units)) {
       if (!u || typeof u !== 'object' || u.is_npc_unit_only || id === 'militia') continue;
       if (+u.favor > 0 && (!u.god_id || u.god_id !== townGod(townId))) continue;
-      // Tropas sin investigar: se pueden pedir si su investigación está en la cola del
-      // juego o en la del bot (se reclutan en cuanto quede investigada).
-      const needR = [].concat(u.research_dependencies || []);
-      if (needR.some((r) => !rs?.get?.(r) && !researchPending(townId, r))) continue;
+      // Tropas sin investigar (o investigándose): se pueden pedir igual. No se reclutan ni
+      // se piden recursos para ellas hasta que estén investigadas; si tienen inicio
+      // programado, TÚ debes asegurarte de que para entonces ya lo estén.
+      void rs;
       const needB = u.building_dependencies || {};
       if (Object.entries(needB).some(([b, l]) => (+bd?.building_data?.[b]?.level || 0) < +l)) continue;
       out.push(id);
@@ -5398,13 +5489,14 @@
         if (!v || (v <= h && !recruitWaiting(townId))) { input.focus(); input.select?.(); return; }
         delete drafts[draftKey(id)];
         setTarget(id, v);
+        if (!unitResearched(townId, id)) recruitLog(`${farmTownName(townId)}: ${unitName(id)} aún no está investigada. No se recluta hasta que lo esté: asegúrate de que esté investigada cuando empiece el reclutamiento.`, 'error');
       };
       input.addEventListener('keydown', (e) => { if (e.key === 'Enter') add(); });
       (isNavalUnit(id) ? addListNaval : addList).appendChild(el('div', { class: 'nb-add-row' }, [
         unitIcon(id),
         el('div', { class: 'nb-add-name' }, [
           el('span', {}, unitName(id)),
-          el('span', { class: 'nb-add-level' }, `tienes ${h} · ${Math.round(c.wood)}/${Math.round(c.stone)}/${Math.round(c.iron)}${c.favor ? ` · ${Math.round(c.favor)} favor` : ''} · ${c.pop} pob${unitResearched(townId, id) ? '' : ' · en investigación'}`)
+          el('span', { class: 'nb-add-level' }, `tienes ${h} · ${Math.round(c.wood)}/${Math.round(c.stone)}/${Math.round(c.iron)}${c.favor ? ` · ${Math.round(c.favor)} favor` : ''} · ${c.pop} pob${unitResearched(townId, id) ? '' : [].concat(UW.GameData?.units?.[id]?.research_dependencies || []).every((r) => researchPending(townId, r)) ? ' · investigándose' : ' · SIN investigar'}`)
         ]),
         el('div', { class: 'nb-stepper' }, [input, el('span', { class: 'nb-mini nb-mini-add', title: 'Añadir (total objetivo)', onclick: add }, '✓')])
       ]));
@@ -5413,6 +5505,7 @@
     const nAddNaval = avail.filter(isNavalUnit).length, nAddLand = avail.length - nAddNaval;
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
       el('div', { class: 'nb-card-title' }, [buildingIcon('barracks', true), 'Cuartel · añadir tropa']),
+      avail.some((id) => !unitResearched(townId, id)) ? el('div', { class: 'nb-alert nb-alert-warn' }, [el('span', {}, [el('b', {}, 'Tropas sin investigar: '), 'se pueden pedir, pero no se reclutan (ni se piden recursos) hasta que estén investigadas. Si programas el inicio, asegúrate de que para entonces ya lo estén.'])]) : null,
       nAddLand ? addList : el('p', { class: 'nb-placeholder' }, 'No hay más tropas de cuartel disponibles en esta ciudad.')
     ]));
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
@@ -7625,7 +7718,7 @@
       { t: 'Cola del bot', find: () => TQ.card(/^Cola del bot/), h: `<p>Lo que quieres investigar, <b>en este orden</b>. Puedes reordenar y quitar; <b>Vaciar</b> la borra entera.</p>` },
       { t: 'Añadir investigación', find: () => TQ.card(/^Añadir investigación/), h: `
         <p>Las investigaciones que aún no tiene esta ciudad. Pulsa para añadirla al final de la cola.</p>
-        ${AUTO('Investiga en cuanto hay hueco, puntos y recursos. El comercio solo le manda recursos para una investigación si la ciudad <b>ya tiene puntos</b> (y Academia/requisitos) para ella. Una tropa sin investigar se puede pedir en Reclutamiento si su investigación está en esta cola.')}` }
+        ${AUTO('Investiga en cuanto hay hueco, puntos y recursos. El comercio solo le manda recursos para una investigación si la ciudad <b>ya tiene puntos</b> (y Academia/requisitos) para ella. Una tropa sin investigar se puede pedir en Reclutamiento (aunque no esté en ninguna cola): no se recluta hasta que esté investigada.')}` }
     ]);
 
     // ------------------------------------------------------------------ Reclutamiento
@@ -7743,7 +7836,11 @@
         ${AUTO('Cada 2 min mira la plata de <b>todo el imperio</b>: lo que pasa de ese % se mete, primero donde más sobra, sin tocar lo que cada ciudad necesita según la prioridad (la Cueva es un módulo más de la prioridad) ni lo que otras ciudades esperan. Cueva 10 = sin límite; si no, 1000 por nivel.')}` },
       { t: 'Relación con las aldeas', find: () => TQ.txt('.nb-alert', /Intercambio con aldeas|Con la Cueva activa/) || TQ.card(/^Meter plata/), h: `
         <p>Con la Cueva activa, el <b>Intercambio con aldeas</b> solo cambia <b>por plata</b>: la madera o piedra que sobra se convierte en plata y la Cueva la guarda. El equilibrio entre ciudades deja de mover plata.</p>` },
-      { t: 'Estado de las cuevas', find: () => TQ.card(/^Cuevas/), h: `<p>Por ciudad: nivel de la cueva, plata guardada / máximo y lo siguiente que meterá. <b>Actualizar</b> relee las cuevas del juego.</p>` }
+      { t: 'Estado de las cuevas', find: () => TQ.card(/^Cuevas/), h: `<p>Por ciudad: nivel de la cueva, plata guardada / máximo y lo siguiente que meterá. <b>Actualizar</b> relee las cuevas del juego.</p>` },
+      { t: 'Llenar la cueva de una ciudad', find: () => TQ.card(/^Cuevas/), h: `
+        <p>Cada ciudad tiene un interruptor <b>Llenar</b> (desactivado por defecto). Al activarlo pones el <b>máximo</b> de plata para esa cueva.</p>
+        ${AUTO('Las demás ciudades le mandan por el <b>Comercio</b> la plata que les sobra (después de sus propios encargos; es lo último que abastece) y esa ciudad la mete en su cueva cada 30 s hasta el máximo. Mientras falte, las demás no meten plata en su propia cueva.')}
+        ${WARN('Necesita el Comercio activado.')}` }
     ]);
 
     // ------------------------------------------------------------------ Ataques
@@ -7825,6 +7922,15 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.14.12', items: [
+      { t: 'Pedir tropas sin investigar', tab: 'reclutamiento', find: () => TQ.card(/añadir tropa/) || TQ.tab('reclutamiento'), h: `
+        <p>Ahora puedes pedir tropas que aún se están investigando (o sin investigar). Salen marcadas «investigándose» / «SIN investigar».</p>
+        ${WARN('No se reclutan ni se piden recursos para ellas hasta que estén investigadas: si programas el inicio, asegúrate de que para entonces ya lo estén.')}` }
+    ] },
+    { v: '1.14.11', items: [
+      { t: 'Llenar la cueva de una ciudad', tab: 'cueva', find: () => TQ.card(/^Cuevas/) || TQ.tab('cueva'), h: `
+        <p>En <b>Cueva</b>, cada ciudad tiene un interruptor <b>Llenar</b> (desactivado por defecto) con un máximo. Las demás ciudades le mandan su plata sobrante y ella la mete en la cueva hasta llegar a ese máximo.</p>` }
+    ] },
     { v: '1.14.10', items: [
       { t: 'Hechizo obligatorio: la otra cola sigue', tab: 'resumen', before: () => { if (state.resumenView !== 'reclutamiento') { state.resumenView = 'reclutamiento'; return true; } }, find: () => TQ.sel('.nb-rc-grid', bodyEl) || TQ.tab('resumen'), h: `
         <p>Si a una ciudad le falta favor para el hechizo obligatorio del <b>Cuartel</b> pero tiene tropas pedidas en el <b>Puerto</b> (o al revés), ahora recluta lo del Puerto en vez de quedarse parada ocupando su turno. En la tarjeta sale «Cuartel esperando favor (…)».</p>` }
