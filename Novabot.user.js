@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.14.16
+// @version      1.14.17
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.14.16';
+  const VERSION = '1.14.17';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -828,6 +828,15 @@
     const dim = (t) => el('span', { class: 'nb-ov-dim' }, t);
     const towns = allTownIds().sort((a, b) => farmTownName(a).localeCompare(farmTownName(b), 'es'));
     const limit = buildQueueLimit();
+    // Isla: ciudad principal (si varias ciudades comparten isla, el % de granjas sale
+    // solo en la principal, para no repetirlo).
+    const islandMains = new Map(); // townId (principal) -> group
+    const islandOfTown = new Map(); // townId -> principal de su isla
+    for (const [key, group] of townsByIsland()) {
+      const main = islandMainOf(key, group);
+      islandMains.set(main, group);
+      for (const id of group) islandOfTown.set(id, main);
+    }
     const rows = towns.map((id) => {
       // Construcción: cola del juego (lo primero que termina) + objetivos del bot
       const bo = townBuildOrders(id).slice().sort((a, b) => (+a.to_be_completed_at || 0) - (+b.to_be_completed_at || 0));
@@ -865,18 +874,41 @@
         return el('div', { title: `${Math.floor(rs[k]).toLocaleString('es-ES')}${cap ? ` de ${cap.toLocaleString('es-ES')}` : ''}` }, [resIcon(k),
           el('span', { class: `nb-ov-count${pct >= 90 && pct < 95 ? ' nb-warn-txt' : ''}`, style: pct >= 95 ? 'color:#e5484d' : '' }, pct == null ? '—' : `${pct} %`), dim(kfmt(rs[k]))]);
       }));
+      // Granjas: % del cofre de la isla ya listo para recoger (solo en la ciudad
+      // principal de la isla; las demás muestran con quién la comparte).
+      let farms;
+      if (islandMains.has(id)) {
+        const info = islandFarmFillPct(id);
+        farms = el('div', { class: 'nb-ov-cell' }, [info
+          ? el('span', { title: `${Math.round(info.loot).toLocaleString('es-ES')} de ${Math.round(info.cap).toLocaleString('es-ES')} · ${info.n} aldea(s)` },
+              [el('span', { class: `nb-ov-count${info.pct >= 90 ? ' nb-warn-txt' : ''}`, style: info.pct >= 98 ? 'color:#e5484d' : '' }, `${info.pct} %`)])
+          : dim('sin aldeas')]);
+      } else {
+        farms = el('div', { class: 'nb-ov-cell' }, [dim(`comparte isla con ${farmTownName(islandOfTown.get(id))}`)]);
+      }
       const cur = +UW.Game?.townId === id;
       return el('tr', { class: cur ? 'nb-ov-current' : '' }, [
         el('td', { class: 'nb-ov-town' }, farmTownName(id)),
         el('td', {}, resources),
+        el('td', {}, farms),
         el('td', {}, build), el('td', {}, recruit), el('td', {}, fest), el('td', {}, trade), el('td', {}, attacks)
       ]);
     });
-    const head = el('tr', {}, ['Ciudad', 'Recursos', 'Construcción', 'Reclutamiento', 'Festival', 'Llega (comercio)', 'Ataques del bot'].map((h) => el('th', {}, h)));
+    const head = el('tr', {}, ['Ciudad', 'Recursos', 'Granjas (isla)', 'Construcción', 'Reclutamiento', 'Festival', 'Llega (comercio)', 'Ataques del bot'].map((h) => el('th', {}, h)));
+    // Resumen imperio: recursos totales guardados vs almacén total (suma de las 3 cifras
+    // de cada ciudad: madera+piedra+plata contra 3× su almacén).
+    const empireCap = towns.reduce((s, id) => s + (townStorage(id) || 0) * 3, 0);
+    const empireCur = towns.reduce((s, id) => { const r = townResources(id); return s + r.wood + r.stone + r.iron; }, 0);
+    const empirePct = empireCap ? Math.min(100, Math.round(empireCur / empireCap * 100)) : null;
+    const kfmtBig = (n) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(Math.floor(n)));
+    bodyEl.appendChild(el('div', { class: 'nb-alert nb-alert-info' }, [
+      el('span', {}, [el('b', {}, 'Recursos del imperio: '), empirePct == null ? '—' : `${empirePct} %`,
+        ` · ${kfmtBig(empireCur)} de ${kfmtBig(empireCap)}`, ' (madera + piedra + plata de todas las ciudades frente a 3× la suma de sus almacenes)'])
+    ]));
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
       el('div', { class: 'nb-card-title' }, `Vista general · ${towns.length} ciudades`),
       el('div', { class: 'nb-ov-wrap' }, [el('table', { class: 'nb-ov' }, [el('thead', {}, [head]), el('tbody', {}, rows)])]),
-      el('p', { class: 'nb-placeholder nb-mt' }, 'Solo lectura. Se actualiza al abrir la pestaña; las cuentas atrás van solas.')
+      el('p', { class: 'nb-placeholder nb-mt' }, 'Solo lectura. Se actualiza al abrir la pestaña; las cuentas atrás van solas. Granjas (isla): % del botín ya acumulado en las aldeas de esa isla, frente al tope de cada aldea (no depende de que el granjeo del bot esté activado).')
     ]));
     updateCountdown();
   }
@@ -1528,6 +1560,34 @@
       sum += lootValue(+rel.expansion_stage || 0, booty, tier);
     }
     return sum;
+  }
+  /* % de "recursos por recoger" en las aldeas de la isla de una ciudad (lo lleno que
+     está su cofre, aunque el granjeo del bot esté desactivado — es un dato de solo
+     lectura del juego). Verificado en la partida real (28/09/2026):
+       FarmTownPlayerRelation.loot = botín ya acumulado en esa aldea (crece solo con
+         el tiempo, tope propio por aldea).
+       Tope de esa aldea = GameData.farm_town.max_resources_per_day[expansion_stage]
+         × Game.game_speed (nombre real en el código del juego: getMaxResourceStorage;
+         "max_resources_per_day" es solo la clave del JSON). Con varias aldeas visto
+         que loot nunca pasa de ese tope (ratios de 0,25 a 0,99 según cuánto llevan
+         sin recolectarse).
+     % de la isla = suma(loot) / suma(tope) de TODAS sus aldeas liberadas. */
+  function islandFarmFillPct(townId) {
+    const d = farmTownData(townId);
+    const perDay = UW.GameData?.farm_town?.max_resources_per_day || {};
+    const speed = +UW.Game?.game_speed || 1;
+    const farms = new Map(exCollection('FarmTown').map((f) => [+f.id, f]));
+    let loot = 0, cap = 0, n = 0;
+    for (const rel of exCollection('FarmTownPlayerRelation')) {
+      if (+rel.relation_status !== 1) continue;
+      const f = farms.get(+rel.farm_town_id);
+      if (!f || +f.island_x !== +d.island_x || +f.island_y !== +d.island_y) continue;
+      const c = (+perDay[+rel.expansion_stage] || 0) * speed;
+      if (!c) continue; // nivel desconocido: no se cuenta (mejor incompleto que falso)
+      loot += +rel.loot || 0; cap += c; n++;
+    }
+    if (!cap) return null;
+    return { pct: Math.min(100, Math.round(loot / cap * 100)), loot, cap, n };
   }
   // Lo que se perdería (suma de los 3 recursos) si esta ciudad recolecta ahora.
   function claimWaste(townId) {
@@ -7649,10 +7709,13 @@
         <p>Una fila por ciudad (la tuya resaltada):</p>
         <ul><li><b>Recursos</b>: madera, piedra y plata en <b>% del almacén</b> (amarillo desde el 90 %, <b>rojo</b> desde el 95 % o lleno) y la cantidad.</li>
         <li><b>Construcción</b>: órdenes en la cola del juego / huecos y lo primero que termina; cuántos objetivos tiene el bot.</li>
+        <li><b>Granjas (isla)</b>: % del botín ya acumulado en las aldeas de su isla, frente al tope de cada aldea. Solo lectura del juego: sale aunque el granjeo del bot esté desactivado.</li>
         <li><b>Reclutamiento</b>: cola del Cuartel y del Puerto y el estado del bot en esa ciudad.</li>
         <li><b>Festival</b>: en curso (cuenta atrás) o si puede hacerlo.</li>
         <li><b>Llega (comercio)</b>: envíos en camino y cuándo llega el primero.</li>
-        <li><b>Ataques del bot</b>: ataques programados que salen de ella.</li></ul>` },
+        <li><b>Ataques del bot</b>: ataques programados que salen de ella.</li></ul>
+        ${AUTO('Con varias ciudades en la misma isla, el % de Granjas sale solo en la <b>principal</b> (la que elijas en Granjas, o la de más almacén); las demás muestran con quién la comparte, para no repetirlo.')}
+        <p>Arriba de la tabla: <b>Recursos del imperio</b>, en % y en cifra, la suma de madera + piedra + plata de todas tus ciudades frente a 3× la suma de sus almacenes.</p>` },
       { t: 'Construcción del bot', before: () => { if (state.resumenView !== 'construccion') { state.resumenView = 'construccion'; return true; } }, find: () => TQ.sel('.nb-rc-stats', bodyEl) || TQ.sel('.nb-seg-main', bodyEl), h: `
         <p>Vista <b>Construcción</b>: una ficha por ciudad con objetivos en el bot. Cada edificio con su nivel → objetivo (barra: clara = con la cola del juego), cuántos niveles faltan y por qué espera.</p>
         <p><b>Siguiente</b>: el nivel que toca y sus recursos (verde = ya los tiene). Abajo, la cola del juego (lo primero que termina) y si esa ciudad <b>intercala</b> o va <b>en orden</b>.</p>
@@ -7965,6 +8028,11 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.14.17', items: [
+      { t: 'Granjas (isla) y recursos del imperio', tab: 'resumen', before: () => { if ((state.resumenView || 'ciudades') !== 'ciudades') { state.resumenView = 'ciudades'; return true; } }, find: () => TQ.card(/^Vista general/) || TQ.tab('resumen'), h: `
+        <p>En <b>Vista general → Ciudades</b>, nueva columna <b>Granjas (isla)</b>: % del botín ya acumulado en las aldeas de esa isla (dato del propio juego, aunque el granjeo del bot esté desactivado). Con varias ciudades en la misma isla, sale solo en la principal.</p>
+        <p>Arriba de la tabla, <b>Recursos del imperio</b>: en % y en cifra, madera + piedra + plata de todas las ciudades frente a 3× la suma de sus almacenes.</p>` }
+    ] },
     { v: '1.14.16', items: [
       { t: 'Prioridad consistente con cada módulo', tab: 'prioridad', find: () => TQ.card(/^Prioridad de recursos/) || TQ.tab('prioridad'), h: `
         <p>Si desactivas un módulo en su propia pestaña (p. ej. Festivales), ahora en <b>Prioridad de recursos</b> sale como «Desactivado en su pestaña» en vez de seguir contando como incluido.</p>` }
