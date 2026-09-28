@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.14.17
+// @version      1.14.18
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.14.17';
+  const VERSION = '1.14.18';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -3797,7 +3797,11 @@
         arrivals: transit.filter((r) => r.to === id).map((r) => ({ t: Math.max(0, (r.arrival - now) / 1000), wood: r.wood, stone: r.stone, iron: r.iron })),
         // Excedente: lo que sobra tras reservar TODOS sus propios encargos y lo que
         // sus próximos lotes van a gastar (reclutamiento pendiente).
-        surplus: Object.fromEntries(RES.map((k) => [k, Math.max(0, cur[k] - Math.max(total[k], reserveBy[id][k]) - (+cfg.keepMin || 0))]))
+        surplus: Object.fromEntries(RES.map((k) => [k, Math.max(0, cur[k] - Math.max(total[k], reserveBy[id][k]) - (+cfg.keepMin || 0))])),
+        // Para encargos de reclutamiento (o menos prioritarios): además se guarda lo que
+        // necesitarán TODAS sus tropas pedidas (recruitHold). Una ciudad que recluta no da
+        // a otra lo que le hace falta a ella.
+        surplusLo: (() => { const h = recruitHold(id); return Object.fromEntries(RES.map((k) => [k, Math.max(0, cur[k] - Math.max(total[k], reserveBy[id][k], h[k]) - (+cfg.keepMin || 0))])); })()
       };
     }
 
@@ -3833,7 +3837,7 @@
     // nada (sin encargos propios); a las que reclutan no se les toca la plata.
     const caveDonorOk = (id) => !itemsBy[id].length && !(recruitOnFor(id) && townRecruitCfg(id).goals.length);
     const donorsFor = (n) => towns
-      .filter((id) => id !== n.townId && tradePairOk(id, n.townId) && (!n.items.every((i) => i.caveFill) || caveDonorOk(id)) && st[id].cap > 0 && RES.some((k) => canGive(id, k) && st[id].surplus[k] > 0 && n.miss[k] > 0))
+      .filter((id) => id !== n.townId && tradePairOk(id, n.townId) && (!n.items.every((i) => i.caveFill) || caveDonorOk(id)) && st[id].cap > 0 && RES.some((k) => canGive(id, k) && availFor(id, k, n) > 0 && n.miss[k] > 0))
       .filter((id) => (tradeRuntime.pairCooldown.get(`${id}>${n.townId}`) || 0) < now)
       .sort((a, b) => donorCost(a, n) - donorCost(b, n));
     // Coste de usar un donante = tiempo de viaje, rebajado hasta a la mitad si el
@@ -3846,6 +3850,10 @@
       return travelSec(id, n.townId) * (1 - 0.5 * over);
     }
 
+    // Prioridad del reclutamiento: los encargos MÁS prioritarios (p. ej. Construcción si va
+    // antes) sí pueden usar lo guardado para reclutar; los de reclutamiento o menos, no.
+    const recruitRank = (() => { try { return priorityConfig().inc.has('reclutamiento') ? prioRank('reclutamiento') : Infinity; } catch { return Infinity; } })();
+    const availFor = (id, k, n) => (n.topPrio < recruitRank ? st[id].surplus[k] : st[id].surplusLo[k]);
     const plan = [];
     const pending = needs.slice();
     const agingWeight = Number.isFinite(+cfg.agingWeight) ? Math.max(0, +cfg.agingWeight) : 2;
@@ -3881,7 +3889,7 @@
         for (const pass of [needTop, need]) {
           for (const k of [...RES].sort((a, b) => pass[b] - pass[a])) {
             if (!canGive(donorId, k)) continue;
-            const v = Math.floor(Math.min(left, d.surplus[k] - want[k], pass[k] - want[k]));
+            const v = Math.floor(Math.min(left, availFor(donorId, k, best) - want[k], pass[k] - want[k]));
             if (v > 0) { want[k] += v; left -= v; }
           }
         }
@@ -3910,7 +3918,8 @@
         if (total <= 0 || (total < minShip && !completes)) continue;
         plan.push({ from: donorId, to: best.townId, ship: want, eta, label: best.topLabel || best.items[0]?.label || '' });
         d.cap -= total;
-        for (const k of RES) { d.surplus[k] -= want[k]; best.miss[k] -= want[k]; best.topMiss[k] = Math.max(0, best.topMiss[k] - want[k]); r.incoming[k] += want[k]; }
+        const hi = best.topPrio < recruitRank;
+        for (const k of RES) { d.surplus[k] = Math.max(0, d.surplus[k] - want[k]); d.surplusLo[k] = Math.max(0, Math.min(d.surplusLo[k] - (hi ? 0 : want[k]), d.surplus[k])); best.miss[k] -= want[k]; best.topMiss[k] = Math.max(0, best.topMiss[k] - want[k]); r.incoming[k] += want[k]; }
         r.arrivals.push({ t: eta, ...want });
       }
     }
@@ -3987,11 +3996,12 @@
       const vinc = zero();
       for (const r of transit) if (r.to === id && !r.from) for (const k of RES) vinc[k] += r[k];
       const lvl = {}, miss = {}, keep = {}, safe = {}, over = {};
+      const hold = recruitHold(id); // lo que guarda para sus tropas pedidas (ver recruitHold)
       for (const k of RES) {
         pend[k] = Math.max(0, pend[k] - vinc[k]);
         lvl[k] = cur[k] + inc[k] + pend[k];
         miss[k] = Math.max(0, total[k] - lvl[k]);
-        keep[k] = Math.max(total[k], reserve[k]) + keepMin;
+        keep[k] = Math.max(total[k], reserve[k], hold[k]) + keepMin;
         // Línea de seguridad: deja sitio para 2 recolecciones y media hora de producción.
         safe[k] = Math.max(storage * 0.5, top - 2 * loot - prod[k] * 0.5);
         // Lo que rebosaría en la próxima recolección si no se hace nada.
@@ -4917,6 +4927,35 @@
   // "pedidos por adelantado", aunque ahora la cola esté llena), con tope del almacén.
   // Lo que tenga por encima de eso sí puede darlo: no hace falta guardarlo para tropas
   // que se reclutarán dentro de horas, y así ayuda a otras ciudades ya.
+  /* Lo que una ciudad que RECLUTA se guarda para sí: el coste de TODAS sus tropas pedidas
+     que aún faltan (no solo el próximo lote), hasta el % de lote del almacén. Así no manda
+     a otra ciudad lo que va a necesitar ella (p. ej. piedra para catapultas que van detrás
+     de los jinetes en su lista). Solo ciudades con turno en la cola y que pueden reclutar
+     (una saltada por falta de favor o en espera de hora no se guarda nada). */
+  const recruitHoldMemo = { at: 0, map: new Map() };
+  function recruitHold(townId) {
+    const zero = { wood: 0, stone: 0, iron: 0 };
+    if (Date.now() - recruitHoldMemo.at > 3000) { recruitHoldMemo.at = Date.now(); recruitHoldMemo.map = new Map(); }
+    const hit = recruitHoldMemo.map.get(+townId); if (hit) return hit;
+    let out = zero;
+    try {
+      const cfg = townRecruitCfg(townId);
+      if (cfg.goals.length && recruitEnabledFor(townId) && !recruitSkip.has(+townId)) {
+        const have = townUnitsHave(townId), queued = queuedUnits(townId);
+        out = { wood: 0, stone: 0, iron: 0 };
+        for (const g of cfg.goals) {
+          const rem = Math.max(0, g.target - (+have[g.id] || 0) - (+queued[g.id] || 0));
+          if (!rem) continue;
+          const c = unitCost(townId, g.id);
+          for (const k of RES) out[k] += rem * (+c[k] || 0);
+        }
+        const cap = (townStorage(townId) || 0) * clamp(+state.reclutamiento.fillPct || 95, 10, 100) / 100;
+        for (const k of RES) out[k] = Math.min(out[k], cap);
+      }
+    } catch { out = zero; }
+    recruitHoldMemo.map.set(+townId, out);
+    return out;
+  }
   function recruitPendingReserve(townId) {
     const out = { wood: 0, stone: 0, iron: 0 };
     const ahead = clamp(+state.reclutamiento.lotsAhead || 2, 1, 4);
@@ -7880,6 +7919,7 @@
         ${AUTO(`<ul><li>Cada 10 s calcula qué falta en cada ciudad y lo envía desde las que tienen de sobra.</li>
         <li>Primero lee <b>todos los envíos en camino</b> (vista de comercio del juego) para no mandar de más.</li>
         <li>Nunca dona lo que la ciudad donante va a gastar; una ciudad que espera recursos solo da los que ella no necesita.</li>
+        <li>Una ciudad que <b>recluta</b> se guarda lo que necesitan <b>todas</b> sus tropas pedidas (no solo el próximo lote), hasta el % de lote del almacén: no se lo da a otra ciudad para reclutar ni para módulos menos prioritarios. Solo lo puede usar un módulo que vaya <b>antes</b> en la Prioridad (p. ej. Construcción).</li>
         <li>Reparto justo: las ciudades lejanas no se quedan olvidadas (cuanto más esperan, más prioridad).</li>
         <li>Simula el almacén de destino: puede mandar más de lo que cabe si se va a gastar antes de llegar, pero <b>nunca</b> hace que se pierda nada. Descuenta lo que la ciudad producirá mientras viaja el envío.</li>
         <li>Aprende la velocidad real de los comerciantes con cada envío.</li>
@@ -8028,6 +8068,11 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.14.18', items: [
+      { t: 'Las ciudades que reclutan no regalan lo suyo', tab: 'comercio', find: () => TQ.card(/^Comercio automático/) || TQ.tab('comercio'), h: `
+        <p>Arreglado: una ciudad que reclutaba podía mandar a otra recursos que iba a necesitar ella (p. ej. piedra para sus catapultas, que iban detrás de los jinetes en su lista: solo se reservaba el próximo lote).</p>
+        ${AUTO('Ahora cada ciudad que recluta se guarda lo que cuestan <b>todas</b> sus tropas pedidas que faltan (hasta el % de lote del almacén). Ni otra ciudad que recluta, ni festivales, cueva, equilibrio o aldeas se lo llevan; solo un módulo que vaya antes en la Prioridad.')}` }
+    ] },
     { v: '1.14.17', items: [
       { t: 'Granjas (isla) y recursos del imperio', tab: 'resumen', before: () => { if ((state.resumenView || 'ciudades') !== 'ciudades') { state.resumenView = 'ciudades'; return true; } }, find: () => TQ.card(/^Vista general/) || TQ.tab('resumen'), h: `
         <p>En <b>Vista general → Ciudades</b>, nueva columna <b>Granjas (isla)</b>: % del botín ya acumulado en las aldeas de esa isla (dato del propio juego, aunque el granjeo del bot esté desactivado). Con varias ciudades en la misma isla, sale solo en la principal.</p>
