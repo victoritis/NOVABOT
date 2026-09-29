@@ -913,24 +913,6 @@
     updateCountdown();
   }
 
-  // Grupos de ciudades: las vistas generales del juego (reclutamiento, dioses, cuevas) solo
-  // traen las ciudades del grupo activo. Ver withAllTowns.
-  function renderGroupCard() {
-    const g = activeTownGroup();
-    const on = groupSwitchOn();
-    let name = '';
-    try { name = [].concat(UW.MM.getCollections().TownGroup || []).flatMap((c) => c.models || []).map((m) => m.attributes).find((a) => +a.id === g)?.name || ''; } catch {}
-    const limited = g != null && g !== -1;
-    return el('div', { class: 'nb-card' }, [
-      el('div', { class: 'nb-row' }, [el('div', { class: 'nb-option-text' }, [
-        el('span', { class: 'nb-option-label' }, 'Leer todas las ciudades aunque tenga un grupo activo'),
-        el('span', { class: 'nb-option-hint' }, 'Cambia un momento (medio segundo) al grupo «Todo» para leer las vistas del juego y vuelve al tuyo')]),
-        switchEl(on, (v) => { state.comercio.groupSwitch = v; saveState(); renderBody(); refreshOverviews(); spellInfo.at = 0; kickSpellRefresh(0); })]),
-      limited && !on ? el('div', { class: 'nb-alert nb-alert-warn nb-mt' }, [el('span', {}, [el('b', {}, `Grupo activo: ${name || g}. `),
-        'Las vistas de reclutamiento y de dioses del juego solo traen las ciudades de ese grupo. Las colas de tropas y la plata de las cuevas se leen igual de todas, pero los hechizos de las ciudades de fuera del grupo no se ven (no se salta a ninguna por ellos). Para verlo todo: pon el grupo «Todo» o activa esta opción.'])]) : null,
-      !limited ? el('p', { class: 'nb-placeholder nb-mt' }, 'Tienes el grupo «Todo»: el bot ve todas tus ciudades sin cambiar nada.') : null
-    ]);
-  }
   function renderInicioTab() {
     const townId = +UW.Game?.townId;
     bodyEl.appendChild(el('div', { class: 'nb-card nb-hero' }, [
@@ -8175,11 +8157,6 @@
     { v: '1.14.22', items: [
       { t: 'Todo funciona igual con grupos', tab: 'comercio', find: () => TQ.card(/^Comercio automático/) || TQ.tab('comercio'), h: `
         <p>Da igual el grupo de ciudades que tengas activo: el bot lee de <b>todas</b> tus ciudades los recursos, la plata de las cuevas, las colas y ahora también los <b>hechizos</b> (de la memoria del propio juego). Ya no cambia nunca tu grupo y se quita la opción de Inicio.</p>` }
-    ] },
-    { v: '1.14.21', items: [
-      { t: 'Grupos de ciudades: sin cambiarte de grupo', tab: 'inicio', find: () => TQ.card(/Leer todas las ciudades/) || TQ.tab('inicio'), h: `
-        <p>El bot ya <b>no cambia tu grupo de ciudades</b> por defecto. La plata de las cuevas y las colas de tropas las lee de todas tus ciudades sin tocar el grupo.</p>
-        <p>Lo único que el juego solo da del grupo activo son los <b>hechizos</b>: los de las ciudades de fuera no se ven (y no se salta a ninguna por ellos). En <b>Inicio</b> hay una opción (desactivada) para que cambie medio segundo a «Todo» y los lea; si la usas y cambias de grupo en ese momento, se respeta tu cambio.</p>` }
     ] },
     { v: '1.14.20', items: [
       { t: 'Mercado nivel ≤ 5: recibir sí', tab: 'comercio', find: () => TQ.card(/^Comercio automático/) || TQ.tab('comercio'), h: `
