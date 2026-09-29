@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.14.18
+// @version      1.14.19
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.14.18';
+  const VERSION = '1.14.19';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -1329,6 +1329,46 @@
   const gpGet = (controller, action, json) => gpCall('ajaxGet', controller, action, json);
   const gpPost = (controller, action, json) => gpCall('ajaxPost', controller, action, json);
 
+  /* GRUPOS DE CIUDADES — las vistas generales del juego (reclutamiento, dioses, cuevas)
+     solo devuelven las ciudades del GRUPO ACTIVO (comprobado 29/09/2026: grupo "DEFF"
+     activo → 16 de 33 ciudades; el resto salía "Leyendo cueva…" para siempre, sin colas
+     de tropas ni hechizos). El grupo se guarda en el servidor, no se puede pedir otro por
+     parámetro. Así que, para leerlas, se cambia un momento al grupo "Todo" (-1) con la
+     misma petición que usa el juego (town_group_overviews/set_active_town_group) y se
+     vuelve al tuyo enseguida (~0,5 s; la pantalla del juego no cambia: el grupo que ves
+     lo guarda la propia pestaña). Las lecturas que coinciden se hacen en el mismo cambio. */
+  const groupSwitch = { busy: null, queue: [] };
+  function activeTownGroup() { try { const g = UW.ITowns?.getActiveTownGroupId?.(); return g == null ? null : +g; } catch { return null; } }
+  const needAllTownsGroup = () => { const g = activeTownGroup(); return g != null && g !== -1; };
+  function withAllTowns(fn) {
+    if (!needAllTownsGroup()) return fn();
+    return new Promise((resolve, reject) => {
+      groupSwitch.queue.push({ fn, resolve, reject });
+      if (!groupSwitch.busy) groupSwitch.busy = runGroupBatch().finally(() => { groupSwitch.busy = null; if (groupSwitch.queue.length) groupSwitch.busy = runGroupBatch().finally(() => { groupSwitch.busy = null; }); });
+    });
+  }
+  async function runGroupBatch() {
+    await sleep(60); // junta las lecturas pedidas a la vez
+    // El grupo que ves (el del juego en esta pestaña; el cambio de aquí no lo toca).
+    const orig = activeTownGroup();
+    let switched = false;
+    if (orig != null && orig !== -1) {
+      try { await gpPost('town_group_overviews', 'set_active_town_group', { group_id: -1 }); switched = true; } catch {}
+    }
+    try {
+      while (groupSwitch.queue.length) {
+        const jobs = groupSwitch.queue.splice(0);
+        await Promise.all(jobs.map((j) => Promise.resolve().then(j.fn).then(j.resolve, j.reject)));
+      }
+    } finally {
+      if (switched) {
+        for (let i = 0; i < 3; i++) {
+          try { await gpPost('town_group_overviews', 'set_active_town_group', { group_id: orig }); break; } catch { await sleep(1000); }
+        }
+      }
+    }
+  }
+
   function allTownIds() {
     try { return Object.values(UW.ITowns?.towns || {}).map((t) => +t.id).filter(Boolean); }
     catch { return []; }
@@ -2336,7 +2376,7 @@
     return ci.max === Infinity ? 100000 : Math.max(1000, ci.max);
   }
   async function refreshCaveInfo() {
-    const d = await gpGet('town_overviews', 'hides_overview', { nl_init: true });
+    const d = await withAllTowns(() => gpGet('town_overviews', 'hides_overview', { nl_init: true }));
     const html = String(d?.html || '');
     const map = new Map();
     for (const m of html.matchAll(/id="ov_town_(\d+)"[^>]*?data-iron-stored="(\d+)"/g)) map.set(+m[1], { stored: +m[2] });
@@ -2533,7 +2573,9 @@
       if (fMax && caveFillOn()) {
         const inp = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '1000', step: '1000', value: String(fMax), title: 'Máximo de plata en esta cueva' });
         inp.addEventListener('change', () => { cfg.fill = { ...(cfg.fill || {}) }; let v = Math.max(1000, Math.floor(pos(inp.value, fMax))); if (t.ci.max !== Infinity) v = Math.min(v, t.ci.max); cfg.fill[t.id] = v; saveState(); caveRuntime.planAt = 0; renderBody(); });
-        fillBox = el('div', { class: 'nb-goal-sub' }, ['Llenar hasta ', inp, ' · ', fLeft === null ? 'leyendo cueva…' : fLeft > 0 ? el('span', {}, ['faltan ', el('b', {}, fmt(fLeft)), ' (se las mandan las demás ciudades)']) : el('span', { class: 'nb-ok' }, 'llena ✓')]);
+        fillBox = el('div', { class: 'nb-goal-sub' }, ['Llenar hasta ', inp, ' · ', fLeft === null ? 'leyendo cueva…' : fLeft > 0 ? el('span', {}, ['faltan ', el('b', {}, fmt(fLeft)), lowMarket(t.id)
+          ? el('span', { class: 'nb-warn-txt' }, ` · mercado nivel ${marketLevel(t.id)}: el juego solo deja que le manden las ciudades de su isla${(() => { const mates = allTownIds().filter((o) => o !== t.id && islandKeyOf(o) === islandKeyOf(t.id)); return mates.length ? ` (${mates.map(farmTownName).join(', ')})` : ' (no hay ninguna)'; })()}`)
+          : ' (se las mandan las demás ciudades)']) : el('span', { class: 'nb-ok' }, 'llena ✓')]);
       }
       list.appendChild(el('div', { class: `nb-goal${next || (fLeft && fLeft > 0) ? ' nb-goal-next' : ''}` }, [
         buildingIcon('hide', true),
@@ -3388,7 +3430,7 @@
     try {
       const [tr, rc] = await Promise.all([
         gpGet('town_overviews', 'trade_overview', { nl_init: true }).catch(() => null),
-        gpGet('town_overviews', 'recruit_overview', { nl_init: true }).catch(() => null)
+        withAllTowns(() => gpGet('town_overviews', 'recruit_overview', { nl_init: true })).catch(() => null)
       ]);
       // Cada vista cuenta por separado: el comercio no puede fiarse de "ya leído"
       // si la de envíos falló aunque la de reclutamiento saliera bien.
@@ -3414,6 +3456,9 @@
         }
         overview.recruit = map;
         overview.recruitAt = Date.now();
+        const missing = allTownIds().filter((id) => !map.has(+id));
+        overview.missing = missing;
+        if (missing.length && !overview.missLogged) { overview.missLogged = true; console.warn(`[NOVABOT] La vista de reclutamiento no trae ${missing.length} ciudad(es) (¿grupo de ciudades activo sin Administrador?).`); }
       }
       overview.at = Math.min(overview.tradesAt, overview.recruitAt);
       const failed = [overview.tradesAt ? null : 'envíos', overview.recruitAt ? null : 'reclutamiento'].filter(Boolean);
@@ -3575,14 +3620,14 @@
       return out;
   }
 
-  function collectDemands() {
+  function collectDemands(everyLevel = false) {
     const all = [];
     for (const p of tradeDemandProviders) { try { all.push(...p()); } catch (e) { console.warn('[NOVABOT][comercio] proveedor falló:', e); } }
     // Prioridad común (8a): los módulos no incluidos no piden ni reservan; el
     // resto recibe su rango como prioridad.
     const cfg = priorityConfig();
     let list = all.filter((d) => !d.module || cfg.inc.has(d.module));
-    if (cfg.mode !== 'equilibrado') {
+    if (cfg.mode !== 'equilibrado' && !everyLevel) {
       // Por orden / por niveles: en cada ciudad solo piden (y reservan) los módulos del
       // nivel que tiene el turno (varios a la vez si comparten nivel).
       // El turno es GLOBAL: mientras en CUALQUIER ciudad un módulo de nivel superior
@@ -3766,11 +3811,11 @@
   const lowMarket = (id) => { const l = marketLevel(id); return l > 0 && l < TRADE_MIN_MARKET_LEVEL; };
   const tradePairOk = (a, b) => !(lowMarket(a) || lowMarket(b)) || (islandKeyOf(a) !== '' && islandKeyOf(a) === islandKeyOf(b));
 
-  function planTrades() {
+  function planTrades(opts = {}) {
     const cfg = state.comercio;
     const towns = allTownIds();
     const transit = transitRows();
-    const demands = collectDemands();
+    const demands = collectDemands(!!opts.all);
     const now = Date.now();
     const marginPct = clamp(+cfg.storageMarginPct || 0, 0, 50) / 100;
     const minShip = Math.max(1, +cfg.minShipment || 500);
@@ -3833,9 +3878,9 @@
     // (nunca lo que le falta: así no manda lo suyo para luego pedirlo de vuelta).
     const needy = new Map(needs.map((n) => [n.townId, n.missInit]));
     const canGive = (id, k) => !needy.has(id) || (needy.get(id)[k] || 0) <= 0;
-    // Llenar cueva: primero lo primero. Solo donan ciudades que NO reclutan ni esperan
-    // nada (sin encargos propios); a las que reclutan no se les toca la plata.
-    const caveDonorOk = (id) => !itemsBy[id].length && !(recruitOnFor(id) && townRecruitCfg(id).goals.length);
+    // Llenar cueva: primero lo primero. No donan las ciudades que reclutan; las demás dan
+    // solo lo que les sobra tras sus propios encargos (surplus ya lo descuenta).
+    const caveDonorOk = (id) => !(recruitOnFor(id) && townRecruitCfg(id).goals.length);
     const donorsFor = (n) => towns
       .filter((id) => id !== n.townId && tradePairOk(id, n.townId) && (!n.items.every((i) => i.caveFill) || caveDonorOk(id)) && st[id].cap > 0 && RES.some((k) => canGive(id, k) && availFor(id, k, n) > 0 && n.miss[k] > 0))
       .filter((id) => (tradeRuntime.pairCooldown.get(`${id}>${n.townId}`) || 0) < now)
@@ -4149,7 +4194,10 @@
     const cfg = state.equilibrio;
     const now = Date.now();
     const free = ctx.mode === 'libre';
-    const resList = caveOn() ? ['wood', 'stone'] : RES; // con Cueva la plata la gestiona la Cueva
+    // Con la Cueva en "Todas" la plata la gestiona la Cueva (cada ciudad mete la suya). En
+    // "Individual" no: la plata de las ciudades que no se llenan se reparte como lo demás
+    // (si no, se quedaba al 100 % sin hacer nada).
+    const resList = caveAllOn() ? ['wood', 'stone'] : RES;
     const tol = clamp(+cfg.tolPct || 20, 5, 60) / 100;
     const maxTravel = Math.max(1, +cfg.maxTravelMin || 45) * 60;
     // Parte de los comerciantes que puede usar cada ciudad (lo demás queda libre para encargos).
@@ -4387,7 +4435,15 @@
     if (!state.comercio.enabled) return;
     if (!overviewReady()) return; // sin conocer TODOS los envíos en camino se enviaría de más
     calibrateTravel();
-    const { plan, needs } = planTrades();
+    let { plan, needs } = planTrades();
+    // Por orden / por niveles: si el módulo con el turno no tiene NADA que se pueda enviar
+    // ahora (sus ciudades esperan algo que nadie tiene, o ya va todo de camino), los
+    // comerciantes no se quedan parados: se abastece a los demás módulos (siempre primero
+    // los más prioritarios, y sin tocar lo que cada ciudad guarda para lo suyo).
+    let spare = false;
+    if (!plan.length && prioMode() !== 'equilibrado') {
+      try { const p2 = planTrades({ all: true }); if (p2.plan.length) { plan = p2.plan; spare = true; } } catch {}
+    }
     const maxPerTick = Math.max(1, +state.comercio.maxPerTick || 5);
     for (const p of plan.slice(0, maxPerTick)) {
       if (!state.comercio.enabled) return;
@@ -4396,7 +4452,7 @@
         tradeRuntime.ledger.push({ from: p.from, to: p.to, ...p.ship, arrival: Date.now() + p.eta * 1000, expires: Date.now() + p.eta * 1000 + 120000 });
         tradeRuntime.pairCooldown.set(`${p.from}>${p.to}`, Date.now() + 20000);
         tradeRuntime.lastSendAt = Date.now(); tradeRuntime.recentFrom.set(p.from, Date.now());
-        tradeLog(`${farmTownName(p.from)} → ${farmTownName(p.to)}: ${fmtRes(p.ship)} · ${Math.round(p.eta / 60)} min · para ${p.label}`, 'ok');
+        tradeLog(`${farmTownName(p.from)} → ${farmTownName(p.to)}: ${fmtRes(p.ship)} · ${Math.round(p.eta / 60)} min · para ${p.label}${spare ? ' (comerciantes libres: el módulo con el turno no tenía nada que enviar)' : ''}`, 'ok');
         setTimeout(refreshOverviews, 3000);
       } catch (e) {
         tradeRuntime.pairCooldown.set(`${p.from}>${p.to}`, Date.now() + 5 * 60000);
@@ -5085,7 +5141,7 @@
     let ok = false;
     spellInfo.tryAt = Date.now();
     try {
-      const d = await gpGet('town_overviews', 'gods_overview', { nl_init: true });
+      const d = await withAllTowns(() => gpGet('town_overviews', 'gods_overview', { nl_init: true }));
       const towns = d?.data?.towns;
       if (Array.isArray(towns)) {
         const map = new Map();
@@ -7919,6 +7975,8 @@
         ${AUTO(`<ul><li>Cada 10 s calcula qué falta en cada ciudad y lo envía desde las que tienen de sobra.</li>
         <li>Primero lee <b>todos los envíos en camino</b> (vista de comercio del juego) para no mandar de más.</li>
         <li>Nunca dona lo que la ciudad donante va a gastar; una ciudad que espera recursos solo da los que ella no necesita.</li>
+        <li>Por orden / por niveles: si el módulo con el turno no tiene <b>nada</b> que se pueda enviar ahora, los comerciantes no se quedan parados: se abastece a los demás (primero los más prioritarios, sin tocar lo que cada ciudad guarda para lo suyo).</li>
+        <li><b>Grupos de ciudades</b>: las vistas generales del juego solo traen las ciudades del grupo que tienes activo. Para leerlas todas, el bot cambia un momento al grupo «Todo» y vuelve al tuyo (medio segundo; tu pantalla no cambia).</li>
         <li>Una ciudad que <b>recluta</b> se guarda lo que necesitan <b>todas</b> sus tropas pedidas (no solo el próximo lote), hasta el % de lote del almacén: no se lo da a otra ciudad para reclutar ni para módulos menos prioritarios. Solo lo puede usar un módulo que vaya <b>antes</b> en la Prioridad (p. ej. Construcción).</li>
         <li>Reparto justo: las ciudades lejanas no se quedan olvidadas (cuanto más esperan, más prioridad).</li>
         <li>Simula el almacén de destino: puede mandar más de lo que cabe si se va a gastar antes de llegar, pero <b>nunca</b> hace que se pierda nada. Descuenta lo que la ciudad producirá mientras viaja el envío.</li>
@@ -7981,12 +8039,12 @@
         <li><b>Mínimo por ingreso</b>: no mete menos de esto de una vez.</li></ul>
         ${AUTO('Cada 2 min mira la plata de <b>todo el imperio</b>: lo que pasa de ese % se mete, primero donde más sobra, sin tocar lo que cada ciudad necesita según la prioridad (la Cueva es un módulo más de la prioridad) ni lo que otras ciudades esperan. Cueva 10 = sin límite; si no, 1000 por nivel.')}` },
       { t: 'Relación con las aldeas', find: () => TQ.txt('.nb-alert', /Intercambio con aldeas|Con la Cueva activa/) || TQ.card(/^Meter plata/), h: `
-        <p>Con la Cueva activa, el <b>Intercambio con aldeas</b> solo cambia <b>por plata</b>: la madera o piedra que sobra se convierte en plata y la Cueva la guarda. El equilibrio entre ciudades deja de mover plata.</p>` },
+        <p>Con la Cueva activa, el <b>Intercambio con aldeas</b> solo cambia <b>por plata</b>: la madera o piedra que sobra se convierte en plata y la Cueva la guarda. Con el modo <b>Todas</b>, el equilibrio entre ciudades deja de mover plata; con <b>Individual</b> la sigue repartiendo (así ninguna ciudad se queda al 100 % de plata sin hacer nada).</p>` },
       { t: 'Estado de las cuevas', find: () => TQ.card(/^Cuevas/), h: `<p>Por ciudad: nivel de la cueva, plata guardada / máximo y lo siguiente que meterá. <b>Actualizar</b> relee las cuevas del juego.</p>` },
       { t: 'Llenar la cueva de una ciudad', find: () => TQ.card(/^Cuevas/), h: `
         <p>Con las Cuevas activadas eliges el modo: <b>Todas las ciudades</b> (cada una mete lo que le sobra) o <b>Individual</b>: en la lista activas <b>Llenar</b> en las ciudades que quieras (desactivado por defecto) con su <b>máximo</b>.</p>
-        ${AUTO('Individual: las demás le mandan por el <b>Comercio</b> su plata, pero <b>solo las que no reclutan ni esperan recursos para nada</b> (primero lo primero; es lo último que abastece el Comercio). Esa ciudad la mete en su cueva cada 30 s hasta el máximo.')}
-        ${WARN('Necesita el Comercio activado.')}` }
+        ${AUTO('Individual: las demás le mandan por el <b>Comercio</b> su plata, pero <b>no las que reclutan</b>, y el resto solo lo que le sobra tras sus propios encargos (primero lo primero; es lo último que abastece el Comercio). Esa ciudad la mete en su cueva cada 30 s hasta el máximo.')}
+        ${WARN('Necesita el Comercio activado. Una ciudad con el <b>mercado a nivel 5 o menos</b> solo puede recibir de las ciudades de su misma isla (regla del juego): se avisa en su fila.')}` }
     ]);
 
     // ------------------------------------------------------------------ Ataques
@@ -8068,6 +8126,13 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.14.19', items: [
+      { t: 'Grupos de ciudades: se leen todas', tab: 'comercio', find: () => TQ.card(/^Comercio automático/) || TQ.tab('comercio'), h: `
+        <p>Arreglado: con un <b>grupo de ciudades</b> activo (p. ej. «DEFF»), las vistas generales del juego solo traían las de ese grupo. Las demás salían «Leyendo cueva…» para siempre y el bot no veía bien sus colas de tropas ni sus hechizos.</p>
+        ${AUTO('Ahora cambia un momento al grupo «Todo», lee y vuelve al tuyo (medio segundo; tu pantalla no cambia).')}` },
+      { t: 'Comerciantes que no se quedan parados', tab: 'comercio', find: () => TQ.card(/^Comercio automático/) || TQ.tab('comercio'), h: `
+        <p>Con la prioridad por orden / por niveles, si el módulo con el turno no tiene nada que se pueda enviar, se abastece a los demás. Con la Cueva en «Individual», la plata que sobra se reparte como lo demás (antes se quedaba al 100 %). Y las cuevas a llenar con el mercado a nivel ≤ 5 avisan de que solo pueden recibir de su isla.</p>` }
+    ] },
     { v: '1.14.18', items: [
       { t: 'Las ciudades que reclutan no regalan lo suyo', tab: 'comercio', find: () => TQ.card(/^Comercio automático/) || TQ.tab('comercio'), h: `
         <p>Arreglado: una ciudad que reclutaba podía mandar a otra recursos que iba a necesitar ella (p. ej. piedra para sus catapultas, que iban detrás de los jinetes en su lista: solo se reservaba el próximo lote).</p>
