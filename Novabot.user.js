@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.14.20
+// @version      1.14.22
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.14.20';
+  const VERSION = '1.14.22';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -558,7 +558,7 @@
       const qInfo = (naval) => { const n = orders.filter((o) => (o.kind === 'naval') === naval).length; return el('span', { class: 'nb-rc-q-item' }, [buildingIcon(naval ? 'docks' : 'barracks', true), `${n}/${limit}`]); };
       const spells = Object.entries(cfg.spells || {}).map(([sid, mode]) => {
         const end = spellEnd(id, sid), on = end > now;
-        const known = on || spellsKnown();
+        const known = on || spellsKnownFor(id);
         const left = on ? ` (quedan ${fmtDur(end - now)})` : '';
         return el('span', { class: `nb-rc-spell${on ? ' on' : ''}`, style: known ? '' : 'opacity:.6;filter:grayscale(.5);outline:1px dashed currentColor;outline-offset:1px', title: `${UW.GameData?.powers?.[sid]?.name || sid} · ${mode === 'required' ? 'obligatorio' : 'opcional'} · ${on ? `activo${left}` : known ? 'inactivo' : 'leyendo hechizos…'}` }, [el('span', { class: `nb-icon nb-icon-25 power_icon30x30 ${sid}` })]);
       });
@@ -913,6 +913,24 @@
     updateCountdown();
   }
 
+  // Grupos de ciudades: las vistas generales del juego (reclutamiento, dioses, cuevas) solo
+  // traen las ciudades del grupo activo. Ver withAllTowns.
+  function renderGroupCard() {
+    const g = activeTownGroup();
+    const on = groupSwitchOn();
+    let name = '';
+    try { name = [].concat(UW.MM.getCollections().TownGroup || []).flatMap((c) => c.models || []).map((m) => m.attributes).find((a) => +a.id === g)?.name || ''; } catch {}
+    const limited = g != null && g !== -1;
+    return el('div', { class: 'nb-card' }, [
+      el('div', { class: 'nb-row' }, [el('div', { class: 'nb-option-text' }, [
+        el('span', { class: 'nb-option-label' }, 'Leer todas las ciudades aunque tenga un grupo activo'),
+        el('span', { class: 'nb-option-hint' }, 'Cambia un momento (medio segundo) al grupo «Todo» para leer las vistas del juego y vuelve al tuyo')]),
+        switchEl(on, (v) => { state.comercio.groupSwitch = v; saveState(); renderBody(); refreshOverviews(); spellInfo.at = 0; kickSpellRefresh(0); })]),
+      limited && !on ? el('div', { class: 'nb-alert nb-alert-warn nb-mt' }, [el('span', {}, [el('b', {}, `Grupo activo: ${name || g}. `),
+        'Las vistas de reclutamiento y de dioses del juego solo traen las ciudades de ese grupo. Las colas de tropas y la plata de las cuevas se leen igual de todas, pero los hechizos de las ciudades de fuera del grupo no se ven (no se salta a ninguna por ellos). Para verlo todo: pon el grupo «Todo» o activa esta opción.'])]) : null,
+      !limited ? el('p', { class: 'nb-placeholder nb-mt' }, 'Tienes el grupo «Todo»: el bot ve todas tus ciudades sin cambiar nada.') : null
+    ]);
+  }
   function renderInicioTab() {
     const townId = +UW.Game?.townId;
     bodyEl.appendChild(el('div', { class: 'nb-card nb-hero' }, [
@@ -1339,7 +1357,12 @@
      lo guarda la propia pestaña). Las lecturas que coinciden se hacen en el mismo cambio. */
   const groupSwitch = { busy: null, queue: [] };
   function activeTownGroup() { try { const g = UW.ITowns?.getActiveTownGroupId?.(); return g == null ? null : +g; } catch { return null; } }
-  const needAllTownsGroup = () => { const g = activeTownGroup(); return g != null && g !== -1; };
+  // Solo si lo activas (desactivado por defecto): cambiar el grupo, aunque sea medio
+  // segundo, puede notarse (p. ej. con otra pestaña abierta en otro grupo).
+  const groupSwitchOn = () => !!state.comercio?.groupSwitch;
+  const needAllTownsGroup = () => false; // ya no hace falta: todo se lee de la memoria del juego (ver clientSpellFragment, clientCaveStored)
+  // ¿El grupo activo limita las vistas generales? (y no se cambia de grupo para leerlas)
+  const groupLimited = () => { const g = activeTownGroup(); return g != null && g !== -1 && !groupSwitchOn(); };
   function withAllTowns(fn) {
     if (!needAllTownsGroup()) return fn();
     return new Promise((resolve, reject) => {
@@ -1362,8 +1385,10 @@
       }
     } finally {
       if (switched) {
+        // Al que tengas AHORA (si lo cambiaste en ese medio segundo, se respeta tu cambio).
+        const back = activeTownGroup() ?? orig;
         for (let i = 0; i < 3; i++) {
-          try { await gpPost('town_group_overviews', 'set_active_town_group', { group_id: orig }); break; } catch { await sleep(1000); }
+          try { await gpPost('town_group_overviews', 'set_active_town_group', { group_id: back }); break; } catch { await sleep(1000); }
         }
       }
     }
@@ -2351,11 +2376,17 @@
   const caveFillOn = () => caveOn() && state.cueva.mode === 'individual';        // modo "Individual" (llenar)
   const hideLevel = (townId) => { try { return +UW.ITowns.getTown(townId)?.getBuildings?.()?.attributes?.hide || 0; } catch { return 0; } };
   // Capacidad y lo guardado: el nivel manda (Cueva 10 = sin límite; si no, 1000/nivel).
+  // Plata guardada: el juego la tiene de TODAS las ciudades (town.getEspionageStorage(),
+  // comprobado 29/09/2026 = lo que sale en la vista de cuevas), sin depender del grupo de
+  // ciudades activo. La vista de cuevas / lo recién guardado por el bot se usa si es mayor.
+  function clientCaveStored(townId) { try { const v = UW.ITowns.getTown(townId)?.getEspionageStorage?.(); return Number.isFinite(+v) && v !== null ? +v : null; } catch { return null; } }
   function caveInfo(townId) {
     const lvl = hideLevel(townId);
     const i = caveRuntime.info.get(+townId);
+    const c = clientCaveStored(townId);
     const max = lvl >= 10 ? Infinity : lvl * 1000;
-    return { lvl, max, stored: i ? i.stored : null };
+    const stored = i && c !== null ? Math.max(i.stored, c) : i ? i.stored : c;
+    return { lvl, max, stored };
   }
   /* Llenar la cueva de una ciudad (por ciudad, desactivado por defecto): las ciudades
      marcadas reciben plata de las demás (por el Comercio) y la meten en su cueva hasta
@@ -3481,7 +3512,9 @@
      reclutar DE MÁS. Solución: leer el Cuartel de esas ciudades (solo lectura, como abrir
      la ventana) antes de decidir, y cada 2 min las que tienen cola. */
   const unitSync = { touched: new Map(), dirty: new Set() };
-  const unitsStale = (townId, maxAge) => +townId !== +UW.Game?.townId && unitSync.dirty.has(+townId) && Date.now() - (unitSync.touched.get(+townId) || 0) > maxAge;
+  // (una ciudad que la vista no trae —fuera del grupo activo— cuenta si tiene cola en el juego)
+  const clientOrders = (townId) => { try { return (UW.ITowns.getTown(townId)?.getUnitOrdersCollection?.()?.models || []).length; } catch { return 0; } };
+  const unitsStale = (townId, maxAge) => +townId !== +UW.Game?.townId && (unitSync.dirty.has(+townId) || (!overview.recruit.has(+townId) && clientOrders(townId) > 0)) && Date.now() - (unitSync.touched.get(+townId) || 0) > maxAge;
   async function touchTownUnits(townId) {
     unitSync.touched.set(+townId, Date.now()); unitSync.dirty.delete(+townId);
     try { await gpGetAs(townId, 'building_barracks', 'index', { nl_init: true }); } catch {}
@@ -4637,7 +4670,7 @@
       favorAhead.set(id, { ...reserved });
       if (max && list.length >= max) continue;
       let take = {}, why = null;
-      if (known) {
+      if (known && spellsKnownFor(id)) { // (fuera del grupo activo: no se sabe → ni se salta ni reserva)
         try {
           const nd = recruitSpellNeeds(id, now);
           const kinds = Object.keys(nd);
@@ -5038,6 +5071,7 @@
   // ¿Un hechizo OBLIGATORIO de esa cola (tierra/mar) impedirá reclutar en atMs? (no estará
   // activo y para entonces no habrá favor para lanzarlo) → texto del motivo, o null.
   function recruitSpellBlock(townId, kinds, atMs) {
+    if (!spellsKnownFor(townId)) return null; // no se sabe si está activo: no se frena por él
     const cfg = townRecruitCfg(townId).spells || {};
     const need = {}; const names = [];
     for (const sd of RECRUIT_SPELLS) {
@@ -5120,7 +5154,10 @@
   // ¿Ya se han leído los hechizos de TODAS las ciudades? Nada más recargar, el juego solo
   // tiene cargados los de la ciudad que estás viendo: hasta leer la vista de dioses no se
   // decide nada que dependa de ellos (ni se pinta "inactivo" como si se supiera).
-  const spellsKnown = () => spellInfo.at > 0;
+  const spellsKnown = () => spellInfo.at > 0 || !!clientSpellFragment(UW.Game?.townId);
+  // ¿Sabemos los hechizos de ESTA ciudad? (con un grupo de ciudades activo la vista de
+  // dioses no trae las de fuera del grupo; la ciudad que estás viendo siempre se sabe)
+  const spellsKnownFor = (townId) => !!clientSpellFragment(townId) || (spellsKnown() && (!spellInfo.seen || spellInfo.seen.has(+townId) || +townId === +UW.Game?.townId));
   // Hechizos activos de TODAS las ciudades: vista general de dioses (solo lectura,
   // lo mismo que abrir esa ventana): data.towns[].casted_powers = { power_id: fin (s) }.
   // (Comprobado: el "refetch" de CastedPowers devuelve vacío aunque haya hechizos.)
@@ -5154,6 +5191,7 @@
         // Los recién lanzados por el bot que la vista aún no trae se mantienen.
         for (const [t, o] of spellInfo.active) for (const [k, end] of Object.entries(o)) if (end > Date.now() && !(map.get(t)?.[k] > 0)) { if (!map.has(t)) map.set(t, {}); map.get(t)[k] = end; }
         spellInfo.active = map; spellInfo.at = Date.now(); spellInfo.fails = 0; ok = true;
+        spellInfo.seen = new Set(towns.map((t) => +t.id)); // (con un grupo activo no vienen todas)
       }
     } catch {}
     if (!ok) {
@@ -5164,8 +5202,16 @@
     }
     recruitTurnMemo.at = 0; // la cola (quién se salta por falta de favor) se recalcula con esto
   }
+  /* Hechizos de CUALQUIER ciudad sin pedir nada: el juego guarda en memoria los hechizos de
+     todas tus ciudades (colección "por ciudad": MM.getFirstTownAgnosticCollectionByName
+     ('CastedPowers').getFragment(townId)). Comprobado 29/09/2026: coincide en las 33
+     ciudades con la vista de dioses, y NO depende del grupo de ciudades activo. */
+  function clientSpellFragment(townId) {
+    try { return UW.MM.getFirstTownAgnosticCollectionByName?.('CastedPowers')?.getFragment?.(+townId) || null; } catch { return null; }
+  }
   function spellEnd(townId, id) {
     let end = spellInfo.active.get(+townId)?.[id] || 0;
+    try { for (const m of clientSpellFragment(townId)?.models || []) { const a = m.attributes; if (a.power_id === id) end = Math.max(end, +a.end_at * 1000 || 0); } } catch {}
     try { // lo que tenga cargado el juego (ciudad actual)
       for (const c of [].concat(UW.MM.getCollections().CastedPowers || [])) for (const m of c?.models || []) {
         const a = m.attributes; if (+a.town_id === +townId && a.power_id === id) end = Math.max(end, +a.end_at * 1000 || 0);
@@ -5203,6 +5249,7 @@
       const cost = +p.favor || 0, fav = godFavor(p.god_id) - held;
       const key = `${townId}:${sd.id}`;
       if ((recruitRuntime.cooldown.get(key) || 0) > Date.now()) { if (mode === 'required') return { cast: [], wait: `${p.name}: reintentando en unos minutos` }; continue; }
+      if (fav < cost && mode === 'required' && !spellsKnownFor(townId)) return { cast: [], wait: `${p.name}: no se sabe si está activo (la ciudad no está en tu grupo de ciudades activo) y no hay favor para lanzarlo` };
       if (fav < cost) { if (mode === 'required') return { cast: [], wait: `Esperando favor de ${godLabel(p.god_id)} para ${p.name} (${Math.max(0, Math.floor(fav))}/${cost}${held ? `; ${held} reservado para ${mode === 'required' ? 'las de delante en la cola' : 'otras ciudades'}` : ''})` }; continue; }
       cast.push({ sd, p, mode, cost, key });
     }
@@ -7975,7 +8022,7 @@
         <li>Primero lee <b>todos los envíos en camino</b> (vista de comercio del juego) para no mandar de más.</li>
         <li>Nunca dona lo que la ciudad donante va a gastar; una ciudad que espera recursos solo da los que ella no necesita.</li>
         <li>Por orden / por niveles: si el módulo con el turno no tiene <b>nada</b> que se pueda enviar ahora, los comerciantes no se quedan parados: se abastece a los demás (primero los más prioritarios, sin tocar lo que cada ciudad guarda para lo suyo).</li>
-        <li><b>Grupos de ciudades</b>: las vistas generales del juego solo traen las ciudades del grupo que tienes activo. Para leerlas todas, el bot cambia un momento al grupo «Todo» y vuelve al tuyo (medio segundo; tu pantalla no cambia).</li>
+        <li><b>Grupos de ciudades</b>: da igual qué grupo tengas activo. Recursos, plata de las cuevas, colas de tropas y de edificios, hechizos y envíos se leen de <b>todas</b> tus ciudades desde la memoria del propio juego, sin cambiarte de grupo.</li>
         <li>Una ciudad que <b>recluta</b> se guarda lo que necesitan <b>todas</b> sus tropas pedidas (no solo el próximo lote), hasta el % de lote del almacén: no se lo da a otra ciudad para reclutar ni para módulos menos prioritarios. Solo lo puede usar un módulo que vaya <b>antes</b> en la Prioridad (p. ej. Construcción).</li>
         <li>Reparto justo: las ciudades lejanas no se quedan olvidadas (cuanto más esperan, más prioridad).</li>
         <li>Simula el almacén de destino: puede mandar más de lo que cabe si se va a gastar antes de llegar, pero <b>nunca</b> hace que se pierda nada. Descuenta lo que la ciudad producirá mientras viaja el envío.</li>
@@ -8125,6 +8172,15 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.14.22', items: [
+      { t: 'Todo funciona igual con grupos', tab: 'comercio', find: () => TQ.card(/^Comercio automático/) || TQ.tab('comercio'), h: `
+        <p>Da igual el grupo de ciudades que tengas activo: el bot lee de <b>todas</b> tus ciudades los recursos, la plata de las cuevas, las colas y ahora también los <b>hechizos</b> (de la memoria del propio juego). Ya no cambia nunca tu grupo y se quita la opción de Inicio.</p>` }
+    ] },
+    { v: '1.14.21', items: [
+      { t: 'Grupos de ciudades: sin cambiarte de grupo', tab: 'inicio', find: () => TQ.card(/Leer todas las ciudades/) || TQ.tab('inicio'), h: `
+        <p>El bot ya <b>no cambia tu grupo de ciudades</b> por defecto. La plata de las cuevas y las colas de tropas las lee de todas tus ciudades sin tocar el grupo.</p>
+        <p>Lo único que el juego solo da del grupo activo son los <b>hechizos</b>: los de las ciudades de fuera no se ven (y no se salta a ninguna por ellos). En <b>Inicio</b> hay una opción (desactivada) para que cambie medio segundo a «Todo» y los lea; si la usas y cambias de grupo en ese momento, se respeta tu cambio.</p>` }
+    ] },
     { v: '1.14.20', items: [
       { t: 'Mercado nivel ≤ 5: recibir sí', tab: 'comercio', find: () => TQ.card(/^Comercio automático/) || TQ.tab('comercio'), h: `
         <p>Corregido: una ciudad con el <b>mercado a nivel 5 o menos</b> no puede <b>enviar</b> a otras islas, pero <b>recibir</b> sí puede de cualquiera. Antes el bot tampoco le mandaba nada desde otras islas (p. ej. para llenar su cueva).</p>` }
