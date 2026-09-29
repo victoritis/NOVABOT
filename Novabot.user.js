@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.14.19
+// @version      1.14.20
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.14.19';
+  const VERSION = '1.14.20';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -2573,9 +2573,7 @@
       if (fMax && caveFillOn()) {
         const inp = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '1000', step: '1000', value: String(fMax), title: 'Máximo de plata en esta cueva' });
         inp.addEventListener('change', () => { cfg.fill = { ...(cfg.fill || {}) }; let v = Math.max(1000, Math.floor(pos(inp.value, fMax))); if (t.ci.max !== Infinity) v = Math.min(v, t.ci.max); cfg.fill[t.id] = v; saveState(); caveRuntime.planAt = 0; renderBody(); });
-        fillBox = el('div', { class: 'nb-goal-sub' }, ['Llenar hasta ', inp, ' · ', fLeft === null ? 'leyendo cueva…' : fLeft > 0 ? el('span', {}, ['faltan ', el('b', {}, fmt(fLeft)), lowMarket(t.id)
-          ? el('span', { class: 'nb-warn-txt' }, ` · mercado nivel ${marketLevel(t.id)}: el juego solo deja que le manden las ciudades de su isla${(() => { const mates = allTownIds().filter((o) => o !== t.id && islandKeyOf(o) === islandKeyOf(t.id)); return mates.length ? ` (${mates.map(farmTownName).join(', ')})` : ' (no hay ninguna)'; })()}`)
-          : ' (se las mandan las demás ciudades)']) : el('span', { class: 'nb-ok' }, 'llena ✓')]);
+        fillBox = el('div', { class: 'nb-goal-sub' }, ['Llenar hasta ', inp, ' · ', fLeft === null ? 'leyendo cueva…' : fLeft > 0 ? el('span', {}, ['faltan ', el('b', {}, fmt(fLeft)), ' (se las mandan las demás ciudades)']) : el('span', { class: 'nb-ok' }, 'llena ✓')]);
       }
       list.appendChild(el('div', { class: `nb-goal${next || (fLeft && fLeft > 0) ? ' nb-goal-next' : ''}` }, [
         buildingIcon('hide', true),
@@ -3801,15 +3799,16 @@
     return txt.length > 3 ? `${txt.slice(0, 3).join(', ')} y ${txt.length - 3} más` : txt.join(', ');
   }
 
-  /* El juego no deja que una ciudad con el MERCADO a nivel 5 o menos comercie con ciudades
-     de OTRA isla (aviso del juego al intentarlo). En la misma isla sí. El bot no plantea
-     esos envíos (encargos, equilibrio y alimentar aldeas): si alguna de las dos ciudades
-     tiene el mercado por debajo de nivel 6 y están en islas distintas, no se envía. */
+  /* El juego no deja que una ciudad con el MERCADO a nivel 5 o menos ENVÍE a ciudades de
+     OTRA isla (aviso del juego al intentarlo). En la misma isla sí. RECIBIR sí puede de
+     cualquier isla (comprobado por el jugador 29/09/2026: 26. NOVA, mercado 5, recibe).
+     El bot no plantea esos envíos (encargos, equilibrio y alimentar aldeas): solo se mira
+     el mercado de la ciudad que ENVÍA. */
   const TRADE_MIN_MARKET_LEVEL = 6;
   function marketLevel(id) { try { return +UW.ITowns.getTown(+id)?.getBuildings?.()?.attributes?.market || 0; } catch { return 0; } }
   function islandKeyOf(id) { try { const d = farmTownData(id); return d && d.island_x != null ? `${d.island_x}_${d.island_y}` : ''; } catch { return ''; } }
   const lowMarket = (id) => { const l = marketLevel(id); return l > 0 && l < TRADE_MIN_MARKET_LEVEL; };
-  const tradePairOk = (a, b) => !(lowMarket(a) || lowMarket(b)) || (islandKeyOf(a) !== '' && islandKeyOf(a) === islandKeyOf(b));
+  const tradePairOk = (from, to) => !lowMarket(from) || (islandKeyOf(from) !== '' && islandKeyOf(from) === islandKeyOf(to));
 
   function planTrades(opts = {}) {
     const cfg = state.comercio;
@@ -4509,7 +4508,7 @@
       optionRow('Abastecer reclutamiento', 'Envía lo que falta para completar los lotes de tropas', !!cfg.forRecruit, (v) => { cfg.forRecruit = v; saveState(); renderBody(); }),
       optionRow('Abastecer investigación', 'Solo cuando la ciudad tiene puntos de investigación para esa investigación', cfg.forResearch !== false, (v) => { cfg.forResearch = v; saveState(); renderBody(); }),
       optionRow('Abastecer festivales', 'Envía justo lo que falta para el festival (Academia 30+)', cfg.forFestival !== false, (v) => { cfg.forFestival = v; saveState(); renderBody(); }),
-      (() => { const low = allTownIds().filter(lowMarket); return low.length ? el('div', { class: 'nb-alert nb-alert-warn' }, `Mercado por debajo de nivel ${TRADE_MIN_MARKET_LEVEL}: solo comercian con ciudades de su misma isla (el juego no deja con otras islas): ${low.map((id) => `${farmTownName(id)} (nv ${marketLevel(id)})`).join(', ')}.`) : null; })(),
+      (() => { const low = allTownIds().filter(lowMarket); return low.length ? el('div', { class: 'nb-alert nb-alert-warn' }, `Mercado por debajo de nivel ${TRADE_MIN_MARKET_LEVEL}: solo ENVÍAN a ciudades de su misma isla (recibir sí pueden de cualquiera; el juego no deja enviar a otras islas): ${low.map((id) => `${farmTownName(id)} (nv ${marketLevel(id)})`).join(', ')}.`) : null; })(),
       el('p', { class: 'nb-placeholder' }, 'Aquí se elige a qué módulos manda recursos el comercio (es el único sitio). Revisa cada 10 s. Abastece todos los encargos que caben en la cola de cada ciudad. Nunca dona lo que la donante va a gastar y nunca hace que se pierda recurso al llegar.')
     ]));
 
@@ -7981,7 +7980,7 @@
         <li>Reparto justo: las ciudades lejanas no se quedan olvidadas (cuanto más esperan, más prioridad).</li>
         <li>Simula el almacén de destino: puede mandar más de lo que cabe si se va a gastar antes de llegar, pero <b>nunca</b> hace que se pierda nada. Descuenta lo que la ciudad producirá mientras viaja el envío.</li>
         <li>Aprende la velocidad real de los comerciantes con cada envío.</li>
-        <li>Las ciudades con el <b>mercado por debajo de nivel 6</b> solo comercian con ciudades de su <b>misma isla</b> (el juego no deja con otras islas si el mercado es de nivel 5 o menos): no se les plantean esos envíos, y te lo avisa aquí.</li></ul>`)}` },
+        <li>Las ciudades con el <b>mercado por debajo de nivel 6</b> solo <b>envían</b> a ciudades de su <b>misma isla</b> (el juego no deja enviar a otras islas si el mercado es de nivel 5 o menos); <b>recibir</b> sí pueden de cualquiera. No se les plantean esos envíos, y te lo avisa aquí.</li></ul>`)}` },
       { t: 'Ajustes', find: () => TQ.card(/^Ajustes/), h: `
         <ul><li><b>Envío mínimo</b>: no manda envíos más pequeños (salvo que completen lo que falta).</li>
         <li><b>Margen almacén %</b>: hueco que deja libre en el almacén de destino.</li>
@@ -8044,7 +8043,7 @@
       { t: 'Llenar la cueva de una ciudad', find: () => TQ.card(/^Cuevas/), h: `
         <p>Con las Cuevas activadas eliges el modo: <b>Todas las ciudades</b> (cada una mete lo que le sobra) o <b>Individual</b>: en la lista activas <b>Llenar</b> en las ciudades que quieras (desactivado por defecto) con su <b>máximo</b>.</p>
         ${AUTO('Individual: las demás le mandan por el <b>Comercio</b> su plata, pero <b>no las que reclutan</b>, y el resto solo lo que le sobra tras sus propios encargos (primero lo primero; es lo último que abastece el Comercio). Esa ciudad la mete en su cueva cada 30 s hasta el máximo.')}
-        ${WARN('Necesita el Comercio activado. Una ciudad con el <b>mercado a nivel 5 o menos</b> solo puede recibir de las ciudades de su misma isla (regla del juego): se avisa en su fila.')}` }
+        ${WARN('Necesita el Comercio activado.')}` }
     ]);
 
     // ------------------------------------------------------------------ Ataques
@@ -8126,12 +8125,16 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.14.20', items: [
+      { t: 'Mercado nivel ≤ 5: recibir sí', tab: 'comercio', find: () => TQ.card(/^Comercio automático/) || TQ.tab('comercio'), h: `
+        <p>Corregido: una ciudad con el <b>mercado a nivel 5 o menos</b> no puede <b>enviar</b> a otras islas, pero <b>recibir</b> sí puede de cualquiera. Antes el bot tampoco le mandaba nada desde otras islas (p. ej. para llenar su cueva).</p>` }
+    ] },
     { v: '1.14.19', items: [
       { t: 'Grupos de ciudades: se leen todas', tab: 'comercio', find: () => TQ.card(/^Comercio automático/) || TQ.tab('comercio'), h: `
         <p>Arreglado: con un <b>grupo de ciudades</b> activo (p. ej. «DEFF»), las vistas generales del juego solo traían las de ese grupo. Las demás salían «Leyendo cueva…» para siempre y el bot no veía bien sus colas de tropas ni sus hechizos.</p>
         ${AUTO('Ahora cambia un momento al grupo «Todo», lee y vuelve al tuyo (medio segundo; tu pantalla no cambia).')}` },
       { t: 'Comerciantes que no se quedan parados', tab: 'comercio', find: () => TQ.card(/^Comercio automático/) || TQ.tab('comercio'), h: `
-        <p>Con la prioridad por orden / por niveles, si el módulo con el turno no tiene nada que se pueda enviar, se abastece a los demás. Con la Cueva en «Individual», la plata que sobra se reparte como lo demás (antes se quedaba al 100 %). Y las cuevas a llenar con el mercado a nivel ≤ 5 avisan de que solo pueden recibir de su isla.</p>` }
+        <p>Con la prioridad por orden / por niveles, si el módulo con el turno no tiene nada que se pueda enviar, se abastece a los demás. Con la Cueva en «Individual», la plata que sobra se reparte como lo demás (antes se quedaba al 100 %). </p>` }
     ] },
     { v: '1.14.18', items: [
       { t: 'Las ciudades que reclutan no regalan lo suyo', tab: 'comercio', find: () => TQ.card(/^Comercio automático/) || TQ.tab('comercio'), h: `
