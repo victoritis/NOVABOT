@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.14.22
+// @version      1.14.23
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.14.22';
+  const VERSION = '1.14.23';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -534,10 +534,15 @@
         pendingUnits += rem;
         const pct = g.target ? Math.min(100, Math.round((h + q) / g.target * 100)) : 100;
         const pctHave = g.target ? Math.min(100, Math.round(h / g.target * 100)) : 100;
+        const del = el('span', { class: 'nb-mini', title: `Quitar ${unitName(g.id)} del bot en esta ciudad`, style: 'margin-left:6px', onclick: () => {
+          if (!confirm(`¿Quitar ${g.target} ${unitName(g.id)} de ${farmTownName(id)}?`)) return;
+          const t = townRecruitCfg(id); t.goals = t.goals.filter((x) => x.id !== g.id);
+          recruitTurnMemo.at = 0; saveState(); renderBody(); recruitLog(`${farmTownName(id)}: quitado ${g.target} ${unitName(g.id)} (desde Vista general).`);
+        } }, '✕');
         return el('div', { class: 'nb-rc-unit' }, [
           unitIcon(g.id, 25),
           el('div', { class: 'nb-rc-unit-main' }, [
-            el('div', { class: 'nb-rc-unit-top' }, [el('b', {}, unitName(g.id)), el('span', {}, `${h}${q ? ` + ${q} en cola` : ''} / ${g.target}`)]),
+            el('div', { class: 'nb-rc-unit-top' }, [el('b', {}, unitName(g.id)), el('span', {}, [`${h}${q ? ` + ${q} en cola` : ''} / ${g.target}`, del])]),
             el('div', { class: 'nb-bar nb-rc-bar' }, [el('div', { class: 'nb-bar-fill nb-rc-q', style: `width:${pct}%` }), el('div', { class: 'nb-bar-fill', style: `width:${pctHave}%` })]),
             el('div', { class: 'nb-rc-unit-sub' }, rem ? `faltan ${rem}${unitResearched(id, g.id) ? '' : ' · esperando investigación'}` : goalMetOnlyByFlight(id, g, have, queued) ? `completo contando ${unitsInFlight(id).units[g.id]} que van atacando: se recuenta al llegar` : recruitWaiting(id) || +cfg.startAt > 0 ? 'completo ahora: se recuenta al empezar' : 'completo')
           ])
@@ -564,7 +569,7 @@
       });
       return el('div', { class: `nb-rc-card nb-rc-${cls}${+UW.Game?.townId === id ? ' nb-rc-current' : ''}` }, [
         el('div', { class: 'nb-rc-head' }, [
-          el('b', { class: 'nb-rc-town' }, farmTownName(id)),
+          townLink(id, 'nb-rc-town'),
           el('span', { class: `nb-rc-state nb-rc-state-${cls}` }, st)
         ]),
         el('div', { class: 'nb-rc-units' }, rows),
@@ -580,9 +585,10 @@
       sel.addEventListener('change', () => { rc.maxActive = +sel.value; recruitTurnMemo.at = 0; saveState(); renderBody(); recruitLog(`Ciudades reclutando a la vez: ${+sel.value || 'todas'}.`); });
       const turn = recruitTurnSet();
       const ordered = towns.slice().sort(recruitQueueCmp);
+      const nOn = ordered.filter((x) => !recruitQueueOff(x)).length;
       const move = (id, d) => {
         const list = ordered.slice(); const i = list.indexOf(id), j = i + d;
-        if (j < 0 || j >= list.length) return;
+        if (j < 0 || j >= list.length || recruitQueueOff(id) || recruitQueueOff(list[j])) return; // las desactivadas se quedan al final
         [list[i], list[j]] = [list[j], list[i]];
         rc.queueOrder = list; recruitTurnMemo.at = 0; saveState(); renderBody();
       };
@@ -590,13 +596,16 @@
       let pos = 0;
       const rows = ordered.map((id, i) => {
         const inc = recruitIncluded(id) && recruitOnFor(id);
-        const tag = !inc ? 'desactivada' : recruitWaiting(id) ? 'en espera (hora)' : recruitSkip.has(id) ? `se salta: ${recruitSkip.get(id).split(':')[0].replace(/^Sin favor/, 'sin favor')} (vuelve en cuanto lo haya)` : turn.has(id) ? '● reclutando' : `en cola${limited ? ` (${++pos}º)` : ''}`;
+        const tag = !inc ? 'desactivada (al final)' : recruitWaiting(id) ? 'en espera (hora)' : recruitSkip.has(id) ? `se salta: ${recruitSkip.get(id).split(':')[0].replace(/^Sin favor/, 'sin favor')} (vuelve en cuanto lo haya)` : turn.has(id) ? '● reclutando' : 'en cola';
+        void pos; void limited;
+        // Sin números (se confunden con los de las ciudades): se marca la primera y la última.
+        const mark = !inc ? null : i === 0 ? el('span', { class: 'nb-pill', style: 'margin-right:6px', title: 'La primera de la cola' }, '⤒ primera') : i === nOn - 1 ? el('span', { class: 'nb-pill', style: 'margin-right:6px', title: 'La última de la cola' }, '⤓ última') : null;
         const sw = switchEl(recruitIncluded(id), (v) => { rc.excluded = { ...(rc.excluded || {}) }; if (v) delete rc.excluded[id]; else rc.excluded[id] = true; recruitTurnMemo.at = 0; saveState(); renderBody(); recruitLog(`${farmTownName(id)}: reclutamiento ${v ? 'activado' : 'desactivado'} en la cola.`); });
         return el('div', { class: 'nb-row' }, [
-          el('span', { class: 'nb-row-label' }, [el('b', {}, `${i + 1}. ${farmTownName(id)}`), el('span', { class: `nb-ov-dim${turn.has(id) ? ' nb-ok' : ''}`, style: 'margin-left:8px' }, tag)]),
+          el('span', { class: 'nb-row-label', style: inc ? '' : 'opacity:.55' }, [mark, townLink(id), el('span', { class: `nb-ov-dim${turn.has(id) ? ' nb-ok' : ''}`, style: 'margin-left:8px' }, tag)]),
           el('span', { class: 'nb-stepper' }, [
-            el('span', { class: `nb-mini${i === 0 ? ' nb-mini-off' : ''}`, title: 'Subir en la cola', onclick: () => move(id, -1) }, '▲'),
-            el('span', { class: `nb-mini${i === ordered.length - 1 ? ' nb-mini-off' : ''}`, title: 'Bajar en la cola', onclick: () => move(id, 1) }, '▼'),
+            el('span', { class: `nb-mini${i === 0 || !inc ? ' nb-mini-off' : ''}`, title: 'Subir en la cola', onclick: () => move(id, -1) }, '▲'),
+            el('span', { class: `nb-mini${i >= nOn - 1 || !inc ? ' nb-mini-off' : ''}`, title: 'Bajar en la cola', onclick: () => move(id, 1) }, '▼'),
             sw
           ])
         ]);
@@ -606,7 +615,7 @@
         el('div', { class: 'nb-card-title nb-mt' }, 'Cola de reclutamiento'),
         spellsKnown() ? null : el('p', { class: 'nb-placeholder' }, 'Leyendo los hechizos activos de todas las ciudades… (hasta entonces no se salta a ninguna ni se le mandan recursos a las que tienen hechizo obligatorio)'),
         ...(rows.length ? rows : [el('p', { class: 'nb-placeholder' }, 'Ninguna ciudad tiene tropas pedidas.')]),
-        el('p', { class: 'nb-placeholder' }, 'Interruptor activado (por defecto) = recluta con el bot; desactivado = no recluta ni pide recursos. ▲▼ = orden: las N de arriba son las que reclutan. Se salta la que no puede por falta de favor para un hechizo obligatorio (vuelve en cuanto lo tenga).')
+        el('p', { class: 'nb-placeholder' }, 'Interruptor activado (por defecto) = recluta con el bot; desactivado = no recluta ni pide recursos y pasa al final. ▲▼ = orden (de arriba abajo): las N de arriba son las que reclutan. Se salta la que no puede por falta de favor para un hechizo obligatorio (vuelve en cuanto lo tenga). Pulsa el nombre de una ciudad para ir a ella en el juego.')
       ]));
     }
     bodyEl.appendChild(el('div', { class: 'nb-stats nb-rc-stats' }, [
@@ -4599,11 +4608,20 @@
   let recruitTurnMemo = { at: 0, set: null };
   // Orden de la cola (lo eliges con ▲▼ en Vista general → Reclutamiento); las que no están
   // en la lista van detrás, por nombre.
+  // Las desactivadas (interruptor de la cola o reclutamiento apagado en la ciudad) van
+  // siempre al final, en su orden; al volver a activarlas recuperan su puesto.
+  const recruitQueueOff = (id) => { try { return !recruitIncluded(id) || !recruitOnFor(id); } catch { return false; } };
   function recruitQueueCmp(a, b) {
     const q = (state.reclutamiento.queueOrder || []).map(Number);
     const ia = q.indexOf(+a), ib = q.indexOf(+b);
-    return ((ia < 0 ? 1e9 : ia) - (ib < 0 ? 1e9 : ib)) || farmTownName(a).localeCompare(farmTownName(b), 'es');
+    return ((recruitQueueOff(a) ? 1 : 0) - (recruitQueueOff(b) ? 1 : 0)) || ((ia < 0 ? 1e9 : ia) - (ib < 0 ? 1e9 : ib)) || farmTownName(a).localeCompare(farmTownName(b), 'es');
   }
+  // Ir a esa ciudad en el juego (lo mismo que elegirla en la lista de ciudades).
+  function gotoTown(id) {
+    try { if (typeof UW.HelperTown?.townSwitch === 'function') { UW.HelperTown.townSwitch(+id); return; } } catch {}
+    try { if (typeof UW.TownSwitch === 'function') UW.TownSwitch(+id); } catch {}
+  }
+  const townLink = (id, cls = '') => el('b', { class: cls, style: 'cursor:pointer;text-decoration:underline dotted', title: 'Ir a esta ciudad en el juego', onclick: (e) => { e.stopPropagation(); gotoTown(id); } }, farmTownName(id));
   /* Cola estricta: con un máximo N, reclutan SIEMPRE las N primeras de la cola (orden ▲▼)
      que puedan reclutar. Si subes una, pasa a reclutar y la que queda fuera deja de hacerlo
      (lo que ya mandó a la cola del juego sigue; solo deja de mandar lotes nuevos).
@@ -7848,6 +7866,8 @@
       { t: 'Reclutamiento del bot', before: () => { if (state.resumenView !== 'reclutamiento') { state.resumenView = 'reclutamiento'; return true; } }, find: () => TQ.sel('.nb-rc-stats', bodyEl) || TQ.sel('.nb-seg-main', bodyEl), h: `
         <p>Vista <b>Reclutamiento</b>: por ciudad, qué tropas le has pedido al bot, cuánto falta (barra), el <b>siguiente lote</b> con sus recursos, las colas y los hechizos.</p>
         <p>Colores del estado: <b>listo</b> para reclutar, reuniendo recursos, en espera (cola llena, programado, falta población…), desactivado o completo.</p>
+        <p>Pulsa el <b>nombre de una ciudad</b> (en las tarjetas o en la cola) para ir a ella en el juego. Con la <b>✕</b> de cada tropa la quitas del bot sin salir de aquí.</p>
+        <p>En la <b>cola de reclutamiento</b> no hay números (se confundían con los de tus ciudades): se marcan la <b>primera</b> y la <b>última</b>, y el orden es de arriba abajo. Las desactivadas pasan solas <b>al final</b>.</p>
         <p>Lo pendiente está <b>solo en las tarjetas</b>. Abajo, plegado, el <b>Historial</b>: lo que el bot ya quitó por estar cumplido (tus tropas + la cola del juego llegan al objetivo), con cómo está ahora y un botón para devolverlo.</p>
         ${AUTO('Las tropas de las ciudades que no estás viendo se ponen al día leyendo su Cuartel (el juego no suma lo que termina la cola hasta que “tocas” la ciudad): cada 2 min las que tienen cola y siempre justo antes de reclutar, para no reclutar de más.')}` }
     ]);
@@ -8154,6 +8174,12 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.14.23', items: [
+      { t: 'Vista general de reclutamiento', tab: 'resumen', before: () => { if (state.resumenView !== 'reclutamiento') { state.resumenView = 'reclutamiento'; return true; } }, find: () => TQ.card(/^Ciudades reclutando/) || TQ.tab('resumen'), h: `
+        <ul><li><b>✕</b> en cada tropa de las tarjetas para quitarla del bot.</li>
+        <li>Pulsando el <b>nombre de la ciudad</b> vas a ella en el juego.</li>
+        <li>La cola ya no lleva números: se marcan la <b>primera</b> y la <b>última</b>. Las ciudades desactivadas pasan solas al final (y no se pueden mover hasta reactivarlas).</li></ul>` }
+    ] },
     { v: '1.14.22', items: [
       { t: 'Todo funciona igual con grupos', tab: 'comercio', find: () => TQ.card(/^Comercio automático/) || TQ.tab('comercio'), h: `
         <p>Da igual el grupo de ciudades que tengas activo: el bot lee de <b>todas</b> tus ciudades los recursos, la plata de las cuevas, las colas y ahora también los <b>hechizos</b> (de la memoria del propio juego). Ya no cambia nunca tu grupo y se quita la opción de Inicio.</p>` }
