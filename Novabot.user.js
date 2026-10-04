@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.14.23
+// @version      1.14.24
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.14.23';
+  const VERSION = '1.14.24';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -7086,12 +7086,24 @@
     // Selectores con imagen: héroes de la ciudad de origen y hechizos (uno solo).
     const chip = (active, icon, title, sub, onclick, disabled = false, tip = '') => el('div', { class: `nb-pick${active ? ' active' : ''}${disabled ? ' nb-pick-off' : ''}`, title: tip || null, onclick: disabled ? null : onclick }, [icon, el('div', { class: 'nb-pick-text' }, [el('b', {}, title), sub ? el('small', {}, sub) : null])]);
     const noneIcon = () => el('span', { class: 'nb-pick-none' }, '∅');
+    // Con «Tropas que aún no tengo» (ataque futuro) también se puede elegir un héroe que aún
+    // no está en la ciudad (viene de camino, está herido o en otra ciudad): tú te aseguras de
+    // que esté a la hora de salir. Si al salir no está, el ataque sale sin él (y se avisa).
     const heroesAll = heroesIn(f.source, true);
-    if (f.hero && !heroesAll.some((h) => h.id === f.hero && h.available)) f.hero = '';
+    if (future) {
+      const here = new Set(heroesAll.map((h) => h.id));
+      for (const m of heroModels()) {
+        const id = heroIdOf(m); if (!id || here.has(id)) continue;
+        const t = heroTownOf(m);
+        heroesAll.push({ id, town: t, level: +mval(m, 'level') || null, available: false, why: t ? `en ${farmTownName(t)}` : 'sin ciudad' });
+      }
+    }
+    const heroOk = (h) => h.available || future;
+    if (f.hero && !heroesAll.some((h) => h.id === f.hero && heroOk(h))) f.hero = '';
     const heroSel = el('div', { class: 'nb-picks' }, [
       chip(!f.hero, noneIcon(), 'Sin héroe', null, () => { f.hero = ''; renderBody(); }),
       ...heroesAll.map((h) => chip(f.hero === h.id, el('span', { class: `nb-icon nb-icon-25 hero_icon hero25x25 ${h.id}` }), heroName(h.id),
-        h.available ? (h.level ? `nivel ${h.level}` : null) : h.why, () => { f.hero = h.id; renderBody(); }, !h.available))
+        h.available ? (h.level ? `nivel ${h.level}` : null) : `${h.why}${future ? ' · tú te aseguras de que esté' : ''}`, () => { f.hero = h.id; renderBody(); }, !heroOk(h)))
     ]);
     if (!heroesAll.length) heroSel.appendChild(el('span', { class: 'nb-placeholder' }, 'Ningún héroe en esta ciudad.'));
     const spells = attackSpells(f.type);
@@ -8111,7 +8123,7 @@
       { t: '4 · Tropas, héroe y hechizo', find: () => TQ.step(4), wide: true, h: `
         <ul><li>Escribe cuántas de cada una o pulsa <b>máx</b>. Atajos: Todas, Ofensivas, Solo tierra, Ninguna.</li>
         <li>Cada tropa muestra su tiempo de viaje; la que <b>marca</b> el tiempo se resalta. El viaje se calcula con el <b>mismo código que la ventana del juego</b>: si van barcos, mandan los barcos (la tierra va embarcada, aunque sea la misma isla); cada <b>Sirena</b> acelera los barcos un 2 %; y cuentan los bonus de la ciudad, hechizos y héroe.</li>
-        <li><b>Tropas que aún no tengo</b>: para un ataque futuro puedes pedir más de las que hay ahora (tú te aseguras de tenerlas a esa hora). Al salir se envía lo que haya.</li>
+        <li><b>Tropas que aún no tengo</b>: para un ataque futuro puedes pedir más de las que hay ahora (tú te aseguras de tenerlas a esa hora). Al salir se envía lo que haya. También puedes elegir un <b>héroe que aún no está</b> en la ciudad (de camino, herido o en otra): si al salir no está, el ataque sale sin él y te avisa.</li>
         <li><b>Héroe</b>: solo los de la ciudad de origen que estén disponibles.</li>
         <li><b>Hechizo</b>: uno, de los que se pueden lanzar sobre esa orden, con su coste de favor. Con <b>Ultra</b> o <b>Humano</b> no va con el envío: se lanza sobre la orden cuando ya acertó el rango y no se va a cancelar, así no se pierde favor en los intentos.</li></ul>` },
       { t: '5 · Hora', find: () => TQ.step(5), wide: true, h: `
@@ -8174,6 +8186,10 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.14.24', items: [
+      { t: 'Héroe que aún no está', tab: 'ataques', find: () => TQ.tab('ataques'), h: `
+        <p>Con <b>«Tropas que aún no tengo»</b> activado puedes elegir también un <b>héroe que todavía no está</b> en la ciudad de origen (viene de camino, está herido o en otra ciudad). Tú te aseguras de que esté a la hora de salir; si no está, el ataque sale sin él y se avisa.</p>` }
+    ] },
     { v: '1.14.23', items: [
       { t: 'Vista general de reclutamiento', tab: 'resumen', before: () => { if (state.resumenView !== 'reclutamiento') { state.resumenView = 'reclutamiento'; return true; } }, find: () => TQ.card(/^Ciudades reclutando/) || TQ.tab('resumen'), h: `
         <ul><li><b>✕</b> en cada tropa de las tarjetas para quitarla del bot.</li>
