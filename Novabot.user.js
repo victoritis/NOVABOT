@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.14.23
+// @version      1.15.0
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.14.23';
+  const VERSION = '1.15.0';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -684,7 +684,7 @@
 
   function renderResumenBuild() {
     for (const id of allTownIds()) pruneCompletedGoals(id);
-    const towns = allTownIds().filter((id) => townBuildCfg(id).goals.length)
+    const towns = allTownIds().filter((id) => buildGoals(id).length)
       .sort((a, b) => farmTownName(a).localeCompare(farmTownName(b), 'es'));
     let pendingLv = 0, ready = 0, waiting = 0;
     const cards = towns.map((id) => {
@@ -701,13 +701,16 @@
       else { st = `${buildingName(f.id)}: ${f.reason}`; cls = 'wait'; }
       if (cls === 'wait') waiting++;
       // Objetivos (en orden de prioridad)
-      const rows = cfg.goals.map((g, gi) => {
+      const gl = buildGoals(id), tpl = townUsesTemplate(id);
+      void cfg;
+      const rows = gl.map((g, gi) => {
         const info = o.bd?.building_data?.[g.id];
         const real = realBuildingLevel(id, g.id), q = queuedLevel(id, g.id, info);
         // Si el edificio ya salió antes en la lista, este objetivo empieza donde acaba aquel.
-        const prev = cfg.goals.slice(0, gi).filter((x) => x.id === g.id).pop();
+        const prev = gl.slice(0, gi).filter((x) => x.id === g.id).pop();
         const from = !prev ? q : g.demolish ? Math.min(q, prev.target) : Math.max(q, prev.target);
         const rem = Math.max(0, g.demolish ? from - g.target : g.target - from);
+        if (tpl && !rem) return null; // maqueta: lo que ya cumple no se lista
         pendingLv += rem;
         const head = o.heads.find((h) => h.id === g.id && h.gi === gi);
         const sub = !rem ? 'completo'
@@ -849,10 +852,10 @@
     const rows = towns.map((id) => {
       // Construcción: cola del juego (lo primero que termina) + objetivos del bot
       const bo = townBuildOrders(id).slice().sort((a, b) => (+a.to_be_completed_at || 0) - (+b.to_be_completed_at || 0));
-      const goals = townBuildCfg(id).goals.length;
+      const goals = buildGoals(id).length;
       const build = el('div', { class: 'nb-ov-cell' }, [
         el('div', {}, [el('span', { class: 'nb-ov-count' }, `${bo.length}/${limit}`), bo[0] ? [' ', buildingName(bo[0].building_type), ' ', cd(+bo[0].to_be_completed_at * 1000)] : dim(' sin cola')]),
-        goals ? dim(`${goals} objetivo(s) en el bot${buildEnabledFor(id) ? '' : ' · desactivado'}`) : null
+        goals ? dim(`${townUsesTemplate(id) ? 'maqueta global' : `${goals} objetivo(s) en el bot`}${buildEnabledFor(id) ? '' : ' · desactivado'}`) : null
       ]);
       // Reclutamiento: Cuartel y Puerto
       const uo = (() => { try { return townUnitOrders(id); } catch { return []; } })();
@@ -933,7 +936,7 @@
 
     let metrics = {};
     try {
-      const goalsBuild = allTownIds().reduce((n, id) => n + townBuildCfg(id).goals.length, 0);
+      const goalsBuild = allTownIds().reduce((n, id) => n + buildGoals(id).length, 0);
       const goalsRec = allTownIds().filter((id) => townRecruitCfg(id).goals.length).length;
       const transit = transitRows().length;
       const needs = (() => { try { return planTrades().needs.length; } catch { return 0; } })();
@@ -2761,6 +2764,16 @@
     if (!all[townId]) all[townId] = { goals: [] };
     return all[townId];
   }
+  /* MAQUETA GLOBAL: una lista de niveles por edificio (la misma para todas). Las ciudades
+     en modo "maqueta" construyen eso en vez de sus objetivos propios (que se guardan tal
+     cual por si vuelves al modo normal). Lo que una ciudad ya tenga por encima no se toca
+     (la maqueta solo SUBE, nunca derriba). */
+  const buildTemplate = () => (Array.isArray(state.construccion.template) ? state.construccion.template : (state.construccion.template = []));
+  const townUsesTemplate = (townId) => state.construccion.towns[townId]?.mode === 'maqueta';
+  function buildGoals(townId) {
+    if (!townUsesTemplate(townId)) return townBuildCfg(townId).goals;
+    return buildTemplate().filter((g) => g && g.id && +g.target > 0).map((g) => ({ id: g.id, target: +g.target }));
+  }
 
   // Intercalar es POR CIUDAD. Las que aún no lo han tocado heredan el valor que
   // tenía la antigua opción general (así nadie pierde lo que ya tenía puesto).
@@ -2833,7 +2846,7 @@
     const maxOf = (id) => +UW.GameData?.buildings?.[id]?.max_level || 99;
     // Pasos de cada edificio, en el orden de sus objetivos (subir y/o derribar).
     const seq = new Map(), sim = {};
-    tcfg.goals.forEach((g, gi) => {
+    buildGoals(townId).forEach((g, gi) => {
       const info = bd.building_data?.[g.id];
       if (!info) return;
       if (!seq.has(g.id)) seq.set(g.id, []);
@@ -2889,7 +2902,7 @@
   // y desaparece de "Objetivos del bot" sin esperar a que termine de subir.
   function pruneCompletedGoals(townId) {
     const bd = buildDataFor(townId);
-    if (!bd) return;
+    if (!bd || townUsesTemplate(townId)) return; // la maqueta no se modifica (es de todas)
     const cfg = townBuildCfg(townId);
     const before = cfg.goals.length;
     cfg.goals = cfg.goals.filter((g) => {
@@ -2957,6 +2970,75 @@
     }
   }
 
+  // Maqueta global: un nivel por edificio (0 = no se toca), en orden (▲▼ = cuál va antes),
+  // y qué ciudades la usan.
+  function renderBuildTemplate() {
+    const cfg = state.construccion;
+    const tpl = buildTemplate();
+    const maxOf = (id) => +UW.GameData?.buildings?.[id]?.max_level || 99;
+    const towns = allTownIds().sort((a, b) => farmTownName(a).localeCompare(farmTownName(b), 'es'));
+    const using = towns.filter(townUsesTemplate);
+    const setLvl = (id, v) => {
+      v = clamp(Math.floor(+v || 0), 0, maxOf(id));
+      const i = tpl.findIndex((g) => g.id === id);
+      if (!v) { if (i >= 0) tpl.splice(i, 1); }
+      else if (i >= 0) tpl[i].target = v; else tpl.push({ id, target: v });
+      saveState(); renderBody();
+    };
+    const move = (i, d) => { const j = i + d; if (j < 0 || j >= tpl.length) return; [tpl[i], tpl[j]] = [tpl[j], tpl[i]]; saveState(); renderBody(); };
+    // Edificios de la maqueta, en su orden
+    const list = el('div', { class: 'nb-goals' });
+    tpl.forEach((g, i) => {
+      const done = using.filter((t) => { const bd = buildDataFor(t); return bd && queuedLevel(t, g.id, bd.building_data?.[g.id]) >= g.target; }).length;
+      list.appendChild(el('div', { class: 'nb-goal' }, [
+        buildingIcon(g.id),
+        el('div', { class: 'nb-goal-main' }, [el('div', { class: 'nb-goal-name' }, buildingName(g.id)), el('div', { class: 'nb-goal-sub' }, using.length ? `cumplen ${done}/${using.length} ciudades` : 'ninguna ciudad la usa aún')]),
+        el('div', { class: 'nb-stepper' }, [
+          el('span', { class: 'nb-mini', title: '−1', onclick: () => setLvl(g.id, g.target - 1) }, '−'),
+          el('span', { class: 'nb-goal-target' }, String(g.target)),
+          el('span', { class: 'nb-mini', title: '+1', onclick: () => setLvl(g.id, g.target + 1) }, '+')
+        ]),
+        el('div', { class: 'nb-goal-actions' }, [
+          el('span', { class: `nb-mini${i === 0 ? ' nb-mini-off' : ''}`, title: 'Antes', onclick: () => move(i, -1) }, '▲'),
+          el('span', { class: `nb-mini${i === tpl.length - 1 ? ' nb-mini-off' : ''}`, title: 'Después', onclick: () => move(i, 1) }, '▼'),
+          el('span', { class: 'nb-mini nb-mini-danger', title: 'Quitar de la maqueta', onclick: () => setLvl(g.id, 0) }, '✕')
+        ])
+      ]));
+    });
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+      el('div', { class: 'nb-card-title' }, `Maqueta global (${tpl.length} edificio${tpl.length === 1 ? '' : 's'})`),
+      el('p', { class: 'nb-placeholder' }, 'Los mismos niveles para todas las ciudades que la usen. Solo sube: lo que una ciudad ya tenga por encima no se toca. Orden de arriba abajo (con «Intercalar» en la ciudad, va un nivel de cada uno por turnos).'),
+      tpl.length ? list : el('p', { class: 'nb-placeholder' }, 'Vacía. Pon niveles abajo.')
+    ]));
+    // Añadir / cambiar nivel de cualquier edificio
+    const add = el('div', { class: 'nb-add-list' });
+    for (const id of buildingIds()) {
+      const cur = tpl.find((g) => g.id === id)?.target || 0;
+      const input = el('input', { class: 'nb-input nb-input-inline nb-lvl-input', type: 'number', min: '0', max: String(maxOf(id)), value: String(cur), title: '0 = no se toca' });
+      const ok = el('span', { class: 'nb-mini nb-mini-add', title: 'Guardar nivel' }, '✓');
+      const save = () => setLvl(id, input.value);
+      ok.addEventListener('click', save);
+      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') save(); });
+      add.appendChild(el('div', { class: 'nb-add-row' }, [buildingIcon(id), el('div', { class: 'nb-add-name' }, [buildingName(id), el('span', { class: 'nb-add-level' }, cur ? `en la maqueta: ${cur}` : `máx ${maxOf(id)}`)]), el('div', { class: 'nb-stepper' }, [input, ok])]));
+    }
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [el('div', { class: 'nb-card-title' }, 'Poner nivel · 0 = no se toca'), add]));
+    // Qué ciudades la usan
+    const rows = towns.map((id) => el('div', { class: 'nb-row' }, [
+      el('span', { class: 'nb-row-label' }, [farmTownName(id), buildEnabledFor(id) ? null : el('span', { class: 'nb-ov-dim', style: 'margin-left:8px' }, 'construcción desactivada')]),
+      switchEl(townUsesTemplate(id), (v) => { const t = townBuildCfg(id); if (v) t.mode = 'maqueta'; else delete t.mode; saveState(); renderBody(); buildLog(`${farmTownName(id)}: construye ${v ? 'la maqueta global' : 'sus objetivos propios'}.`); })
+    ]));
+    const all = (v) => { if (!confirm(v ? '¿Usar la maqueta en TODAS las ciudades? (sus objetivos propios se guardan)' : '¿Volver todas a sus objetivos propios?')) return; for (const id of towns) { const t = townBuildCfg(id); if (v) t.mode = 'maqueta'; else delete t.mode; } saveState(); renderBody(); buildLog(v ? 'Maqueta global en todas las ciudades.' : 'Todas las ciudades vuelven a sus objetivos propios.'); };
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+      el('div', { class: 'nb-card-head' }, [el('div', { class: 'nb-card-title' }, `Ciudades con la maqueta (${using.length}/${towns.length})`),
+        el('div', { class: 'nb-btn-group' }, [el('span', { class: 'nb-btn', onclick: () => all(true) }, 'Todas'), el('span', { class: 'nb-btn', onclick: () => all(false) }, 'Ninguna')])]),
+      el('p', { class: 'nb-placeholder' }, 'Desactivado (por defecto) = la ciudad construye sus objetivos propios, como siempre. Activado = construye la maqueta. La construcción tiene que estar activada en esa ciudad.'),
+      ...rows
+    ]));
+    const logBox = el('div', { class: 'nb-log' });
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [el('div', { class: 'nb-card-title' }, 'Actividad'), logBox]));
+    buildLogEl = logBox;
+    renderBuildLog();
+  }
   function renderConstruccionTab() {
     const cfg = state.construccion;
     const towns = allTownIds().sort((a, b) => farmTownName(a).localeCompare(farmTownName(b), 'es'));
@@ -2965,6 +3047,12 @@
     pruneCompletedGoals(townId); // por si se completó a mano o fuera del ciclo del bot
     const tcfg = townBuildCfg(townId);
     const bd = buildDataFor(townId);
+
+    // Subpestañas: la ciudad actual (como siempre) o la maqueta global (niveles para todas).
+    const view = cfg.view === 'maqueta' ? 'maqueta' : 'ciudad';
+    bodyEl.appendChild(el('div', { class: 'nb-seg nb-seg-main nb-seg-wrap' }, [['ciudad', 'Por ciudad'], ['maqueta', 'Maqueta global']].map(([v, l]) =>
+      el('span', { class: `nb-seg-btn${view === v ? ' active' : ''}`, onclick: () => { cfg.view = v; saveState(); renderBody(); } }, l))));
+    if (view === 'maqueta') { renderBuildTemplate(); return; }
 
     // Activar / desactivar: general (todas) + excepción para esta ciudad
     const sw = switchEl(!!cfg.enabled, (v) => { setModuleGlobal('construccion', v); renderBody(); buildLog(v ? 'Construcción activada en todas las ciudades.' : 'Construcción desactivada en todas las ciudades.'); }, false);
@@ -2984,7 +3072,12 @@
         tcfg.interleave = v; saveState(); renderBody();
         buildLog(`${farmTownName(townId)}: intercalar ${v ? 'activado' : 'desactivado'}.`);
       }),
-      optionRow('Orden estricto', 'Si el primero está bloqueado, no salta al siguiente', !!cfg.strictOrder, (v) => { cfg.strictOrder = v; saveState(); })
+      optionRow('Orden estricto', 'Si el primero está bloqueado, no salta al siguiente', !!cfg.strictOrder, (v) => { cfg.strictOrder = v; saveState(); }),
+      el('div', { class: 'nb-row nb-option' }, [el('div', { class: 'nb-option-text' }, [
+        el('span', { class: 'nb-option-label' }, `Qué construye ${farmTownName(townId)}`),
+        el('span', { class: 'nb-option-hint' }, townUsesTemplate(townId) ? 'Maqueta global: los niveles de la pestaña «Maqueta global» (sus objetivos propios se guardan por si vuelves)' : 'Sus objetivos propios (lista de abajo)')]),
+        el('div', { class: 'nb-seg nb-seg-sm' }, [['', 'Objetivos propios'], ['maqueta', 'Maqueta global']].map(([v, l]) =>
+          el('span', { class: `nb-seg-btn${(tcfg.mode || '') === v ? ' active' : ''}`, onclick: () => { if (v) tcfg.mode = v; else delete tcfg.mode; saveState(); renderBody(); buildLog(`${farmTownName(townId)}: construye ${v ? 'la maqueta global' : 'sus objetivos propios'}.`); } }, l)))])
     ]));
     const prioWarn = anyBuildEnabled() ? prioExcludedAlert('construccion') : null;
     if (prioWarn) bodyEl.appendChild(prioWarn);
@@ -3037,7 +3130,28 @@
         : el('p', { class: 'nb-placeholder' }, 'Nada en construcción.')
     ]));
 
-    if (!bd) {
+    if (bd && townUsesTemplate(townId)) {
+      // Estado de la maqueta en esta ciudad (lo que falta, en el orden de la maqueta).
+      const lvlOf = (id) => queuedLevel(townId, id, bd.building_data?.[id]);
+      const tg = buildGoals(townId);
+      const pend = tg.filter((g) => lvlOf(g.id) < g.target);
+      const box = el('div', { class: 'nb-goals' });
+      for (const g of pend) {
+        const info = bd.building_data?.[g.id];
+        const isNext = next.id === g.id;
+        box.appendChild(el('div', { class: `nb-goal${isNext ? ' nb-goal-next' : ''}` }, [
+          buildingIcon(g.id),
+          el('div', { class: 'nb-goal-main' }, [el('div', { class: 'nb-goal-name' }, buildingName(g.id)), el('div', { class: 'nb-goal-sub' }, isNext ? 'siguiente' : (buildBlockReason(townId, info) || 'en espera'))]),
+          el('span', { class: 'nb-goal-cur' }, `${lvlOf(g.id)} → ${g.target}`)
+        ]));
+      }
+      bodyEl.appendChild(el('div', { class: 'nb-card' }, [
+        el('div', { class: 'nb-card-head' }, [el('div', { class: 'nb-card-title' }, `Maqueta global en ${farmTownName(townId)} (${pend.length} edificio${pend.length === 1 ? '' : 's'} por subir)`),
+          el('span', { class: 'nb-btn', onclick: () => { cfg.view = 'maqueta'; saveState(); renderBody(); } }, 'Editar maqueta')]),
+        !tg.length ? el('p', { class: 'nb-placeholder' }, 'La maqueta está vacía: ponle niveles en «Maqueta global».')
+          : pend.length ? box : el('p', { class: 'nb-placeholder' }, 'Esta ciudad ya cumple la maqueta (lo que tenga por encima no se toca).')
+      ]));
+    } else if (!bd) {
       bodyEl.appendChild(el('div', { class: 'nb-card' }, [el('p', { class: 'nb-placeholder' }, 'Sin datos de edificios para esta ciudad todavía.')]));
     } else {
       const maxOf = (id) => +UW.GameData?.buildings?.[id]?.max_level || 99;
@@ -3617,7 +3731,7 @@
       const limit = buildQueueLimit();
       for (const townId of [+tid]) {
         if (!buildEnabledFor(townId)) continue;
-        const goals = townBuildCfg(townId).goals;
+        const goals = buildGoals(townId);
         if (!goals.length) continue;
         const bd = buildDataFor(townId);
         if (!bd || bd.is_building_order_queue_full) continue;
@@ -4149,7 +4263,7 @@
     for (const id of allTownIds()) {
       // Construcción con la cola llena: el siguiente nivel cuando termine la primera orden.
       try {
-        if (state.comercio.forBuild && inc('construccion') && buildEnabledFor(id) && townBuildCfg(id).goals.length) {
+        if (state.comercio.forBuild && inc('construccion') && buildEnabledFor(id) && buildGoals(id).length) {
           const orders = townBuildOrders(id);
           if (orders.length >= buildQueueLimit()) {
             const freeAt = Math.min(...orders.map((o) => +o.to_be_completed_at * 1000 || Infinity));
@@ -7086,12 +7200,24 @@
     // Selectores con imagen: héroes de la ciudad de origen y hechizos (uno solo).
     const chip = (active, icon, title, sub, onclick, disabled = false, tip = '') => el('div', { class: `nb-pick${active ? ' active' : ''}${disabled ? ' nb-pick-off' : ''}`, title: tip || null, onclick: disabled ? null : onclick }, [icon, el('div', { class: 'nb-pick-text' }, [el('b', {}, title), sub ? el('small', {}, sub) : null])]);
     const noneIcon = () => el('span', { class: 'nb-pick-none' }, '∅');
+    // Con «Tropas que aún no tengo» (ataque futuro) también se puede elegir un héroe que aún
+    // no está en la ciudad (viene de camino, está herido o en otra ciudad): tú te aseguras de
+    // que esté a la hora de salir. Si al salir no está, el ataque sale sin él (y se avisa).
     const heroesAll = heroesIn(f.source, true);
-    if (f.hero && !heroesAll.some((h) => h.id === f.hero && h.available)) f.hero = '';
+    if (future) {
+      const here = new Set(heroesAll.map((h) => h.id));
+      for (const m of heroModels()) {
+        const id = heroIdOf(m); if (!id || here.has(id)) continue;
+        const t = heroTownOf(m);
+        heroesAll.push({ id, town: t, level: +mval(m, 'level') || null, available: false, why: t ? `en ${farmTownName(t)}` : 'sin ciudad' });
+      }
+    }
+    const heroOk = (h) => h.available || future;
+    if (f.hero && !heroesAll.some((h) => h.id === f.hero && heroOk(h))) f.hero = '';
     const heroSel = el('div', { class: 'nb-picks' }, [
       chip(!f.hero, noneIcon(), 'Sin héroe', null, () => { f.hero = ''; renderBody(); }),
       ...heroesAll.map((h) => chip(f.hero === h.id, el('span', { class: `nb-icon nb-icon-25 hero_icon hero25x25 ${h.id}` }), heroName(h.id),
-        h.available ? (h.level ? `nivel ${h.level}` : null) : h.why, () => { f.hero = h.id; renderBody(); }, !h.available))
+        h.available ? (h.level ? `nivel ${h.level}` : null) : `${h.why}${future ? ' · tú te aseguras de que esté' : ''}`, () => { f.hero = h.id; renderBody(); }, !heroOk(h)))
     ]);
     if (!heroesAll.length) heroSel.appendChild(el('span', { class: 'nb-placeholder' }, 'Ningún héroe en esta ciudad.'));
     const spells = attackSpells(f.type);
@@ -7295,7 +7421,7 @@
     if (realBuildingLevel(townId, b) >= l) return 'ok';
     let q = 0; try { q = townBuildOrders(townId).filter((o) => o.building_type === b).reduce((n, o) => n + (o.tear_down ? -1 : 1), 0); } catch {}
     if (realBuildingLevel(townId, b) + q >= l) return 'building';
-    if ((townBuildCfg(townId).goals || []).some((g) => g.id === b && !g.demolish && +g.target >= l)) return 'bot';
+    if ((buildGoals(townId) || []).some((g) => g.id === b && !g.demolish && +g.target >= l)) return 'bot';
     return null;
   }
   // Edificios que le faltan a una tropa (nivel real): [{ b, l }]
@@ -7928,6 +8054,10 @@
     // ------------------------------------------------------------------ Construcción
     add('Construcción', 'construccion', [
       { t: 'Construcción', find: () => TQ.tab('construccion'), h: `<p>Le dices hasta qué nivel quieres cada edificio (en cada ciudad) y el bot lo va subiendo solo, sin cambiar de ciudad.</p>` },
+      { t: 'Por ciudad o maqueta global', before: () => { if (state.construccion.view === 'maqueta') { state.construccion.view = 'ciudad'; return true; } }, find: () => TQ.sel('.nb-seg-main', bodyEl) || TQ.tab('construccion'), h: `
+        <p>Arriba eliges la subpestaña: <b>Por ciudad</b> (los objetivos de la ciudad actual, como siempre) o <b>Maqueta global</b>: un nivel para cada edificio, el mismo en todas las ciudades que la usen.</p>
+        <p>En cada ciudad eliges <b>qué construye</b>: sus <b>objetivos propios</b> (por defecto) o la <b>maqueta global</b>. Sus objetivos propios se guardan por si vuelves.</p>
+        ${AUTO('La maqueta solo sube: si una ciudad ya tiene un edificio por encima, no se toca. Va en el orden de la maqueta (▲▼), o un nivel de cada uno por turnos si esa ciudad tiene «Intercalar». El comercio le manda recursos igual que con sus objetivos.')}` },
       { t: 'Activar: general y por ciudad', find: () => TQ.card(/^Construcción automática/), h: `
         <ul><li><b>Construcción automática</b>: enciende o apaga en <b>todas</b> las ciudades.</li>
         <li><b>Solo [ciudad]</b>: una <b>excepción</b> para la ciudad actual (apagada aunque el general esté encendido, o al revés). Arriba ves cuántas excepciones hay.</li></ul>
@@ -8111,7 +8241,7 @@
       { t: '4 · Tropas, héroe y hechizo', find: () => TQ.step(4), wide: true, h: `
         <ul><li>Escribe cuántas de cada una o pulsa <b>máx</b>. Atajos: Todas, Ofensivas, Solo tierra, Ninguna.</li>
         <li>Cada tropa muestra su tiempo de viaje; la que <b>marca</b> el tiempo se resalta. El viaje se calcula con el <b>mismo código que la ventana del juego</b>: si van barcos, mandan los barcos (la tierra va embarcada, aunque sea la misma isla); cada <b>Sirena</b> acelera los barcos un 2 %; y cuentan los bonus de la ciudad, hechizos y héroe.</li>
-        <li><b>Tropas que aún no tengo</b>: para un ataque futuro puedes pedir más de las que hay ahora (tú te aseguras de tenerlas a esa hora). Al salir se envía lo que haya.</li>
+        <li><b>Tropas que aún no tengo</b>: para un ataque futuro puedes pedir más de las que hay ahora (tú te aseguras de tenerlas a esa hora). Al salir se envía lo que haya. También puedes elegir un <b>héroe que aún no está</b> en la ciudad (de camino, herido o en otra): si al salir no está, el ataque sale sin él y te avisa.</li>
         <li><b>Héroe</b>: solo los de la ciudad de origen que estén disponibles.</li>
         <li><b>Hechizo</b>: uno, de los que se pueden lanzar sobre esa orden, con su coste de favor. Con <b>Ultra</b> o <b>Humano</b> no va con el envío: se lanza sobre la orden cuando ya acertó el rango y no se va a cancelar, así no se pierde favor en los intentos.</li></ul>` },
       { t: '5 · Hora', find: () => TQ.step(5), wide: true, h: `
@@ -8174,6 +8304,15 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.15.0', items: [
+      { t: 'Maqueta global de construcción', tab: 'construccion', before: () => { if (state.construccion.view !== 'maqueta') { state.construccion.view = 'maqueta'; return true; } }, find: () => TQ.card(/^Maqueta global/) || TQ.tab('construccion'), h: `
+        <p>Nueva subpestaña en <b>Construcción → Maqueta global</b>: pones el nivel que quieres de cada edificio (0 = no se toca) y en qué ciudades se usa. Esas ciudades construyen la maqueta en vez de sus objetivos propios (que se guardan).</p>
+        ${AUTO('Solo sube niveles: lo que una ciudad ya tenga por encima no se toca.')}` }
+    ] },
+    { v: '1.14.24', items: [
+      { t: 'Héroe que aún no está', tab: 'ataques', find: () => TQ.tab('ataques'), h: `
+        <p>Con <b>«Tropas que aún no tengo»</b> activado puedes elegir también un <b>héroe que todavía no está</b> en la ciudad de origen (viene de camino, está herido o en otra ciudad). Tú te aseguras de que esté a la hora de salir; si no está, el ataque sale sin él y se avisa.</p>` }
+    ] },
     { v: '1.14.23', items: [
       { t: 'Vista general de reclutamiento', tab: 'resumen', before: () => { if (state.resumenView !== 'reclutamiento') { state.resumenView = 'reclutamiento'; return true; } }, find: () => TQ.card(/^Ciudades reclutando/) || TQ.tab('resumen'), h: `
         <ul><li><b>✕</b> en cada tropa de las tarjetas para quitarla del bot.</li>
