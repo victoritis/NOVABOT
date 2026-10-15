@@ -1,11 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-<<<<<<< HEAD
 // @version      1.15.0
-=======
-// @version      1.14.24
->>>>>>> 9fb6360492c8ba7638d94ceb806b1e4c1f148251
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -58,11 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-<<<<<<< HEAD
   const VERSION = '1.15.0';
-=======
-  const VERSION = '1.14.24';
->>>>>>> 9fb6360492c8ba7638d94ceb806b1e4c1f148251
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -8312,14 +8304,11 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
-<<<<<<< HEAD
     { v: '1.15.0', items: [
       { t: 'Maqueta global de construcción', tab: 'construccion', before: () => { if (state.construccion.view !== 'maqueta') { state.construccion.view = 'maqueta'; return true; } }, find: () => TQ.card(/^Maqueta global/) || TQ.tab('construccion'), h: `
         <p>Nueva subpestaña en <b>Construcción → Maqueta global</b>: pones el nivel que quieres de cada edificio (0 = no se toca) y en qué ciudades se usa. Esas ciudades construyen la maqueta en vez de sus objetivos propios (que se guardan).</p>
         ${AUTO('Solo sube niveles: lo que una ciudad ya tenga por encima no se toca.')}` }
     ] },
-=======
->>>>>>> 9fb6360492c8ba7638d94ceb806b1e4c1f148251
     { v: '1.14.24', items: [
       { t: 'Héroe que aún no está', tab: 'ataques', find: () => TQ.tab('ataques'), h: `
         <p>Con <b>«Tropas que aún no tengo»</b> activado puedes elegir también un <b>héroe que todavía no está</b> en la ciudad de origen (viene de camino, está herido o en otra ciudad). Tú te aseguras de que esté a la hora de salir; si no está, el ataque sale sin él y se avisa.</p>` }
