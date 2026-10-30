@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.18.5
+// @version      1.18.6
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.18.5';
+  const VERSION = '1.18.6';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -167,6 +167,7 @@
         minutes: 10           // con cuánta antelación (min antes de que llegue el ataque)
       },
       defensa: {
+        auto: false,          // construir defensa automáticamente (cada 5 min, como el botón)
         autoSupport: false,   // mandar apoyos de las ciudades cercanas a las que van a recibir un ataque
         maxUnits: 2500,       // con esta defensa (tropas) en la ciudad atacada ya no se manda más
         keepPct: 50,          // cada ciudad que apoya se queda al menos este % de su defensa
@@ -5955,7 +5956,8 @@
     // Población que ya van a usar las tropas pendientes del bot.
     let committed = 0;
     for (const g of cfg.goals) committed += Math.max(0, g.target - (+have[g.id] || 0) - (+queued[g.id] || 0)) * P(g.id);
-    let free = Math.max(0, freePopulation(townId) - committed);
+    const gameFree = freePopulation(townId); // la población libre que enseña el juego (ya descuenta lo que está en cola)
+    let free = Math.max(0, gameFree - committed);
     const boat = defenseUnitOk(townId, DEF_BOAT), arch = defenseUnitOk(townId, DEF_ARCHER), infOk = defenseUnitOk(townId, inf);
     const cap = (+UW.GameData?.units?.[DEF_BOAT]?.capacity || 26) + (isResearched(townId, 'berth') ? 6 : 0);
     // 1º BARCOS para la defensa de tierra que YA tiene (en casa, fuera, en cola o pedida al
@@ -5976,7 +5978,7 @@
     const add = {};
     if (n) { if (a) add[DEF_ARCHER] = n * a; if (b) add[inf] = n * b; }
     if (boat && (n + boatsFirst)) add[DEF_BOAT] = n + boatsFirst;
-    return { townId, free: free + boatsFirst * P(DEF_BOAT), n, a, b, boat, inf, cap, add, boatsFirst, groundDefPop, todo: n > 0 || boatsFirst > 0,
+    return { townId, gameFree, committed, free: free + boatsFirst * P(DEF_BOAT), groupPop, n, a, b, boat, inf, cap, add, boatsFirst, groundDefPop, todo: n > 0 || boatsFirst > 0,
       why: !(a || b) ? 'sin arqueros ni infantería investigados' : !n ? 'sin población libre para una barcada' : '' };
   }
   function wallMaxLevel() { return +UW.GameData?.buildings?.wall?.max_level || 25; }
@@ -5985,15 +5987,15 @@
     for (const id of allTownIds()) {
       if (realBuildingLevel(id, 'wall') >= wallMaxLevel()) continue;
       const t = townBuildCfg(id);
-      if (!t.wallMax) { t.wallMax = true; out.push(id); }
-      if (!buildEnabledFor(id)) t.enabled = true; // para que se construya (sus otros pedidos van antes)
+      if (!t.wallMax) { t.wallMax = true; out.push(id); if (!buildEnabledFor(id)) t.enabled = true; } // (para que se construya; sus otros pedidos van antes)
     }
     if (out.length) buildLog(`Muro al máximo (detrás de lo que ya tengan pedido) en: ${out.map(farmTownName).join(', ')}.`, 'ok');
     return out;
   }
-  function applyDefense() {
+  function applyDefense(auto = false) {
     if (state.defensa?.wall !== false) applyDefenseWalls();
-    const plans = allTownIds().map(defensePlan).filter((p) => p.todo);
+    // En automático no se toca una ciudad en la que TÚ apagaste el reclutamiento.
+    const plans = allTownIds().filter((id) => !auto || recruitOnFor(id)).map(defensePlan).filter((p) => p.todo);
     for (const p of plans) {
       const t = townRecruitCfg(p.townId);
       const have = townUnitsHave(p.townId), queued = queuedUnits(p.townId);
@@ -6013,8 +6015,21 @@
       if (state.reclutamiento.excluded?.[p.townId]) { state.reclutamiento.excluded = { ...state.reclutamiento.excluded }; delete state.reclutamiento.excluded[p.townId]; }
       recruitLog(`${farmTownName(p.townId)}: defensa · ${p.boatsFirst ? `${p.boatsFirst} barco${p.boatsFirst > 1 ? 's' : ''} primero para la defensa que ya tiene · ` : ''}${p.n} barcada${p.n === 1 ? '' : 's'}: ${Object.entries(p.add).map(([u, k]) => `${k} ${unitName(u)}`).join(' + ')}.`, 'ok');
     }
-    recruitTurnMemo.at = 0; saveState(); renderBody();
+    recruitTurnMemo.at = 0; saveState();
+    if (auto) { renderIfIdle('defensa'); renderIfIdle('reclutamiento'); } else renderBody();
     return plans;
+  }
+  // DEFENSA AUTOMÁTICA (continua): cada 5 min hace lo mismo que el botón en todas las
+  // ciudades: en cuanto en una queda población libre para una barcada (o tiene defensa sin
+  // barcos), se la pide. Es acumulativo: lo ya pedido se descuenta, nunca se duplica.
+  const defAutoRt = { timer: null, at: 0 };
+  function startDefenseAuto() {
+    if (defAutoRt.timer) return;
+    defAutoRt.timer = setInterval(() => {
+      if (!isRunner() || !state.defensa?.auto) return;
+      if (!overviewReady()) return; // (sin las colas de todas las ciudades se contaría mal)
+      try { defAutoRt.at = Date.now(); applyDefense(true); } catch (e) { recruitLog(`Defensa automática: ${e.message}`, 'error'); }
+    }, 5 * 60000);
   }
   function renderDefenseCard() {
     const rc = state.reclutamiento;
@@ -6032,19 +6047,25 @@
       if (!confirm(`¿Pedir defensa?\n${ok.length ? `Tropas en ${ok.length} ciudad(es): ${Object.entries(tot).map(([u, k]) => `${k} ${unitName(u)}`).join(' · ')}` : 'Sin tropas (no hay población libre)'}${walls.length ? `\nMuro al máximo en ${walls.length} ciudad(es)` : ''}`)) return;
       applyDefense();
     } }, `Construir defensa${ok.length ? ` en ${ok.length} ciudad${ok.length === 1 ? '' : 'es'}` : ''}${walls.length ? ` · muro en ${walls.length}` : ''}`);
+    const autoRow = el('div', { class: 'nb-row' }, [el('div', { class: 'nb-option-text' }, [el('span', { class: 'nb-option-label' }, [el('b', {}, 'Automática')]),
+      el('span', { class: 'nb-option-hint' }, 'Cada 5 min, en todas las ciudades con el reclutamiento activado: en cuanto hay población libre para una barcada (o defensa sin barcos), se pide sola. Lo ya pedido se descuenta, nunca se duplica')]),
+      switchEl(!!state.defensa?.auto, (v) => { state.defensa.auto = v; saveState(); renderBody(); recruitLog(`Defensa automática ${v ? 'activada' : 'desactivada'}.`); if (v) { try { applyDefense(true); } catch {} } }, false)]);
     const wallRow = optionRow('Subir también el muro al máximo', 'En todas las ciudades donde no está al máximo. Va SIEMPRE detrás de lo que esa ciudad ya tenga pedido en Construcción (o de su maqueta)', wallOn, (v) => { state.defensa.wall = v; saveState(); renderBody(); });
     const list = el('div', { class: 'nb-goals' }, plans.map((p) => el('div', { class: `nb-goal${p.todo ? '' : ' nb-goal-done'}` }, [
       el('div', { class: 'nb-goal-main' }, [el('div', { class: 'nb-goal-name' }, farmTownName(p.townId)),
-        el('div', { class: 'nb-goal-sub' }, p.todo ? `${p.free} de población libre → ${p.boatsFirst ? `1º ${p.boatsFirst} barco${p.boatsFirst > 1 ? 's' : ''} para su defensa de tierra (${p.groundDefPop} de población) · ` : ''}${p.n} barcada${p.n === 1 ? '' : 's'} · total ${Object.entries(p.add).map(([u, k]) => `${k} ${unitName(u)}`).join(' + ')}${p.boat ? '' : ' (sin barco: no investigado o sin Puerto)'}` : `${p.free} libre · ${p.why}`)])
+        el('div', { class: 'nb-goal-sub' }, `Población libre en el juego ${p.gameFree}${p.committed ? ` − ${p.committed} para tropas que ya tiene pedidas al bot (aún sin reclutar)` : ''} = ${Math.max(0, p.gameFree - p.committed)} para defensa nueva${p.groupPop ? ` (una barcada usa ${p.groupPop})` : ''}`),
+        el('div', { class: 'nb-goal-sub' }, p.todo ? `→ ${p.boatsFirst ? `1º ${p.boatsFirst} barco${p.boatsFirst > 1 ? 's' : ''} para su defensa de tierra (${p.groundDefPop} de población) · ` : ''}${p.n} barcada${p.n === 1 ? '' : 's'} · total ${Object.entries(p.add).map(([u, k]) => `${k} ${unitName(u)}`).join(' + ')}${p.boat ? '' : ' (sin barco: no investigado o sin Puerto)'}` : `→ ${p.why}`)])
     ])));
     return el('div', { class: 'nb-card', 'data-nb-card': 'defensa' }, [
       el('div', { class: 'nb-card-title' }, 'Defensa automática · todas las ciudades'),
+      autoRow,
       el('div', { class: 'nb-row' }, [el('div', { class: 'nb-option-text' }, [el('span', { class: 'nb-option-label' }, 'Infantería'), el('span', { class: 'nb-option-hint' }, 'Por barco: mitad arqueros y mitad esta tropa (lo que cabe en el barco)')]), sel]),
       wallRow,
       el('p', { class: 'nb-placeholder' }, 'Primero, si una ciudad ya tiene defensa de tierra (espadachines, arqueros, hoplitas, carros, míticas defensivas…) sin barcos suficientes para llevarla, se piden esos barcos (1 por cada 32 de población, con La llamada del mar si hay favor). Después, con un clic se piden, en cada ciudad con población libre, todas las barcadas que caben (1 barco de transporte + su carga, mitad arqueros y mitad infantería). Sin arqueros → todo infantería; sin barco → sin barco. Se suman a sus tropas pedidas y el bot las recluta en los lotes más grandes posibles, con los hechizos de reclutamiento siempre que haya favor.'),
       ok.length ? el('div', { class: 'nb-alert nb-alert-info' }, ['En total: ', el('b', {}, Object.entries(tot).map(([u, k]) => `${k.toLocaleString('es-ES')} ${unitName(u)}`).join(' · '))]) : null,
       !state.comercio?.enabled || !state.comercio?.forRecruit ? el('div', { class: 'nb-alert nb-alert-warn' }, 'El comercio para reclutamiento está desactivado: cada ciudad solo usará sus propios recursos.') : null,
       el('div', { class: 'nb-btn-group nb-mt' }, [btn]),
+      el('p', { class: 'nb-placeholder' }, 'La población libre del juego ya descuenta las tropas en cola. A eso se le resta la de las tropas que la ciudad ya tiene pedidas al bot y aún no se han reclutado (también se van a comer esa población): lo que queda es lo que se puede usar para defensa nueva.'),
       el('details', { class: 'nb-mt' }, [el('summary', { style: 'cursor:pointer' }, 'Ver ciudad a ciudad'), list])
     ]);
   }
@@ -8752,6 +8773,7 @@
         ${AUTO('Cada 30 s mira los ataques que llegan (no apoyos ni espías) en la vista de órdenes del juego. Si ya hay milicia, no la pide otra vez; si el juego da error, lo avisa en la actividad y reintenta en 5 min. Mientras la milicia está, la ciudad produce menos (regla del juego).')}` },
       { t: 'Defensa automática', find: () => TQ.card(/^Defensa automática/), h: `
         <p>Un botón para pedir defensa en <b>todas</b> las ciudades con población libre: por cada barco de transporte, su carga (32 con Literas) mitad <b>arqueros</b> y mitad <b>infantería</b> (eliges espadachín u hoplita).</p>
+        <p><b>Automática</b> (interruptor): lo mismo que el botón, solo, cada 5 min, en las ciudades con el reclutamiento activado.</p>
         <p><b>Barcos primero</b>: si la ciudad ya tiene defensa de tierra sin barcos suficientes (1 por cada 32 de población), se piden antes esos barcos, los primeros de su lista y con La llamada del mar si hay favor.</p>
         ${AUTO('Descuenta la población que ya usan las tropas pedidas. Sin arqueros → todo infantería; sin barco → sin barco. Las añade a las tropas pedidas de cada ciudad (la activa en el reclutamiento si hacía falta) y el bot las recluta como siempre: lotes máximos, comercio y hechizos de reclutamiento cuando haya favor (los que no tuviera, en opcional). Puedes volver a pulsarlo más adelante con la población que quede libre.')}
         <p>Con <b>«Subir también el muro al máximo»</b> (activado), el mismo botón pone el muro al máximo en todas las ciudades donde no lo está, siempre <b>detrás</b> de lo que esa ciudad ya tenga pedido en Construcción (o de su maqueta), y activa la construcción en ellas si estaba apagada.</p>` }
@@ -8853,6 +8875,11 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.18.6', items: [
+      { t: 'Defensa automática de verdad', tab: 'defensa', find: () => TQ.card(/^Defensa automática/) || TQ.tab('defensa'), h: `
+        <p>Nuevo interruptor <b>Automática</b>: cada 5 min pide sola la defensa (barcos primero, barcadas y muro) en todas las ciudades con el reclutamiento activado, en cuanto hay población. El botón sigue para aplicarlo al momento.</p>
+        <p>En «Ver ciudad a ciudad» ahora se ve la cuenta de la población: la libre del juego, lo que ya se van a comer las tropas pedidas al bot y lo que queda para defensa nueva (antes solo salía lo último y parecía que contaba mal).</p>` }
+    ] },
     { v: '1.18.5', items: [
       { t: 'Menos peticiones', find: () => TQ.tab('inicio'), h: `
         <p>Medido en tu partida: en 40 s salían 190 peticiones (hasta 15 en un segundo), casi la mitad del <b>apoyo automático</b> leyendo una y otra vez las ciudades cercanas, y muchas relecturas de comercio tras cada envío. Ahora el apoyo lee como mucho 12 ciudades por vuelta (y las recuerda 2 min), no pregunta a las que no llegarían a tiempo, las relecturas tras cada envío se juntan en una sola cada 10 s y los hechizos se leen de la memoria del juego.</p>` }
@@ -9817,6 +9844,7 @@
     startCaveEngine();
     startMilitiaEngine();
     startSupportEngine();
+    startDefenseAuto();
     startRecruitEngine();
     startAttackEngine();
     startFestivalEngine();
