@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.18.4
+// @version      1.18.5
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.18.4';
+  const VERSION = '1.18.5';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -1351,7 +1351,8 @@
   const reqQueue = { list: [], busy: false, lastAt: 0, sent: 0 };
   const REQ_GAP = 350;          // ms mínimos entre una petición y la siguiente (+ hasta 250 al azar)
   const isUrgentReq = (controller, action, json) =>
-    (controller === 'town_info' && (action === 'send_units' || action === 'attack')) ||
+    (controller === 'town_info' && action === 'send_units') ||
+    (controller === 'town_info' && action === 'attack' && !!json?.__urgent) || // solo el del ataque que va a salir
     (controller === 'command_info' && action === 'cancel_command') ||
     (controller === 'town_overviews' && action === 'command_overview') ||
     (controller === 'frontend_bridge' && action === 'execute' && json?.model_url === 'Commands');
@@ -1368,7 +1369,9 @@
       const prev = UW.Game?.townId;
       if (townId) UW.Game.townId = +townId;
       try {
-        fn.call(UW.gpAjax, controller, action, townId ? { ...json, town_id: +townId } : json, false, {
+        const body = { ...(json || {}) }; delete body.__urgent;
+        if (townId) body.town_id = +townId;
+        fn.call(UW.gpAjax, controller, action, body, false, {
           success: (...a) => { if (done) return; done = true; clearTimeout(timer); resolve(a[1] ?? a[0] ?? null); },
           error: (...a) => { if (done) return; done = true; clearTimeout(timer); reject(new Error(gameErrorText(a))); }
         });
@@ -3614,6 +3617,13 @@
 
   // Si ya hay una lectura en marcha, se devuelve esa (quien necesite datos frescos puede
   // esperarla con await; antes volvía al instante sin esperar).
+  // Tras un envío o una orden: releer las vistas UNA vez, como mucho cada 10 s (antes cada
+  // envío pedía su propia lectura y se juntaban muchas).
+  function refreshOverviewsSoon() {
+    if (overview.soonTimer) return;
+    const wait = Math.max(3000, (overview.soonAt || 0) + 10000 - Date.now());
+    overview.soonTimer = setTimeout(() => { overview.soonTimer = null; overview.soonAt = Date.now(); refreshOverviews(); }, wait);
+  }
   function refreshOverviews() {
     if (overview.inflight) return overview.inflight;
     overview.inflight = refreshOverviewsImpl().finally(() => { overview.inflight = null; });
@@ -4573,7 +4583,7 @@
       }
       await sleep(700 + Math.random() * 900);
     }
-    if (sent) { setTimeout(refreshOverviews, 3000); renderIfIdle('comercio'); }
+    if (sent) { refreshOverviewsSoon(); renderIfIdle('comercio'); }
   }
 
   function renderBalanceCard() {
@@ -4650,12 +4660,12 @@
         tradeRuntime.pairCooldown.set(`${p.from}>${p.to}`, Date.now() + 20000);
         tradeRuntime.lastSendAt = Date.now(); tradeRuntime.recentFrom.set(p.from, Date.now());
         tradeLog(`${farmTownName(p.from)} → ${farmTownName(p.to)}: ${fmtRes(p.ship)} · ${Math.round(p.eta / 60)} min · para ${p.label}${spare ? ' (comerciantes libres: el módulo con el turno no tenía nada que enviar)' : ''}`, 'ok');
-        setTimeout(refreshOverviews, 3000);
+        refreshOverviewsSoon();
       } catch (e) {
         tradeRuntime.pairCooldown.set(`${p.from}>${p.to}`, Date.now() + 5 * 60000);
         tradeLog(`${farmTownName(p.from)} → ${farmTownName(p.to)}: ${e.message}`, 'error');
         // Si fue un corte/tiempo agotado el envío pudo salir igual: releer lo que va de camino.
-        setTimeout(refreshOverviews, 3000);
+        refreshOverviewsSoon();
       }
       await sleep(700 + Math.random() * 900);
     }
@@ -5408,7 +5418,7 @@
     const want = RECRUIT_SPELLS.filter((x) => kinds.includes(x.kind) && cfg[x.id] && !spellActive(townId, x.id));
     if (!want.length) return { cast: [], wait: null };
     // Datos frescos (no lanzar uno que ya está activo).
-    if (Date.now() - spellInfo.at > 15000) await refreshCastedPowers();
+    if (Date.now() - spellInfo.at > 60000 && !clientSpellFragment(townId)) await refreshCastedPowers(); // (la memoria del juego ya los tiene al día)
     const cast = [];
     for (const sd of want) {
       if (spellActive(townId, sd.id)) continue;
@@ -5458,14 +5468,14 @@
         spellInfo.active.get(+townId)[sd.id] = Date.now() + (+p.lifetime || 3600) * 1000;
         recruitLog(`${farmTownName(townId)}: hechizo ${p.name} lanzado (${cost} favor).`, 'ok');
         recruitTurnMemo.at = 0; // ya no reserva ese favor: se reparte de nuevo
-        setTimeout(refreshCastedPowers, 3000);
+        setTimeout(() => kickSpellRefresh(20000), 3000);
       } catch (e) {
         // Si el juego dice que ya está activo, se da por activo (no bloquea el reclutamiento).
         if (/activ|ya est|already|en curso|lanzad/i.test(e.message)) {
           if (!spellInfo.active.has(+townId)) spellInfo.active.set(+townId, {});
           spellInfo.active.get(+townId)[sd.id] = Date.now() + 10 * 60000;
           recruitLog(`${farmTownName(townId)}: ${p.name} ya estaba activo.`, 'info');
-          setTimeout(refreshCastedPowers, 2000);
+          setTimeout(() => kickSpellRefresh(20000), 2000);
           continue;
         }
         recruitRuntime.cooldown.set(key, Date.now() + 5 * 60000);
@@ -5636,7 +5646,7 @@
         try {
           await gpPostAs(townId, isNavalUnit(unitId) ? 'building_docks' : 'building_barracks', 'build', { unit_id: unitId, amount, nl_init: true });
           recruitLog(`${farmTownName(townId)}: ${amount} ${unitName(unitId)} reclutados.`, 'ok');
-          setTimeout(refreshOverviews, 3000);
+          refreshOverviewsSoon();
         } catch (e) {
           recruitLog(`${farmTownName(townId)}: ${unitName(unitId)} — ${e.message}`, 'error');
           recruitRuntime.cooldown.set(townId, Date.now() + 5 * 60000);
@@ -6319,11 +6329,12 @@
   const isOffensive = (id) => { const u = U(id); return +u.attack > Math.max(+u.def_hack || 0, +u.def_pierce || 0, +u.def_distance || 0) && !isTransport(id) && id !== 'colonize_ship'; };
 
   // ---------- información del ataque (servidor) ----------
+  // maxAgeMs 0 = lo pide el ataque que va a salir: sin esperar la cola de peticiones.
   async function attackInfo(sourceId, targetId, maxAgeMs = 20000) {
     const key = `${sourceId}>${targetId}`;
     const c = atk.infoCache.get(key);
     if (c && Date.now() - c.at < maxAgeMs) return c.info;
-    const r = await gpGetAs(sourceId, 'town_info', 'attack', { id: +targetId, nl_init: true });
+    const r = await gpGetAs(sourceId, 'town_info', 'attack', { id: +targetId, nl_init: true, ...(maxAgeMs === 0 ? { __urgent: true } : {}) });
     let x = r?.json !== undefined ? r.json : r;
     if (typeof x === 'string') { try { x = JSON.parse(x); } catch {} }
     if (!x || typeof x !== 'object' || !x.units) throw new Error(gameErrorText([r]) || 'El juego no devolvió datos del ataque.');
@@ -7443,7 +7454,7 @@
     const targets = [...hostile].map(([id, h]) => ({ id, ...h })).sort((a, b) => (b.revolt - a.revolt) || (a.arr - b.arr));
     const margin = clamp(+cfg.marginSec || 60, 0, 600) * 1000, cap = Math.max(100, +cfg.maxUnits || 2500);
     const donorUsed = new Map(); // donante -> { unidad: n } ya mandado en esta vuelta
-    let sends = 0;
+    let sends = 0, infoReads = 0;
     for (const t of targets) {
       const inflight = ownSup.filter((c) => +c.destination_town_id === t.id && +c.arrival_at * 1000 < t.arr)
         .reduce((n, c) => n + Object.entries(c).reduce((m, [k, v]) => m + (isDefUnit(k) ? +v || 0 : 0), 0), 0)
@@ -7457,7 +7468,12 @@
         .sort((a, b) => townDist(a, t.id) - townDist(b, t.id)).slice(0, 10);
       for (const d of donors) {
         if (t.need <= 0 || sends >= 6) break;
-        let info = null; try { info = await attackInfo(d, t.id, 20000); } catch { continue; }
+        if (infoReads >= 12) break; // como mucho 12 lecturas por vuelta (el resto, en la siguiente)
+        // Estimación rápida sin pedir nada: si ni el más rápido llegaría, no se pregunta.
+        if (travelSec(d, t.id) * 1000 * 0.35 > t.arr - srvNow() - margin) continue;
+        let info = null; const cached = atk.infoCache.get(`${d}>${t.id}`);
+        if (!cached || Date.now() - cached.at > 120000) infoReads++;
+        try { info = await attackInfo(d, t.id, 120000); } catch { continue; }
         const used = donorUsed.get(d) || {};
         const left = t.arr - srvNow() - margin;
         const sel = {};
@@ -8837,6 +8853,10 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.18.5', items: [
+      { t: 'Menos peticiones', find: () => TQ.tab('inicio'), h: `
+        <p>Medido en tu partida: en 40 s salían 190 peticiones (hasta 15 en un segundo), casi la mitad del <b>apoyo automático</b> leyendo una y otra vez las ciudades cercanas, y muchas relecturas de comercio tras cada envío. Ahora el apoyo lee como mucho 12 ciudades por vuelta (y las recuerda 2 min), no pregunta a las que no llegarían a tiempo, las relecturas tras cada envío se juntan en una sola cada 10 s y los hechizos se leen de la memoria del juego.</p>` }
+    ] },
     { v: '1.18.4', items: [
       { t: 'Peticiones en orden', find: () => TQ.tab('inicio'), h: `
         <p>Arreglado: con muchas ciudades el bot podía mandar decenas de peticiones al juego en el mismo segundo y el juego se colgaba. Ahora van <b>una a una</b>, con una pausa corta entre ellas: algunas cosas tardan un poco más, pero el juego aguanta.</p>
