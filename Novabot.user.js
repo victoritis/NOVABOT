@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.15.0
+// @version      1.18.2
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.15.0';
+  const VERSION = '1.18.2';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -75,7 +75,8 @@
     { id: 'comercio',    label: 'Comercio',       icon: 'trade',  disabled: false },
     { id: 'festivales',  label: 'Festivales',     icon: 'star',   disabled: false },
     { id: 'cueva',       label: 'Cueva',          icon: 'cave',   disabled: false },
-    { id: 'ataques',     label: 'Ataques',        icon: 'sword',  disabled: false }
+    { id: 'ataques',     label: 'Ataques',        icon: 'sword',  disabled: false },
+    { id: 'defensa',     label: 'Defensa',        icon: 'shield', disabled: false }
   ];
 
   /* ---------------------------------------------------------------------------------
@@ -160,6 +161,21 @@
         strictOrder: false,   // true = no salta a otro edificio si el primero está bloqueado
         interleave: true,     // valor por defecto para las ciudades que aún no lo han elegido (ver townInterleave)
         towns: {}             // townId -> { goals: [{id, target}], lastId, interleave } (orden = prioridad; un edificio puede repetirse)
+      },
+      milicia: {
+        enabled: false,       // llamar a la milicia de la Granja cuando una ciudad va a recibir un ataque
+        minutes: 10           // con cuánta antelación (min antes de que llegue el ataque)
+      },
+      defensa: {
+        autoSupport: false,   // mandar apoyos de las ciudades cercanas a las que van a recibir un ataque
+        maxUnits: 2500,       // con esta defensa (tropas) en la ciudad atacada ya no se manda más
+        keepPct: 50,          // cada ciudad que apoya se queda al menos este % de su defensa
+        keepRevoltPct: 25,    // ... y este % si es para parar una REVUELTA (prioridad)
+        marginSec: 60,        // los apoyos deben llegar al menos esto antes que el ataque
+        wall: true,           // el botón de defensa también sube el muro al máximo
+        noSend: {},           // townId -> true: ciudad con defensa estática (recibe, pero no manda)
+        mine: [],             // apoyos que mandó el BOT (solo esos se devuelven al acabar el peligro)
+        returnGraceMin: 3     // minutos después del último ataque (o del fin de la revuelta) para devolverlos
       },
       festivales: {
         enabled: true,
@@ -246,7 +262,7 @@
       if (raw && typeof raw === 'object') {
         const def = defaultState();
         const out = { ...def, ...raw };
-        for (const k of ['granjas', 'aldeas', 'aldeasNivel', 'equilibrio', 'cueva', 'construccion', 'comercio', 'reclutamiento', 'ataques', 'festivales', 'prioridad', 'investigacion']) out[k] = { ...def[k], ...(raw[k] || {}) };
+        for (const k of ['granjas', 'aldeas', 'aldeasNivel', 'equilibrio', 'cueva', 'construccion', 'comercio', 'reclutamiento', 'ataques', 'festivales', 'prioridad', 'investigacion', 'milicia', 'defensa']) out[k] = { ...def[k], ...(raw[k] || {}) };
         // Prioridad guardada con el formato antiguo (preset): que prioMode() la convierta.
         if (raw.prioridad && !raw.prioridad.mode) delete out.prioridad.mode;
         return out;
@@ -394,7 +410,7 @@
   const fmtResEl = (r) => el('span', { class: 'nb-res-list' }, RES.filter((k) => (+r?.[k] || 0) > 0)
     .map((k) => el('span', { class: 'nb-res' }, [resIcon(k), String(Math.round(r[k]))])));
   // Icono de cada módulo (edificio del juego que lo representa).
-  const MODULE_ICON = { granjas: 'farm', construccion: 'main', investigacion: 'academy', reclutamiento: 'barracks', comercio: 'market', festivales: 'place', cueva: 'hide', ataques: 'wall', inicio: 'main', prioridad: 'storage' };
+  const MODULE_ICON = { granjas: 'farm', construccion: 'main', investigacion: 'academy', reclutamiento: 'barracks', comercio: 'market', festivales: 'place', cueva: 'hide', ataques: 'wall', defensa: 'wall', inicio: 'main', prioridad: 'storage' };
   // Títulos de tarjeta: icono pequeño del edificio correspondiente (adorno).
   const TITLE_ICON = [
     [/prioridad/i, 'storage'], [/en camino|necesidades/i, 'market'], [/lote|tropa/i, 'barracks'],
@@ -479,6 +495,8 @@
       renderInvestigacionTab();
     } else if (state.activeTab === 'ataques') {
       renderAtaquesTab();
+    } else if (state.activeTab === 'defensa') {
+      renderDefensaTab();
     } else if (state.activeTab === 'reclutamiento') {
       renderReclutamientoTab();
     } else if (state.activeTab === 'comercio') {
@@ -2771,8 +2789,12 @@
   const buildTemplate = () => (Array.isArray(state.construccion.template) ? state.construccion.template : (state.construccion.template = []));
   const townUsesTemplate = (townId) => state.construccion.towns[townId]?.mode === 'maqueta';
   function buildGoals(townId) {
-    if (!townUsesTemplate(townId)) return townBuildCfg(townId).goals;
-    return buildTemplate().filter((g) => g && g.id && +g.target > 0).map((g) => ({ id: g.id, target: +g.target }));
+    const base = !townUsesTemplate(townId) ? townBuildCfg(townId).goals
+      : buildTemplate().filter((g) => g && g.id && +g.target > 0).map((g) => ({ id: g.id, target: +g.target }));
+    // Muro al máximo (botón de Defensa): SIEMPRE detrás de lo que ya tenga pedido la ciudad.
+    if (!townBuildCfg(townId).wallMax) return base;
+    const max = +UW.GameData?.buildings?.wall?.max_level || 25;
+    return [...base, { id: 'wall', target: max, auto: 'wall' }];
   }
 
   // Intercalar es POR CIUDAD. Las que aún no lo han tocado heredan el valor que
@@ -2902,6 +2924,7 @@
   // y desaparece de "Objetivos del bot" sin esperar a que termine de subir.
   function pruneCompletedGoals(townId) {
     const bd = buildDataFor(townId);
+    if (bd && townBuildCfg(townId).wallMax && queuedLevel(townId, 'wall', bd.building_data?.wall) >= (+UW.GameData?.buildings?.wall?.max_level || 25)) { delete townBuildCfg(townId).wallMax; saveState(); }
     if (!bd || townUsesTemplate(townId)) return; // la maqueta no se modifica (es de todas)
     const cfg = townBuildCfg(townId);
     const before = cfg.goals.length;
@@ -5861,6 +5884,124 @@
     renderRecruitLog();
   }
 
+  /* DEFENSA AUTOMÁTICA (un botón): en TODAS las ciudades con población libre se pide toda
+     la defensa que cabe, por "barcadas": 1 barco de transporte + lo que lleva (con Literas
+     32 de población) mitad arqueros y mitad infantería (espadachín u hoplita, a elegir).
+       · Sin arqueros (sin investigar) → toda la barcada de infantería (y al revés).
+       · Sin barco (sin investigar o sin Puerto) → las mismas tropas, sin barco.
+     La población que ya tienen comprometida las tropas pedidas al bot se descuenta.
+     No recluta por su cuenta: añade esas tropas a los objetivos de cada ciudad y el
+     reclutamiento del bot hace el resto (lotes máximos, comercio, colas). Los hechizos de
+     reclutamiento que esa ciudad no tenga configurados se ponen en "opcional": se lanzan
+     siempre que haya favor y, si no, se recluta igual. */
+  const DEF_BOAT = 'big_transporter', DEF_ARCHER = 'archer';
+  function defenseUnitOk(townId, u) {
+    if (!UW.GameData?.units?.[u]) return false;
+    if (UW.GameData.units[u].is_naval && realBuildingLevel(townId, 'docks') < 1) return false; // barcos: hace falta Puerto
+    return unitResearched(townId, u) && !unitMissingBuildings(townId, u).length;
+  }
+  function defensePlan(townId) {
+    const inf = state.reclutamiento.defInf === 'hoplite' ? 'hoplite' : 'sword';
+    const P = (u) => +UW.GameData?.units?.[u]?.population || 1;
+    const cfg = townRecruitCfg(townId);
+    const have = townUnitsHave(townId), queued = queuedUnits(townId);
+    // Población que ya van a usar las tropas pendientes del bot.
+    let committed = 0;
+    for (const g of cfg.goals) committed += Math.max(0, g.target - (+have[g.id] || 0) - (+queued[g.id] || 0)) * P(g.id);
+    let free = Math.max(0, freePopulation(townId) - committed);
+    const boat = defenseUnitOk(townId, DEF_BOAT), arch = defenseUnitOk(townId, DEF_ARCHER), infOk = defenseUnitOk(townId, inf);
+    const cap = (+UW.GameData?.units?.[DEF_BOAT]?.capacity || 26) + (isResearched(townId, 'berth') ? 6 : 0);
+    // 1º BARCOS para la defensa de tierra que YA tiene (en casa, fuera, en cola o pedida al
+    // bot: espadachines, arqueros, hoplitas, carros, míticas defensivas…): 1 barco por cada
+    // «cap» de población. Van antes que nada (y con La llamada del mar si hay favor).
+    let boatsFirst = 0, groundDefPop = 0;
+    if (boat) {
+      const goalT = (k) => +cfg.goals.find((g) => g.id === k)?.target || 0;
+      const total = (k) => Math.max((+have[k] || 0) + (+queued[k] || 0), goalT(k));
+      for (const k of Object.keys(UW.GameData?.units || {})) if (isDefUnit(k) && !UW.GameData.units[k].is_naval && !UW.GameData.units[k].flying) groundDefPop += total(k) * P(k);
+      const need = Math.ceil(groundDefPop / cap) - total(DEF_BOAT);
+      if (need > 0) { boatsFirst = Math.min(need, Math.floor(free / P(DEF_BOAT))); free -= boatsFirst * P(DEF_BOAT); }
+    }
+    let a = 0, b = 0;
+    if (arch && infOk) { a = Math.floor(cap / 2); b = cap - a; } else if (infOk) b = cap; else if (arch) a = cap;
+    const groupPop = a * P(DEF_ARCHER) + b * P(inf) + (boat ? P(DEF_BOAT) : 0);
+    const n = (a || b) && groupPop ? Math.floor(free / groupPop) : 0;
+    const add = {};
+    if (n) { if (a) add[DEF_ARCHER] = n * a; if (b) add[inf] = n * b; }
+    if (boat && (n + boatsFirst)) add[DEF_BOAT] = n + boatsFirst;
+    return { townId, free: free + boatsFirst * P(DEF_BOAT), n, a, b, boat, inf, cap, add, boatsFirst, groundDefPop, todo: n > 0 || boatsFirst > 0,
+      why: !(a || b) ? 'sin arqueros ni infantería investigados' : !n ? 'sin población libre para una barcada' : '' };
+  }
+  function wallMaxLevel() { return +UW.GameData?.buildings?.wall?.max_level || 25; }
+  function applyDefenseWalls() {
+    const out = [];
+    for (const id of allTownIds()) {
+      if (realBuildingLevel(id, 'wall') >= wallMaxLevel()) continue;
+      const t = townBuildCfg(id);
+      if (!t.wallMax) { t.wallMax = true; out.push(id); }
+      if (!buildEnabledFor(id)) t.enabled = true; // para que se construya (sus otros pedidos van antes)
+    }
+    if (out.length) buildLog(`Muro al máximo (detrás de lo que ya tengan pedido) en: ${out.map(farmTownName).join(', ')}.`, 'ok');
+    return out;
+  }
+  function applyDefense() {
+    if (state.defensa?.wall !== false) applyDefenseWalls();
+    const plans = allTownIds().map(defensePlan).filter((p) => p.todo);
+    for (const p of plans) {
+      const t = townRecruitCfg(p.townId);
+      const have = townUnitsHave(p.townId), queued = queuedUnits(p.townId);
+      for (const [u, k] of Object.entries(p.add)) {
+        const base = (+have[u] || 0) + (+queued[u] || 0);
+        const g = t.goals.find((x) => x.id === u);
+        if (g) g.target = Math.max(g.target, base) + k; else t.goals.push({ id: u, target: base + k });
+      }
+      // Los barcos, los primeros de su lista (se reclutan antes que el resto).
+      const bi = t.goals.findIndex((x) => x.id === DEF_BOAT);
+      if (bi > 0 && p.boatsFirst) t.goals.unshift(...t.goals.splice(bi, 1));
+      // Hechizos de reclutamiento: los que no tenga, en opcional (los que ya tenga, igual).
+      t.spells = { ...(t.spells || {}) };
+      for (const sd of RECRUIT_SPELLS) if (!t.spells[sd.id] && (sd.kind === 'naval' ? p.boat : true)) t.spells[sd.id] = 'optional';
+      // Que recluten ya: activado en esa ciudad y en la cola.
+      if (!recruitOnFor(p.townId)) t.enabled = true;
+      if (state.reclutamiento.excluded?.[p.townId]) { state.reclutamiento.excluded = { ...state.reclutamiento.excluded }; delete state.reclutamiento.excluded[p.townId]; }
+      recruitLog(`${farmTownName(p.townId)}: defensa · ${p.boatsFirst ? `${p.boatsFirst} barco${p.boatsFirst > 1 ? 's' : ''} primero para la defensa que ya tiene · ` : ''}${p.n} barcada${p.n === 1 ? '' : 's'}: ${Object.entries(p.add).map(([u, k]) => `${k} ${unitName(u)}`).join(' + ')}.`, 'ok');
+    }
+    recruitTurnMemo.at = 0; saveState(); renderBody();
+    return plans;
+  }
+  function renderDefenseCard() {
+    const rc = state.reclutamiento;
+    const plans = allTownIds().map(defensePlan).sort((x, y) => farmTownName(x.townId).localeCompare(farmTownName(y.townId), 'es'));
+    const ok = plans.filter((p) => p.todo);
+    const tot = {};
+    for (const p of ok) for (const [u, k] of Object.entries(p.add)) tot[u] = (tot[u] || 0) + k;
+    const sel = el('select', { class: 'nb-input nb-input-inline' }, [['sword', 'Espadachín'], ['hoplite', 'Hoplita']].map(([v, l]) => { const o = el('option', { value: v }, l); if ((rc.defInf || 'sword') === v) o.selected = true; return o; }));
+    sel.addEventListener('change', () => { rc.defInf = sel.value; saveState(); renderBody(); });
+    const wallOn = state.defensa?.wall !== false;
+    const walls = wallOn ? allTownIds().filter((id) => realBuildingLevel(id, 'wall') < wallMaxLevel() && !townBuildCfg(id).wallMax) : [];
+    const any = ok.length || walls.length;
+    const btn = el('span', { class: `nb-btn${any ? '' : ' nb-mini-off'}`, onclick: () => {
+      if (!any) return;
+      if (!confirm(`¿Pedir defensa?\n${ok.length ? `Tropas en ${ok.length} ciudad(es): ${Object.entries(tot).map(([u, k]) => `${k} ${unitName(u)}`).join(' · ')}` : 'Sin tropas (no hay población libre)'}${walls.length ? `\nMuro al máximo en ${walls.length} ciudad(es)` : ''}`)) return;
+      applyDefense();
+    } }, `Construir defensa${ok.length ? ` en ${ok.length} ciudad${ok.length === 1 ? '' : 'es'}` : ''}${walls.length ? ` · muro en ${walls.length}` : ''}`);
+    const wallRow = optionRow('Subir también el muro al máximo', 'En todas las ciudades donde no está al máximo. Va SIEMPRE detrás de lo que esa ciudad ya tenga pedido en Construcción (o de su maqueta)', wallOn, (v) => { state.defensa.wall = v; saveState(); renderBody(); });
+    const list = el('div', { class: 'nb-goals' }, plans.map((p) => el('div', { class: `nb-goal${p.todo ? '' : ' nb-goal-done'}` }, [
+      el('div', { class: 'nb-goal-main' }, [el('div', { class: 'nb-goal-name' }, farmTownName(p.townId)),
+        el('div', { class: 'nb-goal-sub' }, p.todo ? `${p.free} de población libre → ${p.boatsFirst ? `1º ${p.boatsFirst} barco${p.boatsFirst > 1 ? 's' : ''} para su defensa de tierra (${p.groundDefPop} de población) · ` : ''}${p.n} barcada${p.n === 1 ? '' : 's'} · total ${Object.entries(p.add).map(([u, k]) => `${k} ${unitName(u)}`).join(' + ')}${p.boat ? '' : ' (sin barco: no investigado o sin Puerto)'}` : `${p.free} libre · ${p.why}`)])
+    ])));
+    return el('div', { class: 'nb-card', 'data-nb-card': 'defensa' }, [
+      el('div', { class: 'nb-card-title' }, 'Defensa automática · todas las ciudades'),
+      el('div', { class: 'nb-row' }, [el('div', { class: 'nb-option-text' }, [el('span', { class: 'nb-option-label' }, 'Infantería'), el('span', { class: 'nb-option-hint' }, 'Por barco: mitad arqueros y mitad esta tropa (lo que cabe en el barco)')]), sel]),
+      wallRow,
+      el('p', { class: 'nb-placeholder' }, 'Primero, si una ciudad ya tiene defensa de tierra (espadachines, arqueros, hoplitas, carros, míticas defensivas…) sin barcos suficientes para llevarla, se piden esos barcos (1 por cada 32 de población, con La llamada del mar si hay favor). Después, con un clic se piden, en cada ciudad con población libre, todas las barcadas que caben (1 barco de transporte + su carga, mitad arqueros y mitad infantería). Sin arqueros → todo infantería; sin barco → sin barco. Se suman a sus tropas pedidas y el bot las recluta en los lotes más grandes posibles, con los hechizos de reclutamiento siempre que haya favor.'),
+      ok.length ? el('div', { class: 'nb-alert nb-alert-info' }, ['En total: ', el('b', {}, Object.entries(tot).map(([u, k]) => `${k.toLocaleString('es-ES')} ${unitName(u)}`).join(' · '))]) : null,
+      !state.comercio?.enabled || !state.comercio?.forRecruit ? el('div', { class: 'nb-alert nb-alert-warn' }, 'El comercio para reclutamiento está desactivado: cada ciudad solo usará sus propios recursos.') : null,
+      el('div', { class: 'nb-btn-group nb-mt' }, [btn]),
+      el('details', { class: 'nb-mt' }, [el('summary', { style: 'cursor:pointer' }, 'Ver ciudad a ciudad'), list])
+    ]);
+  }
+
   /* ---------------------------------------------------------------------------------
      8e) ATAQUES — programador de ataques y apoyos (todo por API)
      -----------------------------------------------------------------------------
@@ -7074,6 +7215,312 @@
     renderBody();
   }
 
+  /* MILICIA AUTOMÁTICA (desactivada por defecto): si a una ciudad tuya le llega un ataque
+     enemigo, se llama a la milicia de su Granja unos minutos antes de que llegue.
+     · Ataques que llegan: vista general de órdenes del juego (la misma que ya usa el bot):
+       órdenes que NO son tuyas, de ida, con destino una ciudad tuya, que no son apoyo ni
+       espionaje.
+     · Llamar a la milicia: la misma petición que el botón de la Granja
+       (building_farm / request_militia, en esa ciudad). Si la milicia ya está, no se pide.
+       Mientras está, la ciudad produce menos (regla del juego): por eso se llama solo
+       unos minutos antes y no en cuanto se ve el ataque.
+     · Se comprueba que salió (milicia en la ciudad); si el juego da error, se avisa y se
+       reintenta en 5 min. */
+  const milRuntime = { timer: null, running: false, at: 0, incoming: new Map(), last: new Map(), log: [] };
+  const militiaOn = () => !!state.milicia?.enabled;
+  function townMilitia(townId) { try { return +UW.ITowns.getTown(townId)?.units?.()?.militia || 0; } catch { return 0; } }
+  // Visto en la vista de órdenes del juego (30/10/2026): un ataque enemigo llega como
+  // type "attack", own_command false, destino una ciudad tuya. Una REVUELTA enemiga en una
+  // ciudad tuya llega como type "revolt" con own_command TRUE (¡), origen de otro jugador,
+  // started_at = cuándo empieza y finished_at = cuándo acaba (la conquista puede llegar
+  // en ese tramo).
+  const isRevoltCmd = (c) => String(c?.type || c?.command_type || '').toLowerCase() === 'revolt';
+  function isHostileIncoming(c, own) {
+    if (!c || c.return || c.cmd_return) return false;
+    if (!own.has(+c.destination_town_id)) return false;
+    if (isRevoltCmd(c)) return +c.origin_town_player_id > 0 && +c.origin_town_player_id !== +UW.Game?.player_id;
+    if (c.own_command === true || c.own_command === 1 || c.own_command === '1') return false;
+    if (own.has(+c.origin_town_id)) return false;
+    const t = `${c.type || ''} ${c.command_type || ''} ${c.command_name || ''}`.toLowerCase();
+    if (/support|apoyo|refuerz|espion|spy|trade|comerc|farm|coloniz/.test(t)) return false;
+    return true;
+  }
+  // Para cuándo hay que tener la defensa: un ataque, cuando llega; una revuelta que aún no
+  // ha empezado, cuando empieza; una revuelta en marcha, antes de que acabe.
+  function hostileDeadline(c, nowMs) {
+    if (!isRevoltCmd(c)) return +c.arrival_at * 1000 || 0;
+    const st = +c.started_at * 1000 || 0, fin = (+c.finished_at || +c.arrival_at) * 1000 || 0;
+    return st > nowMs ? st : fin;
+  }
+  async function militiaTick() {
+    if (!militiaOn()) return;
+    const list = await fetchCommandOverview().catch(() => null);
+    if (!list) return;
+    const own = new Set(allTownIds());
+    const map = new Map(); // townId -> llegada más próxima (ms servidor)
+    for (const c of list) {
+      if (!isHostileIncoming(c, own) || isRevoltCmd(c)) continue; // (la milicia es para ataques que llegan)
+      const arr = +c.arrival_at * 1000 || 0, d = +c.destination_town_id;
+      if (arr > srvNow() && (!map.has(d) || arr < map.get(d))) map.set(d, arr);
+    }
+    milRuntime.incoming = map; milRuntime.at = Date.now();
+    const lead = clamp(+state.milicia.minutes || 10, 1, 180) * 60000;
+    for (const [townId, arr] of map) {
+      if (arr - srvNow() > lead) continue;            // aún falta: se llama más cerca de la llegada
+      if (townMilitia(townId) > 0) continue;          // ya está
+      if ((milRuntime.last.get(townId) || 0) > Date.now()) continue; // pedida hace poco
+      milRuntime.last.set(townId, Date.now() + 5 * 60000);
+      try {
+        await gpPostAs(townId, 'building_farm', 'request_militia', { nl_init: true });
+        await sleep(2500);
+        const n = townMilitia(townId);
+        milLog(`${farmTownName(townId)}: milicia llamada (ataque llega a las ${srvClock(arr - clockOffset().off)})${n ? ` · ${n} milicianos` : ''}.`, 'ok');
+        if (n) milRuntime.last.set(townId, Date.now() + 30 * 60000);
+      } catch (e) {
+        milLog(`${farmTownName(townId)}: no se pudo llamar a la milicia — ${e.message}`, 'error');
+      }
+      await sleep(600 + Math.random() * 600);
+    }
+    renderIfIdle('defensa');
+  }
+  function startMilitiaEngine() {
+    if (milRuntime.timer) return;
+    milRuntime.timer = setInterval(() => {
+      if (!isRunner() || !militiaOn() || milRuntime.running) return;
+      milRuntime.running = true;
+      militiaTick().catch((e) => milLog(`Error: ${e.message}`, 'error')).finally(() => { milRuntime.running = false; });
+    }, 30000);
+  }
+  function milLog(text, kind = 'info') {
+    milRuntime.log.unshift({ at: Date.now(), text, kind }); milRuntime.log = milRuntime.log.slice(0, 40);
+    try { atkLog(`Milicia · ${text}`, kind); } catch {}
+  }
+  function renderMilitiaCard() {
+    const cfg = state.milicia;
+    const inp = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: '1', max: '180', value: String(clamp(+cfg.minutes || 10, 1, 180)) });
+    inp.addEventListener('change', () => { cfg.minutes = clamp(pos(inp.value, 10), 1, 180); saveState(); renderBody(); });
+    const inc = [...milRuntime.incoming].sort((a, b) => a[1] - b[1]);
+    return el('div', { class: 'nb-card', 'data-nb-card': 'milicia' }, [
+      el('div', { class: 'nb-row' }, [el('div', { class: 'nb-option-text' }, [el('span', { class: 'nb-option-label' }, [el('b', {}, 'Milicia automática')]),
+        el('span', { class: 'nb-option-hint' }, 'Si a una ciudad tuya le llega un ataque, llama a la milicia de su Granja antes de que llegue')]),
+        switchEl(!!cfg.enabled, (v) => { cfg.enabled = v; saveState(); renderBody(); milLog(v ? 'activada.' : 'desactivada.'); if (v && !milRuntime.running) { milRuntime.running = true; militiaTick().catch(() => {}).finally(() => { milRuntime.running = false; }); } }, false)]),
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Llamarla este tiempo antes de que llegue el ataque'), el('span', {}, [inp, ' min'])]),
+      el('p', { class: 'nb-placeholder' }, 'Cada 30 s mira los ataques que llegan a tus ciudades (no los apoyos ni los espías). Mientras la milicia está, esa ciudad produce menos (regla del juego): por eso se llama solo esos minutos antes. Si ya hay milicia, no se pide otra vez.'),
+      cfg.enabled && milRuntime.at ? (inc.length
+        ? el('div', { class: 'nb-alert nb-alert-warn' }, ['Ataques llegando: ', ...inc.slice(0, 6).map(([t, a], i) => el('span', {}, [i ? ' · ' : '', el('b', {}, farmTownName(t)), ` ${srvClock(a - clockOffset().off)}${townMilitia(t) ? ' (milicia ✓)' : ''}`]))])
+        : el('p', { class: 'nb-placeholder' }, 'Ahora no llega ningún ataque a tus ciudades.')) : null
+    ]);
+  }
+  /* APOYO AUTOMÁTICO (desactivado por defecto): cuando a una ciudad tuya le llega un ataque,
+     las ciudades tuyas cuyo apoyo LLEGA ANTES que el ataque le mandan defensa.
+       · Ataques: vista de órdenes del juego (las que no son tuyas, de ida, a tus ciudades;
+         sin apoyos ni espías). REVUELTA = prioridad: se atiende antes y se puede mandar más.
+       · Cuánta: hasta que la ciudad atacada tenga «maxUnits» tropas de defensa, contando
+         las suyas en casa + los apoyos tuyos que ya van y llegan antes del ataque.
+       · De dónde: las ciudades más cercanas primero; cada una se queda al menos el % de su
+         defensa que elijas (menos para una revuelta). No apoya una ciudad que también va a
+         recibir un ataque. Solo tropas que llegan a tiempo (con margen); a otra isla, con
+         sus barcos de transporte (lo que no cabe se queda).
+       · Varios ataques: se reparte por orden (revueltas, luego el que llega antes) y cada
+         ciudad atacada solo hasta su tope: lo que sobra va a la siguiente.
+     Envío: la misma petición que el botón «Apoyar» del juego (town_info / send_units,
+     type "support"). */
+  const supRuntime = { timer: null, running: false, at: 0, targets: [], sent: [], last: new Map() };
+  // Tropa de defensa: en tierra, alguna defensa mayor que su ataque (espadachín, arquero,
+  // hoplita, carro, míticas defensivas); en el mar, defensa ≥ ataque (birremes, trirremes,
+  // hidra). Comprobado con los datos del juego (29/10/2026). Sin transportes ni milicia.
+  const isDefUnit = (k) => {
+    const u = UW.GameData?.units?.[k];
+    if (!u || k === 'militia' || k === 'godsent' || GameData_isHero(k) || isTransport(k) || k === 'colonize_ship') return false;
+    if (u.is_naval) return +u.defense > 0 && +u.defense >= +u.attack;
+    return Math.max(+u.def_hack || 0, +u.def_pierce || 0, +u.def_distance || 0) > (+u.attack || 0);
+  };
+  function townDefHome(townId) {
+    let n = 0; try { const u = UW.ITowns.getTown(townId)?.units?.() || {}; for (const [k, v] of Object.entries(u)) if (isDefUnit(k)) n += +v || 0; } catch {}
+    // + apoyos que ya están en la ciudad (tuyos de antes, de aliados o del bot): grupos de
+    // tropas del juego (Units) con esa ciudad como "current" y otra como "home".
+    try {
+      for (const m of Object.values(UW.MM.getModels().Units || {})) {
+        const a = m.attributes || {};
+        if (+a.current_town_id !== +townId || +a.home_town_id === +townId) continue;
+        for (const [k, v] of Object.entries(a)) if (isDefUnit(k)) n += +v || 0;
+      }
+    } catch {}
+    return n;
+  }
+  // Apoyos del bot: se apuntan (con su id de grupo de tropas = el support_id del juego) para
+  // devolver SOLO esos cuando pase el peligro. Nunca se tocan los que ya tenías puestos ni
+  // los que mandes tú (en camino o estacionados).
+  const supMine = () => (Array.isArray(state.defensa.mine) ? state.defensa.mine : (state.defensa.mine = []));
+  function supReconcile(list) {
+    const known = new Set(supMine().map((r) => String(r.unitsId || '')));
+    for (const r of supMine()) {
+      if (r.unitsId) continue;
+      const c = list.find((x) => (x.own_command === true || x.own_command === 1 || x.own_command === '1') && String(x.type) === 'support' && +x.origin_town_id === r.from && +x.destination_town_id === r.to
+        && x.units_id && !known.has(String(x.units_id)) && Math.abs(+x.started_at * 1000 - r.sentSrv) < 30000);
+      if (c) { r.unitsId = +c.units_id; r.cmdId = +c.id; r.arr = +c.arrival_at * 1000 || 0; known.add(String(c.units_id)); saveState(); }
+      else if (Date.now() - r.at > 10 * 60000) r.lost = true; // no apareció: no se intentará devolver
+    }
+    state.defensa.mine = supMine().filter((r) => !r.lost);
+  }
+  // Devolver los apoyos del bot de las ciudades que ya no tienen ataque ni revuelta encima.
+  async function supReturn(hostile) {
+    const grace = clamp(Number.isFinite(+state.defensa.returnGraceMin) ? +state.defensa.returnGraceMin : 3, 0, 120) * 60000;
+    for (const r of supMine().slice()) {
+      if (!r.unitsId) continue;
+      const h = hostile.get(r.to);
+      if (h) { r.until = Math.max(r.until || 0, h.arr); r.seen = Date.now(); continue; } // sigue el peligro
+      // Ya no hay ataque ni revuelta: pasado el último que había (o si se canceló) + el margen.
+      const end = Math.min(+r.until || 0, (r.seen || r.at) + 60000);
+      if (srvNow() < end + grace && Date.now() < (r.seen || r.at) + grace) continue;
+      if (r.arr && srvNow() < r.arr + 5000) continue; // aún de camino: se devuelve al llegar
+      if ((r.tryAt || 0) > Date.now()) continue;
+      try {
+        await gpPost('building_place', 'send_back', { support_id: r.unitsId });
+        state.defensa.mine = supMine().filter((x) => x !== r); saveState();
+        milLog(`Apoyo devuelto · ${farmTownName(r.to)} → ${farmTownName(r.from)} (el que mandó el bot).`, 'ok');
+      } catch (e) {
+        r.fails = (r.fails || 0) + 1; r.tryAt = Date.now() + 5 * 60000;
+        if (r.fails >= 3) { state.defensa.mine = supMine().filter((x) => x !== r); milLog(`Apoyo ${farmTownName(r.from)} → ${farmTownName(r.to)}: no se pudo devolver (${e.message}); se deja.`, 'error'); }
+        saveState();
+      }
+      await sleep(600 + Math.random() * 600);
+    }
+  }
+  async function supportTick() {
+    const on = !!state.defensa?.autoSupport;
+    if (!on && !supMine().length) return; // (apagado: solo se siguen devolviendo los que mandó)
+    const list = await fetchCommandOverview().catch(() => null);
+    if (!list) return;
+    const cfg = state.defensa, own = new Set(allTownIds()), now = srvNow();
+    const hostile = new Map(); // destino -> { arr (primer ataque), revolt }
+    for (const c of list) {
+      if (!isHostileIncoming(c, own)) continue;
+      const arr = hostileDeadline(c, now), d = +c.destination_town_id;
+      if (arr <= now) continue;
+      const revolt = isRevoltCmd(c) || /conquer|conquist/.test(`${c.type || ''} ${c.command_type || ''} ${c.command_name || ''}`.toLowerCase());
+      const h = hostile.get(d) || { arr: Infinity, revolt: false };
+      h.arr = Math.min(h.arr, arr); h.revolt = h.revolt || revolt; hostile.set(d, h);
+    }
+    // Apoyos propios en camino (de ida) por destino, con su llegada.
+    const ownSup = list.filter((c) => (c.own_command === true || c.own_command === 1 || c.own_command === '1') && !c.return && !c.cmd_return && /support|apoyo/.test(`${c.type || ''} ${c.command_type || ''}`.toLowerCase()));
+    supReconcile(list);
+    await supReturn(hostile);
+    if (!on) return;
+    supRuntime.sent = supRuntime.sent.filter((x) => Date.now() - x.at < 120000); // envíos del bot aún no vistos en la vista
+    const targets = [...hostile].map(([id, h]) => ({ id, ...h })).sort((a, b) => (b.revolt - a.revolt) || (a.arr - b.arr));
+    const margin = clamp(+cfg.marginSec || 60, 0, 600) * 1000, cap = Math.max(100, +cfg.maxUnits || 2500);
+    const donorUsed = new Map(); // donante -> { unidad: n } ya mandado en esta vuelta
+    let sends = 0;
+    for (const t of targets) {
+      const inflight = ownSup.filter((c) => +c.destination_town_id === t.id && +c.arrival_at * 1000 < t.arr)
+        .reduce((n, c) => n + Object.entries(c).reduce((m, [k, v]) => m + (isDefUnit(k) ? +v || 0 : 0), 0), 0)
+        + supRuntime.sent.filter((x) => x.to === t.id).reduce((n, x) => n + x.n, 0);
+      t.present = townDefHome(t.id) + inflight;
+      t.need = Math.max(0, cap - t.present);
+      t.sentNow = 0;
+      if (!t.need || t.arr - now < margin + 30000) continue;
+      const keep = clamp(+(t.revolt ? cfg.keepRevoltPct : cfg.keepPct) || 0, 0, 100) / 100;
+      const donors = allTownIds().filter((d) => d !== t.id && !hostile.has(d) && !state.defensa.noSend?.[d] && (supRuntime.last.get(`${d}>${t.id}`) || 0) < Date.now())
+        .sort((a, b) => townDist(a, t.id) - townDist(b, t.id)).slice(0, 10);
+      for (const d of donors) {
+        if (t.need <= 0 || sends >= 6) break;
+        let info = null; try { info = await attackInfo(d, t.id, 20000); } catch { continue; }
+        const used = donorUsed.get(d) || {};
+        const left = t.arr - srvNow() - margin;
+        const sel = {};
+        let pool = 0;
+        for (const [k, v] of Object.entries(info.units || {})) {
+          if (!isDefUnit(k)) continue;
+          const dur = +v?.duration * 1000 || 0;
+          if (!dur || dur > left) continue; // no llega a tiempo
+          const can = Math.floor((+v.count || 0) * (1 - keep)) - (used[k] || 0);
+          if (can > 0) { sel[k] = can; pool += can; }
+        }
+        if (!pool) continue;
+        const f = Math.min(1, t.need / pool);
+        for (const k of Object.keys(sel)) { sel[k] = Math.floor(sel[k] * f); if (!sel[k]) delete sel[k]; }
+        // Otra isla: sus barcos de transporte (mismo % que se puede llevar); lo que no cabe se queda.
+        if (needsTransport(info, sel)) {
+          for (const k of ['big_transporter', 'small_transporter']) { const c = Math.floor((+info.units?.[k]?.count || 0) * (1 - keep)) - (used[k] || 0); if (c > 0 && +info.units[k].duration * 1000 <= left) sel[k] = c; }
+          const fit = fitToShips(sel, info);
+          for (const k of Object.keys(fit.left)) { if (fit.units[k]) sel[k] = fit.units[k]; else delete sel[k]; }
+        }
+        const n = Object.entries(sel).reduce((m, [k, v]) => m + (isDefUnit(k) ? v : 0), 0);
+        if (n < 10) continue;
+        const tr = travelFromInfo(info, sel, null, d);
+        if (tr.error || srvNow() + tr.ms > t.arr - margin) continue;
+        try {
+          await gpPostAs(d, 'town_info', 'send_units', { id: t.id, type: 'support', nl_init: true, ...sel });
+          for (const [k, v] of Object.entries(sel)) used[k] = (used[k] || 0) + v;
+          donorUsed.set(d, used);
+          supRuntime.sent.push({ to: t.id, n, at: Date.now() });
+          supMine().push({ from: d, to: t.id, at: Date.now(), sentSrv: srvNow(), until: t.arr, units: { ...sel } }); saveState();
+          supRuntime.last.set(`${d}>${t.id}`, Date.now() + 60000);
+          t.need -= n; t.sentNow += n; sends++;
+          milLog(`Apoyo · ${farmTownName(d)} → ${farmTownName(t.id)}${t.revolt ? ' (REVUELTA)' : ''}: ${Object.entries(sel).map(([k, v]) => `${v} ${atkUnitName(k)}`).join(', ')} · llega ${srvClock(srvNow() + tr.ms - clockOffset().off)} (ataque ${srvClock(t.arr - clockOffset().off)}).`, 'ok');
+        } catch (e) {
+          supRuntime.last.set(`${d}>${t.id}`, Date.now() + 5 * 60000);
+          milLog(`Apoyo · ${farmTownName(d)} → ${farmTownName(t.id)}: ${e.message}`, 'error');
+        }
+        await sleep(700 + Math.random() * 700);
+      }
+    }
+    supRuntime.targets = targets; supRuntime.at = Date.now();
+    renderIfIdle('defensa');
+  }
+  function startSupportEngine() {
+    if (supRuntime.timer) return;
+    supRuntime.timer = setInterval(() => {
+      if (!isRunner() || (!state.defensa?.autoSupport && !supMine().length) || supRuntime.running) return;
+      supRuntime.running = true;
+      supportTick().catch((e) => milLog(`Apoyo · error: ${e.message}`, 'error')).finally(() => { supRuntime.running = false; });
+    }, 30000);
+  }
+  function renderSupportCard() {
+    const cfg = state.defensa;
+    const num = (key, min, max, def, suffix) => {
+      const i = el('input', { class: 'nb-input nb-input-inline', type: 'number', min: String(min), max: String(max), value: String(cfg[key] ?? def) });
+      i.addEventListener('change', () => { cfg[key] = clamp(pos(i.value, def), min, max); saveState(); renderBody(); });
+      return el('span', {}, [i, suffix]);
+    };
+    const tg = supRuntime.targets || [];
+    return el('div', { class: 'nb-card', 'data-nb-card': 'apoyo' }, [
+      el('div', { class: 'nb-row' }, [el('div', { class: 'nb-option-text' }, [el('span', { class: 'nb-option-label' }, [el('b', {}, 'Apoyo automático')]),
+        el('span', { class: 'nb-option-hint' }, 'Cuando a una ciudad tuya le llega un ataque, las cercanas cuyo apoyo llega antes le mandan defensa')]),
+        switchEl(!!cfg.autoSupport, (v) => { cfg.autoSupport = v; saveState(); renderBody(); milLog(`Apoyo automático ${v ? 'activado' : 'desactivado'}.`); if (v && !supRuntime.running) { supRuntime.running = true; supportTick().catch(() => {}).finally(() => { supRuntime.running = false; }); } }, false)]),
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Dejar de mandar cuando la ciudad atacada tenga'), num('maxUnits', 100, 100000, 2500, ' tropas de defensa')]),
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Cada ciudad que apoya se queda al menos'), num('keepPct', 0, 100, 50, ' % de su defensa')]),
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Para una REVUELTA (prioridad) se queda al menos'), num('keepRevoltPct', 0, 100, 25, ' %')]),
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'El apoyo debe llegar al menos'), num('marginSec', 0, 600, 60, ' s antes que el ataque')]),
+      el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, 'Devolver los apoyos del bot'), num('returnGraceMin', 0, 120, 3, ' min después del último ataque / fin de la revuelta')]),
+      el('p', { class: 'nb-placeholder' }, 'Cada 30 s. Se atienden primero las revueltas y luego el ataque que llega antes; cada ciudad atacada recibe hasta el tope y lo demás va a la siguiente. Apoyan las más cercanas que llegan a tiempo (a otra isla, con sus barcos), nunca una ciudad que también va a recibir un ataque. Solo se mandan tropas que están EN CASA: los apoyos que ya tengas puestos o en camino no se mueven, y al acabar el peligro el bot devuelve SOLO los que mandó él.'),
+      (() => {
+        const towns = allTownIds().sort((a, b) => farmTownName(a).localeCompare(farmTownName(b), 'es'));
+        const nNo = towns.filter((id) => cfg.noSend?.[id]).length;
+        const det = el('details', { class: 'nb-mt' });
+        det.appendChild(el('summary', { style: 'cursor:pointer' }, `Ciudades que NO mandan apoyo (defensa estática): ${nNo}`));
+        det.appendChild(el('p', { class: 'nb-placeholder' }, 'Desactivada = esa ciudad no manda nunca su defensa (sí puede recibir apoyo).'));
+        for (const id of towns) det.appendChild(el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, farmTownName(id)),
+          switchEl(!cfg.noSend?.[id], (v) => { cfg.noSend = { ...(cfg.noSend || {}) }; if (v) delete cfg.noSend[id]; else cfg.noSend[id] = true; saveState(); milLog(`${farmTownName(id)}: ${v ? 'puede mandar apoyo' : 'no manda apoyo (defensa estática)'}.`); })]));
+        return det;
+      })(),
+      supMine().length ? el('div', { class: 'nb-alert nb-alert-info nb-mt' }, [el('b', {}, `Apoyos del bot fuera (${supMine().length}): `), supMine().map((r) => `${farmTownName(r.from)} → ${farmTownName(r.to)}${r.unitsId ? '' : ' (en camino)'}`).join(' · '), '. Se devuelven solos al acabar el peligro.']) : null,
+      cfg.autoSupport && supRuntime.at ? (tg.length
+        ? el('div', { class: 'nb-goals' }, tg.map((t) => el('div', { class: 'nb-goal' }, [el('div', { class: 'nb-goal-main' }, [
+            el('div', { class: 'nb-goal-name' }, [townLink(t.id), t.revolt ? el('span', { class: 'nb-tag nb-tag-demolish', style: 'margin-left:6px' }, 'revuelta') : null]),
+            el('div', { class: 'nb-goal-sub' }, `${t.revolt ? 'defensa lista antes de las' : 'ataque'} ${srvClock(t.arr - clockOffset().off)} · defensa ${t.present}${t.sentNow ? ` + ${t.sentNow} mandados ahora` : ''} / ${cfg.maxUnits || 2500}${t.need > 0 ? ` · faltan ${t.need}` : ' ✓'}`)])])))
+        : el('p', { class: 'nb-placeholder' }, 'Ahora no llega ningún ataque a tus ciudades.')) : null
+    ]);
+  }
+  function renderDefensaTab() {
+    bodyEl.appendChild(renderSupportCard());
+    bodyEl.appendChild(renderMilitiaCard());
+    bodyEl.appendChild(renderDefenseCard());
+    const logBox = el('div', { class: 'nb-log' });
+    bodyEl.appendChild(el('div', { class: 'nb-card' }, [el('div', { class: 'nb-card-title' }, 'Actividad'), logBox]));
+    paintLog(logBox, milRuntime.log);
+  }
   function renderAtaquesTab() {
     atkLoadWorld();
     installClockSync();
@@ -8208,6 +8655,28 @@
       { t: 'Ciudades aptas', find: () => TQ.card(/^Ciudades aptas/), h: `<p>Estado de cada ciudad: en curso (cuenta atrás), listo, cuánto falta y lo que ya viene de camino, o si está esperando por la prioridad.</p>` }
     ]);
 
+    // ------------------------------------------------------------------ Defensa
+    add('Defensa', 'defensa', [
+      { t: 'Defensa', find: () => TQ.tab('defensa'), h: `<p>Todo lo de defender tus ciudades: <b>apoyo automático</b> entre tus ciudades, <b>milicia automática</b> y el botón para <b>construir defensa</b> (tropas y muro) en todas.</p>` },
+      { t: 'Apoyo automático', find: () => TQ.card(/Apoyo automático/), wide: true, h: `
+        <p><b>Apoyo automático</b> (desactivado por defecto): cuando a una ciudad tuya le llega un ataque, tus ciudades cuyo apoyo <b>llega antes que el ataque</b> le mandan defensa.</p>
+        <ul><li><b>Tope</b>: deja de mandar cuando la ciudad atacada tiene esa defensa (por defecto 2500 tropas), contando sus tropas y los apoyos tuyos que ya van.</li>
+        <li><b>Lo que se queda cada una</b>: cada ciudad que apoya guarda al menos ese % de su defensa (50 %), para no quedarte sin defensa ante otro ataque.</li>
+        <li><b>Revuelta</b>: va primero y se puede mandar más (cada una guarda solo el 25 %).</li>
+        <li><b>Margen</b>: el apoyo debe llegar al menos esos segundos antes que el ataque.</li>
+        <li><b>Defensa estática</b>: puedes marcar ciudades que <b>no mandan</b> nunca su defensa (sí reciben).</li>
+        <li><b>Devolver</b>: cuando ya no queda ataque ni revuelta en esa ciudad (y pasan los minutos que elijas), el bot devuelve <b>solo los apoyos que mandó él</b>. Los que ya tenías puestos, los que estén en camino al activarlo y los que mandes tú no se tocan nunca.</li></ul>
+        ${AUTO('Cada 30 s. Varios ataques: revueltas primero y luego el que llega antes; cada ciudad recibe hasta el tope y lo demás va a la siguiente. Apoyan las más cercanas (a otra isla, con sus barcos de transporte), nunca una ciudad que también va a ser atacada, y solo con tropas que llegan a tiempo.')}` },
+      { t: 'Milicia automática', find: () => TQ.card(/Milicia automática/), h: `
+        <p><b>Milicia automática</b> (desactivada por defecto): si a una ciudad tuya le llega un ataque, se llama a la milicia de su Granja el tiempo antes que pongas (10 min por defecto).</p>
+        ${AUTO('Cada 30 s mira los ataques que llegan (no apoyos ni espías) en la vista de órdenes del juego. Si ya hay milicia, no la pide otra vez; si el juego da error, lo avisa en la actividad y reintenta en 5 min. Mientras la milicia está, la ciudad produce menos (regla del juego).')}` },
+      { t: 'Defensa automática', find: () => TQ.card(/^Defensa automática/), h: `
+        <p>Un botón para pedir defensa en <b>todas</b> las ciudades con población libre: por cada barco de transporte, su carga (32 con Literas) mitad <b>arqueros</b> y mitad <b>infantería</b> (eliges espadachín u hoplita).</p>
+        <p><b>Barcos primero</b>: si la ciudad ya tiene defensa de tierra sin barcos suficientes (1 por cada 32 de población), se piden antes esos barcos, los primeros de su lista y con La llamada del mar si hay favor.</p>
+        ${AUTO('Descuenta la población que ya usan las tropas pedidas. Sin arqueros → todo infantería; sin barco → sin barco. Las añade a las tropas pedidas de cada ciudad (la activa en el reclutamiento si hacía falta) y el bot las recluta como siempre: lotes máximos, comercio y hechizos de reclutamiento cuando haya favor (los que no tuviera, en opcional). Puedes volver a pulsarlo más adelante con la población que quede libre.')}
+        <p>Con <b>«Subir también el muro al máximo»</b> (activado), el mismo botón pone el muro al máximo en todas las ciudades donde no lo está, siempre <b>detrás</b> de lo que esa ciudad ya tenga pedido en Construcción (o de su maqueta), y activa la construcción en ellas si estaba apagada.</p>` }
+    ]);
+
     // ------------------------------------------------------------------ Cueva
     add('Cueva', 'cueva', [
       { t: 'Cueva', find: () => TQ.tab('cueva'), h: `<p>Mete plata en las cuevas (protege contra espías y sirve para espiar).</p>` },
@@ -8304,6 +8773,32 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.18.2', items: [
+      { t: 'Apoyo automático: devolver y defensa estática', tab: 'defensa', find: () => TQ.card(/Apoyo automático/) || TQ.tab('defensa'), h: `
+        <p>El bot apunta los apoyos que manda y, cuando ya no queda ataque ni revuelta en esa ciudad, <b>devuelve solo esos</b>. Los que ya tenías puestos o en camino (y los que mandes tú) no se tocan.</p>
+        <p>Nueva lista de <b>ciudades que no mandan apoyo</b> (defensa estática): pueden recibir, pero nunca envían. La defensa que ya está en una ciudad (tuya o de aliados) cuenta para el tope.</p>` }
+    ] },
+    { v: '1.18.1', items: [
+      { t: 'Defensa: revisado con la partida real', tab: 'defensa', find: () => TQ.tab('defensa'), h: `
+        <p>Comprobado en tu partida: los ataques que llegan se leen bien; las <b>revueltas</b> enemigas en tus ciudades (que el juego marca de otra forma) ahora se detectan, y el apoyo se manda para que llegue <b>antes de que empiece</b> la revuelta (o antes de que acabe si ya está en marcha). La milicia solo se llama para ataques.</p>
+        <p>Las <b>birremes, trirremes e hidras</b> cuentan ya como defensa (antes no).</p>
+        <p><b>Construir defensa</b>: si una ciudad ya tiene defensa de tierra sin barcos suficientes, primero pide esos barcos (1 por cada 32 de población), con La llamada del mar si hay favor.</p>` }
+    ] },
+    { v: '1.18.0', items: [
+      { t: 'Nueva pestaña Defensa', tab: 'defensa', find: () => TQ.tab('defensa'), h: `
+        <p>Nueva pestaña <b>Defensa</b> con la milicia automática, el botón de construir defensa y el nuevo <b>apoyo automático</b>: cuando a una ciudad tuya le llega un ataque, las cercanas cuyo apoyo llega antes le mandan defensa (revueltas primero, hasta un tope, y cada una se guarda parte de la suya).</p>
+        <p>El botón de construir defensa también sube ahora el <b>muro al máximo</b> en todas las ciudades, siempre detrás de lo que ya tengan pedido en Construcción.</p>` }
+    ] },
+    { v: '1.17.0', items: [
+      { t: 'Milicia automática', tab: 'defensa', find: () => TQ.card(/Milicia automática/) || TQ.tab('ataques'), h: `
+        <p>Nuevo en <b>Ataques</b> (desactivado por defecto): si a una de tus ciudades le llega un ataque, el bot llama a la <b>milicia de su Granja</b> los minutos antes que elijas (10 por defecto).</p>
+        ${AUTO('Mira cada 30 s los ataques que llegan (no apoyos ni espías). Si ya hay milicia, no la pide otra vez. Mientras la milicia está, la ciudad produce menos: por eso se llama poco antes de que llegue el ataque.')}` }
+    ] },
+    { v: '1.16.0', items: [
+      { t: 'Defensa automática', tab: 'defensa', find: () => TQ.card(/^Defensa automática/) || TQ.tab('reclutamiento'), h: `
+        <p>Nuevo en <b>Reclutamiento</b>: con un botón se pide en <b>todas</b> las ciudades con población libre toda la defensa que cabe, por barcadas: <b>1 barco de transporte + su carga</b> (32 con Literas), mitad <b>arqueros</b> y mitad <b>infantería</b> (espadachín u hoplita).</p>
+        ${AUTO('Sin arqueros investigados, toda la barcada es de infantería; sin barco, las tropas sin barco. Se suman a las tropas pedidas de cada ciudad y el bot las recluta en los lotes más grandes posibles, con los hechizos de reclutamiento siempre que haya favor (los que la ciudad no tenga se ponen en opcional).')}` }
+    ] },
     { v: '1.15.0', items: [
       { t: 'Maqueta global de construcción', tab: 'construccion', before: () => { if (state.construccion.view !== 'maqueta') { state.construccion.view = 'maqueta'; return true; } }, find: () => TQ.card(/^Maqueta global/) || TQ.tab('construccion'), h: `
         <p>Nueva subpestaña en <b>Construcción → Maqueta global</b>: pones el nivel que quieres de cada edificio (0 = no se toca) y en qué ciudades se usa. Esas ciudades construyen la maqueta en vez de sus objetivos propios (que se guardan).</p>
@@ -9227,6 +9722,8 @@
     startExchangeEngine();
     startVillageLevelEngine();
     startCaveEngine();
+    startMilitiaEngine();
+    startSupportEngine();
     startRecruitEngine();
     startAttackEngine();
     startFestivalEngine();
