@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NOVABOT
 // @namespace    https://github.com/victoritis/NOVABOT
-// @version      1.18.2
+// @version      1.18.4
 // @description  Panel de control para Grepolis — interfaz propia, sin depender del cliente del juego.
 // @author       victoritis
 // @match        *://*.grepolis.com/*
@@ -54,7 +54,7 @@
      1) CONFIG
   --------------------------------------------------------------------------------- */
   const UW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const VERSION = '1.18.2';
+  const VERSION = '1.18.4';
   const STORAGE_KEY = 'novabot_ui_state_v1';
   // Cuenta (mundo + jugador): TODO lo guardado va por cuenta, para que en el mismo PC
   // otra cuenta no vea ni pise la configuración (ni la nube) de la tuya.
@@ -1342,18 +1342,60 @@
     return 'El juego rechazó la acción.';
   }
 
-  function gpCall(method, controller, action, json, timeoutMs = 15000) {
+  /* COLA DE PETICIONES: antes cada módulo pedía a la vez y, con muchas ciudades, se
+     juntaban decenas de peticiones en el mismo segundo y el juego se colgaba. Ahora van
+     UNA A UNA, en orden de llegada, con una pausa corta entre ellas (tarda algo más, pero
+     el juego aguanta). Las de los ATAQUES (enviar, cancelar, leer órdenes, hechizo sobre la
+     orden) no esperan: salen al momento, porque ahí cada décima cuenta. Y si un ataque del
+     bot sale en los próximos segundos, la cola se para hasta que salga. */
+  const reqQueue = { list: [], busy: false, lastAt: 0, sent: 0 };
+  const REQ_GAP = 350;          // ms mínimos entre una petición y la siguiente (+ hasta 250 al azar)
+  const isUrgentReq = (controller, action, json) =>
+    (controller === 'town_info' && (action === 'send_units' || action === 'attack')) ||
+    (controller === 'command_info' && action === 'cancel_command') ||
+    (controller === 'town_overviews' && action === 'command_overview') ||
+    (controller === 'frontend_bridge' && action === 'execute' && json?.model_url === 'Commands');
+  function attackSoon() {
+    try { const now = Date.now(); return (atk?.queue || []).some((a) => (a.status === 'pending' || a.status === 'sending') && a.executeAt - (typeof srvNow === 'function' ? srvNow() : now) < 8000 && a.executeAt - (typeof srvNow === 'function' ? srvNow() : now) > -60000); } catch { return false; }
+  }
+  function gpFire(method, controller, action, json, timeoutMs, townId) {
     return new Promise((resolve, reject) => {
       const fn = UW.gpAjax?.[method];
       if (typeof fn !== 'function') { reject(new Error(`gpAjax.${method} no disponible.`)); return; }
       let done = false;
       const timer = setTimeout(() => { if (!done) { done = true; reject(new Error(`Sin respuesta del juego (${controller}/${action}).`)); } }, timeoutMs);
+      // Peticiones "como otra ciudad": se cambia la ciudad del juego SOLO mientras se lanza.
+      const prev = UW.Game?.townId;
+      if (townId) UW.Game.townId = +townId;
       try {
-        fn.call(UW.gpAjax, controller, action, json, false, {
+        fn.call(UW.gpAjax, controller, action, townId ? { ...json, town_id: +townId } : json, false, {
           success: (...a) => { if (done) return; done = true; clearTimeout(timer); resolve(a[1] ?? a[0] ?? null); },
           error: (...a) => { if (done) return; done = true; clearTimeout(timer); reject(new Error(gameErrorText(a))); }
         });
       } catch (e) { done = true; clearTimeout(timer); reject(e); }
+      finally { if (townId) UW.Game.townId = prev; }
+    });
+  }
+  async function reqPump() {
+    if (reqQueue.busy) return;
+    reqQueue.busy = true;
+    try {
+      while (reqQueue.list.length) {
+        while (attackSoon()) await sleep(500);
+        const wait = reqQueue.lastAt + REQ_GAP + Math.random() * 250 - Date.now();
+        if (wait > 0) await sleep(wait);
+        const r = reqQueue.list.shift();
+        reqQueue.lastAt = Date.now(); reqQueue.sent++;
+        try { r.resolve(await gpFire(r.method, r.controller, r.action, r.json, r.timeoutMs, r.townId)); } catch (e) { r.reject(e); }
+      }
+    } finally { reqQueue.busy = false; }
+  }
+  function gpCall(method, controller, action, json, timeoutMs = 15000, townId = null) {
+    if (isUrgentReq(controller, action, json)) return gpFire(method, controller, action, json, timeoutMs, townId);
+    return new Promise((resolve, reject) => {
+      // (el tiempo de espera cuenta desde que sale, no desde que entra en la cola)
+      reqQueue.list.push({ method, controller, action, json, timeoutMs, townId, resolve, reject });
+      reqPump();
     });
   }
   const gpGet = (controller, action, json) => gpCall('ajaxGet', controller, action, json);
@@ -2732,12 +2774,7 @@
   const buildRuntime = { timer: null, running: false, log: [], cooldown: new Map() };
   let buildLogEl = null;
 
-  function gpPostAs(townId, controller, action, json) {
-    const prev = UW.Game.townId;
-    UW.Game.townId = +townId;
-    try { return gpPost(controller, action, { ...json, town_id: +townId }); }
-    finally { UW.Game.townId = prev; }
-  }
+  function gpPostAs(townId, controller, action, json) { return gpCall('ajaxPost', controller, action, json, 15000, townId); }
 
   function buildingName(id) {
     const d = UW.GameData?.buildings?.[id];
@@ -6293,12 +6330,7 @@
     atk.infoCache.set(key, { at: Date.now(), info: x });
     return x;
   }
-  function gpGetAs(townId, controller, action, json) {
-    const prev = UW.Game.townId;
-    UW.Game.townId = +townId;
-    try { return gpGet(controller, action, { ...json, town_id: +townId }); }
-    finally { UW.Game.townId = prev; }
-  }
+  function gpGetAs(townId, controller, action, json) { return gpCall('ajaxGet', controller, action, json, 15000, townId); }
 
   /* Duración del viaje: la calcula el MISMO código del juego que usa la ventana de ataque
      (módulo "helpers/runtime", getSlowestRuntimeByDistance), pero con la ciudad de ORIGEN
@@ -8100,7 +8132,7 @@
     } catch {}
     return +buildDataFor(townId)?.building_data?.academy?.level || 0;
   }
-  function festivalEnd(townId) {
+  function festivalEnd(townId, type = 'party') {
     try {
       const all = [];
       const m = UW.MM.getModels().Celebration;
@@ -8109,7 +8141,7 @@
       let end = 0;
       for (const x of all) {
         const a = x?.attributes || {};
-        if (+a.town_id !== +townId || a.celebration_type !== 'party') continue;
+        if (+a.town_id !== +townId || a.celebration_type !== type) continue;
         const f = +a.finished_at * 1000;
         if (f > Date.now()) end = Math.max(end, f);
       }
@@ -8155,14 +8187,23 @@
   const canFestival = (townId) => academyLevel(townId) >= festAcademy();
   // (tras iniciarlo, hasta que el juego actualice sus datos, se da por en marcha)
   const festivalPending = (townId) => !!festCfg() && canFestival(townId) && !festivalEnd(townId) && !((festRuntime.startedUntil.get(+townId) || 0) > Date.now());
+  /* OBRAS DE TEATRO: en las ciudades con Teatro, además del festival (son independientes:
+     el juego deja tener las dos a la vez). Leído del juego (30/10/2026): ventana de la
+     Plaza → «Obras de teatro» 10 000 madera · 12 000 piedra · 10 000 plata; se inicia
+     con la misma petición que el festival (building_place/start_celebration) con
+     celebration_type "theater". Su fin se lee de los festejos del juego (Celebration). */
+  const THEATER_COST = { wood: 10000, stone: 12000, iron: 10000 };
+  const theaterOn = () => !!festCfg() && state.festivales.theater !== false;
+  const hasTheater = (townId) => realBuildingLevel(townId, 'theater') >= 1;
+  const theaterPending = (townId) => theaterOn() && hasTheater(townId) && !festivalEnd(townId, 'theater') && !((festRuntime.startedUntil.get(`${townId}:theater`) || 0) > Date.now());
 
   tradeDemandProviders.push(function festivalDemands() {
     const f = festCfg();
     if (!f || !state.comercio.forFestival) return [];
     const out = [];
     for (const townId of allTownIds()) {
-      if (!festivalPending(townId)) continue;
-      out.push({ townId, module: 'festivales', label: f.event ? 'Festival evento' : 'Festival', ...f.cost });
+      if (festivalPending(townId)) out.push({ townId, module: 'festivales', label: f.event ? 'Festival evento' : 'Festival', ...f.cost });
+      if (theaterPending(townId)) out.push({ townId, module: 'festivales', label: 'Obra de teatro', ...THEATER_COST });
     }
     return out;
   });
@@ -8172,6 +8213,24 @@
     for (const townId of allTownIds()) {
       const f = festCfg();
       if (!f) return;
+      // Obra de teatro (si la ciudad tiene Teatro): con lo que quede tras el festival pendiente.
+      if (theaterPending(townId) && (festRuntime.cooldown.get(`${townId}:theater`) || 0) <= Date.now()) {
+        const cur = townResources(townId), fr = reserveAbove(townId, 'festivales');
+        const party = festivalPending(townId) ? f.cost : { wood: 0, stone: 0, iron: 0 };
+        // (el festival va primero: solo si alcanza para los dos, o si el festival no toca)
+        if (RES.every((k) => cur[k] - fr[k] - party[k] >= THEATER_COST[k])) {
+          try {
+            await gpPostAs(townId, 'building_place', 'start_celebration', { celebration_type: 'theater', nl_init: true });
+            festLog(`${farmTownName(townId)}: obra de teatro iniciada.`, 'ok');
+            festRuntime.cooldown.set(`${townId}:theater`, Date.now() + 60000);
+            festRuntime.startedUntil.set(`${townId}:theater`, Date.now() + 3600000); // hasta que el juego lo muestre
+          } catch (e) {
+            festLog(`${farmTownName(townId)}: obra de teatro — ${e.message}`, 'error');
+            festRuntime.cooldown.set(`${townId}:theater`, Date.now() + 5 * 60000);
+          }
+          await sleep(600 + Math.random() * 700);
+        }
+      }
       if (!festivalPending(townId)) continue;
       if ((festRuntime.cooldown.get(townId) || 0) > Date.now()) continue;
       const cur = townResources(townId);
@@ -8213,7 +8272,8 @@
     bodyEl.appendChild(el('div', { class: 'nb-card' }, [
       el('div', { class: 'nb-row' }, [el('span', { class: 'nb-row-label' }, [el('b', {}, 'Festivales automáticos')]),
         switchEl(!!cfg.enabled, (v) => { cfg.enabled = v; if (v) cfg.event = false; saveState(); renderBody(); festLog(v ? 'Festivales activados.' : 'Festivales desactivados.'); }, false)]),
-      el('p', { class: 'nb-placeholder' }, `Solo ciudades con Academia ${FESTIVAL_ACADEMY}+ y sin festival en curso. Coste: 15 000 madera · 18 000 piedra · 15 000 plata.`)
+      el('p', { class: 'nb-placeholder' }, `Solo ciudades con Academia ${FESTIVAL_ACADEMY}+ y sin festival en curso. Coste: 15 000 madera · 18 000 piedra · 15 000 plata.`),
+      optionRow('Obras de teatro', `También en las ciudades con Teatro (${allTownIds().filter(hasTheater).length} ahora), a la vez que el festival. Coste: 10 000 madera · 12 000 piedra · 10 000 plata. El festival va primero.`, cfg.theater !== false, (v) => { cfg.theater = v; saveState(); renderBody(); festLog(v ? 'Obras de teatro activadas.' : 'Obras de teatro desactivadas.'); })
     ]));
 
     // Festival evento ("Temporada de festivales") — oculto mientras FEST_EVENT_ON = false.
@@ -8253,8 +8313,10 @@
         else sub = el('span', {}, ['Faltan ', fmtResEl(miss), ...(sumRes(inc) ? [' · en camino ', fmtResEl(inc), sumRes(missAfter) ? '' : ' (cubre)'] : [])]);
       }
       const pct = Math.min(100, Math.round(RES.reduce((s, k) => s + Math.min(cur[k], COST[k]), 0) / Math.max(1, sumRes(COST)) * 100));
+      const tEnd = hasTheater(r.id) ? festivalEnd(r.id, 'theater') : 0;
+      const tSub = !hasTheater(r.id) ? null : el('div', { class: 'nb-goal-sub' }, ['Teatro: ', tEnd ? el('span', {}, ['en curso · termina en ', el('b', { 'data-nb-until': Math.round(tEnd / 1000) }, formatLeft(Math.round(tEnd / 1000)))]) : theaterOn() ? 'se inicia cuando haya recursos' : 'desactivado']);
       list.appendChild(el('div', { class: `nb-goal${cls}` }, [
-        el('div', { class: 'nb-goal-main' }, [el('div', { class: 'nb-goal-name' }, r.name), el('div', { class: 'nb-goal-sub' }, [sub])]),
+        el('div', { class: 'nb-goal-main' }, [el('div', { class: 'nb-goal-name' }, r.name), el('div', { class: 'nb-goal-sub' }, [sub]), tSub]),
         r.end ? el('span', { class: 'nb-pill' }, 'festival') : el('div', { class: 'nb-bar nb-bar-mini' }, [el('div', { class: 'nb-bar-fill', style: `width:${pct}%` })])
       ]));
     }
@@ -8652,7 +8714,9 @@
       ...(FEST_EVENT_ON ? [{ t: 'Festival evento', find: () => TQ.card(/^Festival evento/), h: `
         <p>Para la <b>Temporada de festivales</b> del juego: usa el coste, la Academia y la duración del evento. Al encenderlo se apagan los festivales normales.</p>
         <p>Si ahora no hay evento, no hace nada hasta que empiece.</p>` }] : []),
-      { t: 'Ciudades aptas', find: () => TQ.card(/^Ciudades aptas/), h: `<p>Estado de cada ciudad: en curso (cuenta atrás), listo, cuánto falta y lo que ya viene de camino, o si está esperando por la prioridad.</p>` }
+      { t: 'Ciudades aptas', find: () => TQ.card(/^Ciudades aptas/), h: `<p>Estado de cada ciudad: en curso (cuenta atrás), listo, cuánto falta y lo que ya viene de camino, o si está esperando por la prioridad.</p>` },
+      { t: 'Obras de teatro', find: () => TQ.tab('festivales'), h: `
+        <p><b>Obras de teatro</b> (activado): en las ciudades con <b>Teatro</b> también se hace la obra (10 000 madera · 12 000 piedra · 10 000 plata), a la vez que el festival. El festival va primero: la obra se inicia cuando alcanza para los dos (o si el festival no toca). En cada ciudad ves si tiene una en curso y cuándo acaba.</p>` }
     ]);
 
     // ------------------------------------------------------------------ Defensa
@@ -8773,6 +8837,15 @@
      (y se explica en su apartado del tour, arriba). Al actualizar, el panel ofrece
      verlas paso a paso; también están en el índice del "?". Lo más nuevo, primero. */
   const TOUR_NEWS = [
+    { v: '1.18.4', items: [
+      { t: 'Peticiones en orden', find: () => TQ.tab('inicio'), h: `
+        <p>Arreglado: con muchas ciudades el bot podía mandar decenas de peticiones al juego en el mismo segundo y el juego se colgaba. Ahora van <b>una a una</b>, con una pausa corta entre ellas: algunas cosas tardan un poco más, pero el juego aguanta.</p>
+        ${AUTO('Los ataques no esperan: enviar, cancelar y leer órdenes salen al momento, y si un ataque va a salir en unos segundos, todo lo demás se para hasta que salga.')}` }
+    ] },
+    { v: '1.18.3', items: [
+      { t: 'Obras de teatro', tab: 'festivales', find: () => TQ.tab('festivales'), h: `
+        <p>Festivales ahora también hace <b>obras de teatro</b> en las ciudades con <b>Teatro</b> (10 000 / 12 000 / 10 000), a la vez que el festival. El festival va primero; la obra se inicia si alcanza para los dos (o si el festival no toca). Se puede desactivar.</p>` }
+    ] },
     { v: '1.18.2', items: [
       { t: 'Apoyo automático: devolver y defensa estática', tab: 'defensa', find: () => TQ.card(/Apoyo automático/) || TQ.tab('defensa'), h: `
         <p>El bot apunta los apoyos que manda y, cuando ya no queda ataque ni revuelta en esa ciudad, <b>devuelve solo esos</b>. Los que ya tenías puestos o en camino (y los que mandes tú) no se tocan.</p>
